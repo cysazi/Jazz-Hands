@@ -55,12 +55,11 @@ void loop() {
     
     switch (sensorValue.sensorId) {
       case SH2_ROTATION_VECTOR:
-        quat_w = sensorValue.un.RotationVector.real;
-        quat_i = sensorValue.un.RotationVector.i;
-        quat_j = sensorValue.un.RotationVector.j;
-        quat_k = sensorValue.un.RotationVector.k;
+        quat_w = sensorValue.un.rotationVector.real;
+        quat_i = sensorValue.un.rotationVector.i;
+        quat_j = sensorValue.un.rotationVector.j;
+        quat_k = sensorValue.un.rotationVector.k;
         break;
-        
       case SH2_LINEAR_ACCELERATION:
         accel_x = sensorValue.un.linearAcceleration.x;
         accel_y = sensorValue.un.linearAcceleration.y;
@@ -71,7 +70,7 @@ void loop() {
   }
   
   // Print both together every 10ms
-  if (millis() - delta_time > 10) {
+  if (millis() - delta_time > 5) {
     delta_time = millis();
     
     Serial.print("Quat[");
