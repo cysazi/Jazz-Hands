@@ -7,8 +7,13 @@
 #include <ESP32_NOW_Serial.h>
 #include <WiFi.h>
 
+// All UWB Libraries
+#include <SPI.h>
+#include "DW1000Ranging.h"
+
 // ESP NOW Definitions
 #define ESPNOW_WIFI_CHANNEL 6
+const uint8_t ESP_NOW_relayMAC[] = { 0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08 };  // The MAC address of the relay ESP-32 (device 4), constant for this device.
 
 // BNO085 definitions
 #define BNO08X_RESET -1
@@ -19,36 +24,45 @@
 #define HEADER 0xAAAA
 #define DEVICE_ID 1
 
+// Packet Type Flags
+#define PACKET_HAS_ACCEL 0b00000001
+#define PACKET_HAS_QUAT 0b00000010
+#define PACKET_HAS_UWB_1 0b00000100
+#define PACKET_HAS_UWB_2 0b00001000
+#define PACKET_HAS_BUTTON 0b10000000
 
-const uint8_t ESP_NOW_relayMAC[] = { 0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08 };  // The MAC address of the relay ESP-32 (device 4), constant for this device.
+// UWB Definitions
+#define UWB_1_ADDRESS 0x1111
+#define UWB_2_ADDRESS 0x2222
+const uint8_t PIN_RST = 9;  // reset pin
+const uint8_t PIN_IRQ = 2;  // irq pin
+const uint8_t PIN_SS = SS;  // spi select pin
 
-
-struct __attribute__((__packed__)) SensorData {  // has some special syntax to tell arduino to leave the raw data in byte form
-  uint16_t header = HEADER;                      // 2 bytes
-  uint8_t device_id = DEVICE_ID;                 // 1 byte
-  uint8_t packet_type;                           // 1 byte
-  uint32_t timestamp;                            // 4 bytes
-  float accel_x, accel_y, accel_z;               // 4*3 = 12 bytes
-  float UWB_distance1, UWB_distance2;            // 4*2 = 8 bytes
-  uint8_t button_state;                          // 1 byte
-  float quat_w, quat_i, quat_j, quat_k;          // 4*4 = 16 bytes
-  uint8_t error_handler;                         // 1 byte
-};                                               // Total: 57 bytes
+// Packet struct definition
+typedef struct __attribute__((__packed__)) {  // has some special syntax to tell arduino to leave the raw data in byte form
+  uint16_t header = HEADER;                   // 2 bytes
+  uint8_t device_id = DEVICE_ID;              // 1 byte
+  uint8_t packet_type;                        // 1 byte
+  uint32_t timestamp;                         // 4 bytes
+  float accel_x, accel_y, accel_z;            // 4*3 = 12 bytes
+  float UWB_distance1, UWB_distance2;         // 4*2 = 8 bytes
+  uint8_t button_state;                       // 1 byte
+  float quat_w, quat_i, quat_j, quat_k;       // 4*4 = 16 bytes
+  uint8_t error_handler;                      // 1 byte
+} datapacket_t;                               // Total: 46 bytes
 
 // IMU Declarations
 Adafruit_BNO08x bno08x(BNO08X_RESET);
 sh2_SensorValue_t sensorValue;
 
 // Global Variables
-struct SensorData current_readings = {};
-current_readings.header = HEADER;
-current_readings.device_id = DEVICE_ID;
+datapacket_t current_readings = {};
 bool ready_to_send;
 bool has_rotation_vector = false;
-uint32_t last_accel_time = 0;      // For 400Hz timing
-uint32_t last_rotation_time = 0;   // For 100Hz timing
+uint32_t last_accel_time = 0;     // For 400Hz timing
+uint32_t last_rotation_time = 0;  // For 100Hz timing
 
-
+// Set desired data for BNO085
 void setReports() {
   Serial.println("Setting desired reports");
   // 2500µs = 400Hz for acceleration, 10000µs = 100Hz for rotation vector
@@ -61,19 +75,22 @@ void setReports() {
 }
 
 void setup() {
+  // Initialize Serial
   Serial.begin(115200);
   delay(100);
-  Serial.println("BNO085 test");
 
+  // Initialize Wire
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);  // 400kHz for stability/faster I2C
   delay(100);
 
   // Initialize the IMU
   if (!bno08x.begin_I2C(0x4A, &Wire)) {
-    Serial.println("Failed to find BNO08x chip");
+    Serial.println("Failed to find BNO08x chip, please RST the ESP32 and try again");
     while (1) { delay(10); }
   }
+  Serial.println("BNO085 Found!");
+  setReports();
 
   // Intialize ESP-NOW
   WiFi.mode(WIFI_STA);
@@ -82,59 +99,91 @@ void setup() {
   // Add relay as peer once
   esp_now_peer_info_t relay = {};
   memcpy(relay.peer_addr, ESP_NOW_relayMAC, 6);
-  relay.channel = ESPNOW_WIFI_CHANNEL;      // Fixed channel for reliability
-  relay.encrypt = false;  // No encryption for speed
+  relay.channel = ESPNOW_WIFI_CHANNEL;  // Fixed channel for reliability
+  relay.encrypt = false;                // No encryption for speed
   esp_now_add_peer(&relay);
 
-  // Initialize the global struct properly
+  // Initialize the global struct
   current_readings.header = HEADER;
   current_readings.device_id = DEVICE_ID;
-  current_readings.packet_type = 0x01;  // Start with accel-only packets
+  current_readings.packet_type = 0x00;
 
-  Serial.println("BNO085 Found!");
-  setReports();
-  Serial.println("Reading events...");
+  // UWB Initialization
+  Serial.print("UWB Initializing");
+  DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ);  //Reset, CS, IRQ pin
+  DW1000Ranging.attachNewRange(newRange);
+  DW1000Ranging.attachNewDevice(newDevice);
+  DW1000Ranging.attachInactiveDevice(inactiveDevice);
+  //Enable the filter to smooth the distance
+  //DW1000Ranging.useRangeFilter(true);
+
+  //we start the module as a tag
+  DW1000Ranging.startAsTag("7D:00:22:EA:82:60:3B:9C", DW1000.MODE_SHORTDATA_FAST_ACCURACY);
 }
 
 void loop() {
-  current_readings = collectData();  // collect the data
-  // maybe check the integrity of the packet here? validatePacket()?
-  if (ready_to_send) {
-    ready_to_send = false;
-    sendPacket(&current_readings);
-  }  // send the data
-  if (has_rotation_vector) {
+  DW1000Ranging.loop();                 // needs to be triggered every loop instance
+
+  while (bno08x.getSensorEvent(sh2_SensorValue_t * sensorValue)) {
+    switch (sensorValue.sensorId) {
+      case SH2_ROTATION_VECTOR:
+        if (!current_readings.packet_type & PACKET_HAS_QUAT) {
+          current_readings.quat_w = sensorValue.un.rotationVector.real;
+          current_readings.quat_i = sensorValue.un.rotationVector.i;
+          current_readings.quat_j = sensorValue.un.rotationVector.j;
+          current_readings.quat_k = sensorValue.un.rotationVector.k;
+          current_readings.packet_type |= PACKET_HAS_QUAT;  // tells python that this packet has quaternion
+        }
+        else
+        break;
+      case SH2_LINEAR_ACCELERATION:
+        if (!current_readings.packet_type & PACKET_HAS_ACCEL) {
+          current_readings.accel_x = sensorValue.un.linearAcceleration.x;
+          current_readings.accel_y = sensorValue.un.linearAcceleration.y;
+          current_readings.accel_z = sensorValue.un.linearAcceleration.z;
+          current_readings.packet_type |= PACKET_HAS_ACCEL;  // tells python that this packet has accel data
+        }
+        break;
+    }
+
+    }
   }
 }
 
-SensorData collectData() {  // this fn returns the struct with all the data
-  SensorData data = {};
-  if (bno08x.getSensorEvent(&sensorValue)) {
-      ready_to_send = true;
-      switch (sensorValue.sensorId) {
-        case SH2_ROTATION_VECTOR:
-          data.quat_w = sensorValue.un.rotationVector.real;
-          data.quat_i = sensorValue.un.rotationVector.i;
-          data.quat_j = sensorValue.un.rotationVector.j;
-          data.quat_k = sensorValue.un.rotationVector.k;
-          break;
-        case SH2_LINEAR_ACCELERATION:
-          data.accel_x = sensorValue.un.linearAcceleration.x;
-          data.accel_y = sensorValue.un.linearAcceleration.y;
-          data.accel_z = sensorValue.un.linearAcceleration.z;
-          break;
-      }
-    }
+void sendPacket(datapacket_t* data) {
+  esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(SensorData));
+  current_readings.packet_type
 
-  data.UWB_distance1 = 0;
-  data.UWB_distance2 = 0;
-  data.button_state = false;
-
-  // The data collection stuff goes here
-  data.timestamp = millis();  // do this last
-  return data;                // returning the instance of the data to the outside world
+    // Optional Error Handling
+    if (result != ESP_OK) {
+    current_readings.error_handler = 1;  // Set error flag
+  }
+  else {
+    current_readings.error_handler = 0;  // Clear error flag
+  }
 }
 
-void sendPacket(SensorData* data) {  // sends the struct to relay ESP-32 via ESP-NOW
-  esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(data))
+
+void newRange() {
+  switch (DW1000Ranging.getDistantDevice()->getShortAddress()) {
+    case UWB_1_ADDRESS:
+      current_readings.UWB_distance1 = DW1000Ranging.getDistantDevice()->getRange();
+      current_readings.packet_type |= PACKET_HAS_UWB_1;
+      break;
+    case UWB_2_ADDRESS:
+      current_readings.UWB_distance2 = DW1000Ranging.getDistantDevice()->getRange();
+      current_readings.packet_type |= PACKET_HAS_UWB_2;
+      break;
+  }
+}
+
+void newDevice(DW1000Device* device) {
+  Serial.print("ranging init; 1 device added ! -> ");
+  Serial.print(" short:");
+  Serial.println(device->getShortAddress(), HEX);
+}
+
+void inactiveDevice(DW1000Device* device) {
+  Serial.print("deleting inactive device: ");
+  Serial.println(device->getShortAddress(), HEX);
 }
