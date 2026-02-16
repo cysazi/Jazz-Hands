@@ -15,7 +15,7 @@ Wiring can be found in this pdf: [Adafruit BNO085 User Guide](https://cdn-learn.
 * I think all you need to include are `<Wire.h>` and `<Adafruit_BNO08x.h>`
 #### UWB (DW1000)
 No Wiring because we got an integrated UWB + ESP32n board (yay!)
-* Library is a .zip library found here: [Makerfabs GitHub]([https://github.com/Makerfabs/Makerfabs-ESP32-UWB/blob/main/mf_DW1000.zip])
+* Library is a .zip library found here: [Makerfabs GitHub]([https://github.com/Makerfabs/Makerfabs-ESP32-UWB/blob/main/mf_DW1000.zip)
 * Download `mf_DW10000.zip` then include it in Arduino IDE using `Sketch > Include Library > Add .ZIP Library`
 ## ESP 32 Info
 ### Mac Addresses
