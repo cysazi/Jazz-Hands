@@ -13,23 +13,12 @@
 
 // ESP NOW Definitions
 #define ESPNOW_WIFI_CHANNEL 6
-const uint8_t ESP_NOW_relayMAC[] = { 0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08 };  // The MAC address of the relay ESP-32 (device 4), constant for this device.
+const uint8_t ESP_NOW_relayMAC[] = { 0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08 };  // The MAC address of the relay ESP-32 (device 4); constant for this device.
 
 // BNO085 definitions
 #define BNO08X_RESET -1
 #define SDA_PIN 21
 #define SCL_PIN 22
-
-// Jazz Hand (1/2) (LEFT/RIGHT) <- to be decided
-#define HEADER 0xAAAA
-#define DEVICE_ID 1
-
-// Packet Type Flags
-#define PACKET_HAS_ACCEL 0b00000001
-#define PACKET_HAS_QUAT 0b00000010
-#define PACKET_HAS_UWB_1 0b00000100
-#define PACKET_HAS_UWB_2 0b00001000
-#define PACKET_HAS_BUTTON 0b10000000
 
 // UWB Definitions
 #define UWB_1_ADDRESS 0x1111
@@ -38,18 +27,31 @@ const uint8_t PIN_RST = 9;  // reset pin
 const uint8_t PIN_IRQ = 2;  // irq pin
 const uint8_t PIN_SS = SS;  // spi select pin
 
+// Misc. definitions
+#define button_pin 23
+
+// Jazz Hand (1/2) (LEFT/RIGHT) <- to be decided
+#define HEADER 0xAAAA
+#define DEVICE_ID 1
+
+// Packet Type Bitflags
+#define PACKET_HAS_ACCEL 0b00000001
+#define PACKET_HAS_QUAT 0b00000010
+#define PACKET_HAS_UWB_1 0b00000100
+#define PACKET_HAS_UWB_2 0b00001000
+
 // Packet struct definition
 typedef struct __attribute__((__packed__)) {  // has some special syntax to tell arduino to leave the raw data in byte form
   uint16_t header = HEADER;                   // 2 bytes
   uint8_t device_id = DEVICE_ID;              // 1 byte
   uint8_t packet_type;                        // 1 byte
-  uint32_t timestamp;                         // 4 bytes
+  unsigned long timestamp;                    // 8 bytes
   float accel_x, accel_y, accel_z;            // 4*3 = 12 bytes
   float UWB_distance1, UWB_distance2;         // 4*2 = 8 bytes
   uint8_t button_state;                       // 1 byte
   float quat_w, quat_i, quat_j, quat_k;       // 4*4 = 16 bytes
   uint8_t error_handler;                      // 1 byte
-} datapacket_t;                               // Total: 46 bytes
+} datapacket_t;                               // Total: 50 bytes
 
 // IMU Declarations
 Adafruit_BNO08x bno08x(BNO08X_RESET);
@@ -110,7 +112,7 @@ void setup() {
 
   // UWB Initialization
   Serial.print("UWB Initializing");
-  DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ);  //Reset, CS, IRQ pin
+  DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ);
   DW1000Ranging.attachNewRange(newRange);
   DW1000Ranging.attachNewDevice(newDevice);
   DW1000Ranging.attachInactiveDevice(inactiveDevice);
@@ -122,9 +124,10 @@ void setup() {
 }
 
 void loop() {
-  DW1000Ranging.loop();                 // needs to be triggered every loop instance
+  DW1000Ranging.loop();  // needs to be triggered every loop instance
+  current_readings.button_state = digitalRead(button_pin);
 
-  while (bno08x.getSensorEvent(sh2_SensorValue_t * sensorValue)) {
+  while (bno08x.getSensorEvent(&sensorValue)) {
     switch (sensorValue.sensorId) {
       case SH2_ROTATION_VECTOR:
         if (!current_readings.packet_type & PACKET_HAS_QUAT) {
@@ -134,7 +137,6 @@ void loop() {
           current_readings.quat_k = sensorValue.un.rotationVector.k;
           current_readings.packet_type |= PACKET_HAS_QUAT;  // tells python that this packet has quaternion
         }
-        else
         break;
       case SH2_LINEAR_ACCELERATION:
         if (!current_readings.packet_type & PACKET_HAS_ACCEL) {
@@ -145,26 +147,30 @@ void loop() {
         }
         break;
     }
-
+    // If both Rotation and Lin Accel are acquired, break out of the while loop regardless of queue contents
+    if (current_readings.packet_type & (PACKET_HAS_ACCEL | PACKET_HAS_QUAT) == 0b00000011) {
+      break;
     }
   }
+  sendPacket(&current_readings);
 }
 
 void sendPacket(datapacket_t* data) {
-  esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(SensorData));
-  current_readings.packet_type
+  current_readings.timestamp = micros()
+    esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(data));
+  current_readings.packet_type = 0b00000000;
 
-    // Optional Error Handling
-    if (result != ESP_OK) {
+  // Optional Error Handling
+  if (result != ESP_OK) {
     current_readings.error_handler = 1;  // Set error flag
-  }
-  else {
+  } else {
     current_readings.error_handler = 0;  // Clear error flag
   }
 }
 
 
 void newRange() {
+  // Get new UWB Data when available
   switch (DW1000Ranging.getDistantDevice()->getShortAddress()) {
     case UWB_1_ADDRESS:
       current_readings.UWB_distance1 = DW1000Ranging.getDistantDevice()->getRange();
