@@ -7,8 +7,7 @@ from dataclasses import dataclass, field
 # Definition of constants
 COM_PORTS: list[str] = ["insert comport here",
                         "insert comport here",
-                        "insert comport here",
-                        "insert comport here"]
+                        ]
 TIMEOUT: float = 0  # Non-Blocking
 PACKET_SIZE: int = 44  # Number of bytes per packet:
 # Header (2) + Device Number (1) + X,Y,Z Accel (4*3 = 12) + Button State (1) + UWB (4x2=8) + Quaternion (4*4 = 16)
@@ -47,83 +46,11 @@ class PacketData:
             UWB_distance_1=unpacked[4],
             UWB_distance_2=unpacked[5],
             button_state=bool(unpacked[6]),
-            quat_w = unpacked[7],
-            quat_i = unpacked[8],
-            quat_j = unpacked[9],
-            quat_k = unpacked[10]
-            )
-
-
-# NOT USED ANYMORE, HERE FOR REFERENCE
-class PacketReader:
-    """Initialize packet reader with all the serial port info. Call it like PacketReader(port)"""
-
-    def __init__(self, port: str, baudrate: int = 115200, timeout: float = TIMEOUT):
-        self.port = port
-        self.baudrate = baudrate
-        self.timeout = timeout
-        self.ser = None
-        self.buffer = bytearray()
-        self.packet_counter: int = 0
-        self.error_counter: int = 0
-
-    def open(self) -> None:
-        """Open the serial port and initialize the packet reader."""
-        try:
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout, bytesize=8,
-                                     parity=serial.PARITY_NONE)
-            print(f"Serial port {self.port} opened")
-        except serial.SerialException as e:
-            print(f"Error opening port: {e}")
-            raise
-
-    def close(self) -> None:
-        """Close the serial port."""
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-            print(f"Serial port {self.port} closed")
-
-    def __enter__(self) -> PacketReader:  # Called when "with" is used
-        self.open()  # run opening logic
-        return self  # update the serial port with the opened serial
-
-    def __exit__(self) -> None:  # Called when exiting "with"
-        self.close()  # run closing logic
-
-    def read_packet(self) -> bytearray | None:
-        """Read the packet from the serial port."""
-
-        if self.ser and self.ser.is_open:
-            # Add new data to buffer
-            new_data = self.ser.read(self.ser.in_waiting or 1)
-            self.buffer.extend(new_data)
-
-            # Look for header byte anywhere in buffer
-            while len(self.buffer) >= PACKET_SIZE:
-                # Find the header
-                try:
-                    header_index = self.buffer.index(HEADER_BYTE)
-                except ValueError:
-                    # No header found, clear buffer and wait for more data
-                    self.buffer.clear()
-                    return None
-
-                # Remove everything before header
-                if header_index > 0:
-                    print(f"Discarded {header_index} bytes before header")
-                    self.buffer = self.buffer[header_index:]
-
-                # Check if we have a complete packet
-                if len(self.buffer) >= PACKET_SIZE:
-                    packet = self.buffer[:PACKET_SIZE]
-                    self.packet_counter += 1
-                    self.buffer = self.buffer[PACKET_SIZE:]
-                    return packet
-                else:
-                    # Have header but not enough bytes yet
-                    return None
-
-        return None  # Not enough data yet
+            quat_w=unpacked[7],
+            quat_i=unpacked[8],
+            quat_j=unpacked[9],
+            quat_k=unpacked[10]
+        )
 
 
 class ThreadedMultiDeviceReader:
@@ -134,7 +61,7 @@ class ThreadedMultiDeviceReader:
         self.processing_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
 
         # Device management
-        self.devices: dict[int, dict] = {}  # device_id -> device info
+        self.relays: dict[int, dict] = {}  # relay_id -> device info
         self.threads: dict[int, threading.Thread] = {}
 
         # Control
@@ -146,11 +73,11 @@ class ThreadedMultiDeviceReader:
         self.packet_callback_function: Callable | None = None
         self.error_callback_function: Callable | None = None
 
-    def add_device(self, device_id: int, port: str, baudrate: int = 115200) -> bool:
+    def add_device(self, relay_id: int, port: str, baudrate: int = 115200) -> bool:
         """Add a new device to monitor"""
         with self.lock:
-            if device_id in self.devices:
-                print(f"Device {device_id} already exists")
+            if relay_id in self.relays:
+                print(f"Device {relay_id} already exists")
                 return False
 
             try:
@@ -158,7 +85,7 @@ class ThreadedMultiDeviceReader:
                 ser = serial.Serial(port, baudrate, timeout=1)
 
                 # Store device info
-                self.devices[device_id] = {
+                self.relays[relay_id] = {
                     'port': port,
                     'serial': ser,
                     'buffer': bytearray(),
@@ -168,7 +95,7 @@ class ThreadedMultiDeviceReader:
                 }
 
                 # Initialize stats
-                self.stats[device_id] = {
+                self.stats[relay_id] = {
                     'packets_received': 0,
                     'bytes_received': 0,
                     'errors': 0,
@@ -178,16 +105,16 @@ class ThreadedMultiDeviceReader:
                 # Start thread for this device
                 thread = threading.Thread(
                     target=self._device_reader_thread,
-                    args=(device_id,),
-                    name=f"Reader-Device-{device_id}"
+                    args=(relay_id,),
+                    name=f"Reader-Device-{relay_id}"
                 )
                 thread.daemon = True
-                self.threads[device_id] = thread
+                self.threads[relay_id] = thread
 
                 if self.running:
                     thread.start()
 
-                print(f"Added device {device_id} on {port}")
+                print(f"Added device {relay_id} on {port}")
                 return True
 
             except serial.SerialException as e:
@@ -204,27 +131,27 @@ class ThreadedMultiDeviceReader:
         self.stop()  # Stop threads, close ports
         return False  # Don't suppress exceptions
 
-    def remove_device(self, device_id: int):
+    def remove_device(self, relay_id: int):
         """Remove and stop monitoring a device"""
         with self.lock:
-            if device_id not in self.devices:
+            if relay_id not in self.relays:
                 return
 
             # Close serial port
-            self.devices[device_id]['serial'].close()
+            self.relays[relay_id]['serial'].close()
 
             # Remove from tracking
-            del self.devices[device_id]
+            del self.relays[relay_id]
 
-    def _device_reader_thread(self, device_id: int):
+    def _device_reader_thread(self, relay_id: int):
         """Thread function for reading from one device"""
-        device = self.devices[device_id]
+        device = self.relays[relay_id]
         ser = device['serial']
         buffer = device['buffer']
 
-        print(f"Started thread for device {device_id}")
+        print(f"Started thread for device {relay_id}")
 
-        while self.running and device_id in self.devices:
+        while self.running and relay_id in self.relays:
             try:
                 # Read available data
                 if ser.in_waiting > 0:
@@ -261,8 +188,8 @@ class ThreadedMultiDeviceReader:
 
                                 # Create wrapped packet
                                 wrapped_packet = DevicePacket(
-                                    device_id=device_id,
-                                    packet=packet_data,
+                                    relay_id=relay_id,
+                                    data=packet_data,
                                     sequence_num=device['packet_count']
                                 )
 
@@ -281,10 +208,10 @@ class ThreadedMultiDeviceReader:
                                 # Parse error
                                 with self.lock:
                                     device['error_count'] += 1
-                                    self.stats[device_id]['errors'] += 1
+                                    self.stats[relay_id]['errors'] += 1
 
                                 if self.error_callback_function:
-                                    self.error_callback_function(device_id, e)
+                                    self.error_callback_function(relay_id, e)
 
                                 # Remove bad packet
                                 buffer[:] = buffer[1:]  # Skip one byte and try again
@@ -297,26 +224,27 @@ class ThreadedMultiDeviceReader:
                     time.sleep(0.001)
 
             except Exception as e:
-                print(f"Error in device {device_id} thread: {e}")
+                print(f"Error in device {relay_id} thread: {e}")
                 time.sleep(0.1)  # Back off on error
 
-        print(f"Stopped thread for device {device_id}")
+        print(f"Stopped thread for device {relay_id}")
 
     def _callback_processor(self):
         """Dedicated thread for callbacks"""
         while True:
-            packet:DevicePacket = self.processing_queue.get()  # type: ignore[annotation-unchecked]
+            packet: DevicePacket = self.processing_queue.get()  # type: ignore[annotation-unchecked]
             if packet is None:
                 break
             try:
-                self.packet_callback_function(packet)
+                if self.packet_callback_function:
+                    self.packet_callback_function(packet)
             except Exception as e:
-                print(f"Callback error: packet for device {packet.device_id}: {e}")
+                print(f"Callback error: packet for device {packet.relay_id}: {e}")
 
     def start(self):
         """Start all device threads"""
         self.running = True
-        for device_id, thread in self.threads.items():
+        for relay_id, thread in self.threads.items():
             if not thread.is_alive():
                 thread.start()
         print(f"Started {len(self.threads)} device threads")
@@ -332,7 +260,7 @@ class ThreadedMultiDeviceReader:
 
         # Close all serial ports
         with self.lock:
-            for device in self.devices.values():
+            for device in self.relays.values():
                 try:
                     device['serial'].close()
                 except serial.SerialException:
@@ -344,9 +272,9 @@ class ThreadedMultiDeviceReader:
         """Get statistics for all devices"""
         with self.lock:
             stats_copy = {}
-            for device_id, stats in self.stats.items():
+            for relay_id, stats in self.stats.items():
                 runtime = time.time() - stats['start_time']
-                stats_copy[device_id] = {
+                stats_copy[relay_id] = {
                     **stats,
                     'runtime': runtime,
                     'packets_per_sec': stats['packets_received'] / runtime if runtime > 0 else 0,
@@ -354,13 +282,13 @@ class ThreadedMultiDeviceReader:
                 }
             return stats_copy
 
-    def is_device_active(self, device_id: int, timeout: float = 1.0) -> bool:
+    def is_device_active(self, relay_id: int, timeout: float = 1.0) -> bool:
         """Check if device received data recently"""
         with self.lock:
-            if device_id not in self.devices:
+            if relay_id not in self.relays:
                 return False
 
-            last_time = self.devices[device_id]['last_packet_time']
+            last_time = self.relays[relay_id]['last_packet_time']
             if last_time is None:
                 return False
 
@@ -370,8 +298,8 @@ class ThreadedMultiDeviceReader:
 @dataclass
 class DevicePacket:
     """Wrapper for packet with metadata"""
-    device_id: int
-    packet: PacketData
+    relay_id: int
+    data: PacketData
     timestamp: float = field(default_factory=time.time)
     sequence_num: int = 0
 
@@ -380,13 +308,29 @@ class DevicePacket:
 class Glove:
     """Basic Glove data"""
     device_id: int
-    last_packet_time:float
+    last_packet_time: float | None = field(default_factory=lambda: None)
     button_state: bool = field(default_factory=lambda: False)
     position: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     velocity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     acceleration: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     rotation_quaternion: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0]))
     rotation_euler: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
+    position_history: np.ndarray = field(default_factory=lambda: np.array(
+        [[0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0]
+         ]))
+    rotation_history: np.ndarray = field(default_factory=lambda: np.array(
+        [[0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0],
+         [0.0, 0.0, 0.0]
+         ]))
 
     def needs_zupt(self) -> bool:
         """Check if accel is due to signal noise or an actual value"""
@@ -408,21 +352,25 @@ class Glove:
 @dataclass
 class LeftHand(Glove):
     """Left-hand specific methods and data based on regular glove data"""
+
     def update(self, packet: DevicePacket):
         pass
-
 
 
 @dataclass
 class RightHand(Glove):
     """Right-hand specific methods and data based on regular glove data"""
+
     def update(self, packet: DevicePacket):
         pass
+
 
 @dataclass
 class GlovePair:
     """Container for a pair of glove states"""
     device_ids: tuple[int, int]
+    reader_number: int
+    instrument_type: str = field(default_factory=lambda: "")
     left_hand: LeftHand | None = None
     right_hand: RightHand | None = None
 
@@ -430,36 +378,24 @@ class GlovePair:
         self.left_hand = LeftHand(device_id=self.device_ids[0])
         self.right_hand = RightHand(device_id=self.device_ids[1])
 
+    def _math_processor(self):
+        threading.Thread(target=self._math_processor).start()
 
-def on_packet(packet: DevicePacket):
+
+def on_packet(wrapped_packet: DevicePacket):
     """Process the packet to correct target and update Glove values"""
     # determine which device it belongs to
-    match packet.device_id:
-        case 1:
-            pass
-        case 2:
-            pass
-        case 3:
-            pass
-        case 4:
-            pass
+
     # set new data
 
 
-
 def main():
-    # Set up the glove objects
-    glove_pairs: list[GlovePair] = []  # type: ignore[annotation-unchecked]
-    for i in range((NUMBER_OF_DEVICES / 2).__floor__()):  # see how many pairs of 2 gloves are initiated
-        j = i * 2 - 1  # produces odd numbers
-        glove_pairs.append(GlovePair((j, j + 1)))  # adds pairs (1,2), (3,4), (5,6), etc. Always (L,R)
-
     # Create reader
     with ThreadedMultiDeviceReader() as reader:
 
         # Add devices
         for number, com_port in enumerate(COM_PORTS, start=1):
-            reader.add_device(device_id=number, port=com_port)
+            reader.add_device(relay_id=number, port=com_port)
 
         # Start reading
         reader.start()
