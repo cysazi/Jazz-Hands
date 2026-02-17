@@ -1,6 +1,57 @@
 # Jazz-Hands
 E-SONIC glove-based musical instrument
 ___
+# Box Initialization plans
+* Upon first button press, set that position as the origin
+```
+
+
+                     x
+            
+            
+```
+* Upon button release, set that as the boundary of the box
+```
+          
+         _ _ _ _ _ _ _ _ _ _ _ _ _
+         |                       |
+         |                       |
+         |                       |
+         |            x--------> |
+         |                       |
+         |                       |
+         |                       |
+         - - - - - - - - - - - - - 
+         
+```
+* Therefore, we draw the box from the centre to the midpoint of the side of the square
+
+
+
+# Main Workflow:
+## 1. Get a packet
+
+## 2. Update glove values
+
+## 3. Do logic with position to find pitch using simple ratios
+
+```
+          
+          _ _ _ _ _ _ _ _ _ _ _ _ _
+          |      |                |
+          |      |     20% x      |
+          |------x----------------|
+          |      |                |
+          |      | 65% y          |
+          |      |                |
+          |      |                |
+          - - - - - - - - - - - - - 
+          
+```
+
+## 4. send to VisPy
+
+## 5. send to MIDI
 # Important Info!
 ## Arduino IDE setup guide
 ### Board Setting
