@@ -1,25 +1,26 @@
 import queue
 from typing import Callable
-import serial, struct, time, threading
+import serial, struct, time, threading  # type: ignore[import-untyped]
 import numpy as np
 from dataclasses import dataclass, field
 
 # Definition of constants
-COM_PORTS: list[str] = ["insert comport here",
-                        "insert comport here",
+COM_PORTS: list[str] = ["/dev/cu.usbserial-023B6AC7", # Board 3
+                        "/dev/cu.usbserial-023B6B29", # Board 4
                         ]
 TIMEOUT: float = 0  # Non-Blocking
 PACKET_SIZE: int = 44  # Number of bytes per packet:
 # Header (2) + Device Number (1) + X,Y,Z Accel (4*3 = 12) + Button State (1) + UWB (4x2=8) + Quaternion (4*4 = 16)
 HEADER_BYTE: bytes = b'\xAA\xAA'  # the header is two 0xAA
 HEADER_SIZE: int = 2  # two the header is two bytes long
-PACKET_FORMAT: str = '2B B l 3f 2f B 4f'  # tells the unpacker the order of packet is 1 byte, a long (for time),  5 floats, 1 byte, then 4 floats
+PACKET_FORMAT: str = '<2B B l 3f 2f B 4f'  # tells the unpacker the order of packet is 1 byte, a long (for time),  5 floats, 1 byte, then 4 floats
 NUMBER_OF_DEVICES: int = 2
 
 
 @dataclass
 class PacketData:
     device_number: int
+    timestamp: float
     accel_x: float
     accel_y: float
     accel_z: float
@@ -40,16 +41,17 @@ class PacketData:
         unpacked = struct.unpack(PACKET_FORMAT, binary_data)
         return cls(
             device_number=unpacked[len(HEADER_BYTE)],
-            accel_x=unpacked[1],
-            accel_y=unpacked[2],
-            accel_z=unpacked[3],
-            UWB_distance_1=unpacked[4],
-            UWB_distance_2=unpacked[5],
-            button_state=bool(unpacked[6]),
-            quat_w=unpacked[7],
-            quat_i=unpacked[8],
-            quat_j=unpacked[9],
-            quat_k=unpacked[10]
+            timestamp=unpacked[len(HEADER_BYTE)+1],
+            accel_x=unpacked[len(HEADER_BYTE)+2],
+            accel_y=unpacked[len(HEADER_BYTE)+3],
+            accel_z=unpacked[len(HEADER_BYTE)+4],
+            UWB_distance_1=unpacked[len(HEADER_BYTE)+5],
+            UWB_distance_2=unpacked[len(HEADER_BYTE)+6],
+            button_state=bool(unpacked[len(HEADER_BYTE)+7]),
+            quat_w=unpacked[len(HEADER_BYTE)+8],
+            quat_i=unpacked[len(HEADER_BYTE)+9],
+            quat_j=unpacked[len(HEADER_BYTE)+10],
+            quat_k=unpacked[len(HEADER_BYTE)+11]
         )
 
 
