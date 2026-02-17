@@ -23,9 +23,16 @@ const uint8_t ESP_NOW_relayMAC[] = { 0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08 };  // T
 // UWB Definitions
 #define UWB_1_ADDRESS 0x1111
 #define UWB_2_ADDRESS 0x2222
-const uint8_t PIN_RST = 9;  // reset pin
-const uint8_t PIN_IRQ = 2;  // irq pin
-const uint8_t PIN_SS = SS;  // spi select pin
+
+#define SPI_SCK 18
+#define SPI_MISO 19
+#define SPI_MOSI 23
+#define DW_CS 4
+
+// connection pins
+const uint8_t PIN_RST = 27;  // reset pin
+const uint8_t PIN_IRQ = 34;  // irq pin
+const uint8_t PIN_SS = 4;    // spi select pin
 
 // Misc. definitions
 #define button_pin 23
@@ -46,9 +53,9 @@ typedef struct __attribute__((__packed__)) {  // has some special syntax to tell
   uint8_t device_id = DEVICE_ID;              // 1 byte
   uint8_t packet_type;                        // 1 byte
   unsigned long timestamp;                    // 8 bytes
+  uint8_t button_state;                       // 1 byte
   float accel_x, accel_y, accel_z;            // 4*3 = 12 bytes
   float UWB_distance1, UWB_distance2;         // 4*2 = 8 bytes
-  uint8_t button_state;                       // 1 byte
   float quat_w, quat_i, quat_j, quat_k;       // 4*4 = 16 bytes
   uint8_t error_handler;                      // 1 byte
 } datapacket_t;                               // Total: 50 bytes
@@ -111,22 +118,27 @@ void setup() {
   current_readings.packet_type = 0x00;
 
   // UWB Initialization
-  Serial.print("UWB Initializing");
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
   DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ);
   DW1000Ranging.attachNewRange(newRange);
   DW1000Ranging.attachNewDevice(newDevice);
   DW1000Ranging.attachInactiveDevice(inactiveDevice);
-  //Enable the filter to smooth the distance
+  //Enable this filter to smooth the distance
   //DW1000Ranging.useRangeFilter(true);
 
-  //we start the module as a tag
+  // Start the module as a tag
   DW1000Ranging.startAsTag("7D:00:22:EA:82:60:3B:9C", DW1000.MODE_SHORTDATA_FAST_ACCURACY);
 }
 
 void loop() {
-  DW1000Ranging.loop();  // needs to be triggered every loop instance
+
+  // UWB Data Collection
+  DW1000Ranging.loop();
+
+  // Button State Reading
   current_readings.button_state = digitalRead(button_pin);
 
+  // IMU Data Collection
   while (bno08x.getSensorEvent(&sensorValue)) {
     switch (sensorValue.sensorId) {
       case SH2_ROTATION_VECTOR:
@@ -147,19 +159,19 @@ void loop() {
         }
         break;
     }
-    // If both Rotation and Lin Accel are acquired, break out of the while loop regardless of queue contents
+    // If both Rotation and Accel are acquired, break out of the while loop regardless of queue contents
     if (current_readings.packet_type & (PACKET_HAS_ACCEL | PACKET_HAS_QUAT) == 0b00000011) {
       break;
     }
   }
-  sendPacket(&current_readings);
+  if (current_readings.packet_type != 0) {
+    sendPacket(&current_readings);
+  }
 }
 
 void sendPacket(datapacket_t* data) {
-  current_readings.timestamp = micros()
-    esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(data));
-  current_readings.packet_type = 0b00000000;
-
+  esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(&data));
+  data->packet_type = 0;  // Reset the packet type
   // Optional Error Handling
   if (result != ESP_OK) {
     current_readings.error_handler = 1;  // Set error flag
@@ -171,7 +183,14 @@ void sendPacket(datapacket_t* data) {
 
 void newRange() {
   // Get new UWB Data when available
-  switch (DW1000Ranging.getDistantDevice()->getShortAddress()) {
+  // Get the specific device that just talked to us
+  DW1000Device* device = DW1000Ranging.getDistantDevice();
+
+  // Extract its address
+  int shortAddress = device->getShortAddress();
+
+
+  switch (shortAddress) {
     case UWB_1_ADDRESS:
       current_readings.UWB_distance1 = DW1000Ranging.getDistantDevice()->getRange();
       current_readings.packet_type |= PACKET_HAS_UWB_1;
