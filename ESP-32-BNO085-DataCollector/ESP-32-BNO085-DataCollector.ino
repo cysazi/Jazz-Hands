@@ -58,7 +58,7 @@ typedef struct __attribute__((__packed__)) {  // has some special syntax to tell
   float UWB_distance1, UWB_distance2;         // 4*2 = 8 bytes
   float quat_w, quat_i, quat_j, quat_k;       // 4*4 = 16 bytes
   uint8_t error_handler;                      // 1 byte
-} datapacket_t;                               // Total: 50 bytes
+} datapacket_t;                               // Total: 46 bytes
 
 // IMU Declarations
 Adafruit_BNO08x bno08x(BNO08X_RESET);
@@ -70,6 +70,9 @@ bool ready_to_send;
 bool has_rotation_vector = false;
 uint32_t last_accel_time = 0;     // For 400Hz timing
 uint32_t last_rotation_time = 0;  // For 100Hz timing
+// Global variables for filtered acceleration
+float filtered_acc_x = 0, filtered_acc_y = 0, filtered_acc_z = 0;
+const float acc_alpha = 0.2;  // Constant between 0 and 1.
 
 // Set desired data for BNO085
 void setReports() {
@@ -123,8 +126,6 @@ void setup() {
   DW1000Ranging.attachNewRange(newRange);
   DW1000Ranging.attachNewDevice(newDevice);
   DW1000Ranging.attachInactiveDevice(inactiveDevice);
-  //Enable this filter to smooth the distance
-  //DW1000Ranging.useRangeFilter(true);
 
   // Start the module as a tag
   DW1000Ranging.startAsTag("7D:00:22:EA:82:60:3B:9C", DW1000.MODE_SHORTDATA_FAST_ACCURACY);
@@ -137,7 +138,6 @@ void loop() {
 
   // Button State Reading
   current_readings.button_state = digitalRead(button_pin);
-
   // IMU Data Collection
   while (bno08x.getSensorEvent(&sensorValue)) {
     switch (sensorValue.sensorId) {
@@ -151,12 +151,17 @@ void loop() {
         }
         break;
       case SH2_LINEAR_ACCELERATION:
-        if (!current_readings.packet_type & PACKET_HAS_ACCEL) {
-          current_readings.accel_x = sensorValue.un.linearAcceleration.x;
-          current_readings.accel_y = sensorValue.un.linearAcceleration.y;
-          current_readings.accel_z = sensorValue.un.linearAcceleration.z;
-          current_readings.packet_type |= PACKET_HAS_ACCEL;  // tells python that this packet has accel data
-        }
+        // One pole recursive Low-Pass Filter
+        filtered_acc_x = (acc_alpha * sensorValue.un.linearAcceleration.x) + (1.0 - acc_alpha) * filtered_acc_x;
+        filtered_acc_y = (acc_alpha * sensorValue.un.linearAcceleration.y) + (1.0 - acc_alpha) * filtered_acc_y;
+        filtered_acc_z = (acc_alpha * sensorValue.un.linearAcceleration.z) + (1.0 - acc_alpha) * filtered_acc_z;
+
+        // Assign the smoothed values to the data packet
+        current_readings.accel_x = filtered_acc_x;
+        current_readings.accel_y = filtered_acc_y;
+        current_readings.accel_z = filtered_acc_z;
+
+        current_readings.packet_type |= PACKET_HAS_ACCEL;  // tells python that this packet has accel data
         break;
     }
     // If both Rotation and Accel are acquired, break out of the while loop regardless of queue contents
@@ -164,7 +169,7 @@ void loop() {
       break;
     }
   }
-  if (current_readings.packet_type != 0) {
+  if (current_readings.packet_type & PACKET_HAS_QUAT) {
     sendPacket(&current_readings);
   }
 }
