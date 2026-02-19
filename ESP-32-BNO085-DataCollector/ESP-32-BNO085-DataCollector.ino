@@ -138,6 +138,9 @@ void loop() {
 
   // Button State Reading
   current_readings.button_state = digitalRead(button_pin);
+  if (current_readings.button_state) {
+
+  }
   // IMU Data Collection
   while (bno08x.getSensorEvent(&sensorValue)) {
     switch (sensorValue.sensorId) {
@@ -208,12 +211,12 @@ void newRange() {
 }
 
 void newDevice(DW1000Device* device) {
-  Serial.print("ranging init; 1 device added ! -> ");
-  Serial.print(" short:");
-  Serial.println(device->getShortAddress(), HEX);
+  // Serial.print("ranging init; 1 device added ! -> ");
+  // Serial.print(" short:");
+  // Serial.println(device->getShortAddress(), HEX);
 }
 
 void inactiveDevice(DW1000Device* device) {
-  Serial.print("deleting inactive device: ");
-  Serial.println(device->getShortAddress(), HEX);
+  // Serial.print("deleting inactive device: ");
+  // Serial.println(device->getShortAddress(), HEX);
 }
