@@ -177,6 +177,7 @@ void loop() {
 }
 
 void sendPacket(datapacket_t* data) {
+  current_readings.timestamp = micros();
   esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(&data));
   data->packet_type = 0;  // Reset the packet type
   // Optional Error Handling
