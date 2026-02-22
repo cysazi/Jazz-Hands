@@ -1,9 +1,11 @@
 from vispy import app, scene
 import numpy as np
 import serial
+from JazzHands import ThreadedMultiDeviceReader, PacketData, DevicePacket
+from Accel_Filtering_Test import looping_function
 
 # serial settings
-PORT = "COM5"
+PORT = "/dev/cu.usbserial-023B6AC7"
 BAUD = 115200
 
 # refresh rate
@@ -18,32 +20,32 @@ ser = serial.Serial(PORT, BAUD, timeout=0.0)  # non-blocking
 # storing variable
 latest_accel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-
-def read_latest_packet():
-    # function to read the latest packet
-    global latest_accel
-
-    while True:
-        raw = ser.readline()
-        if not raw:
-            break  # no data to read
-
-        line = raw.decode("utf-8", errors="ignore").strip()
-        if not line:
-            continue
-
-        parts = line.split(",")
-        if len(parts) != 7:
-            continue
-
-        try:
-            # last three are ax, ay, az
-            ax = float(parts[-3])
-            ay = float(parts[-2])
-            az = float(parts[-1])
-            latest_accel[:] = (ax, ay, az)
-        except ValueError:
-            continue
+#
+# def read_latest_packet():
+#     # function to read the latest packet
+#     global latest_accel
+#
+#     while True:
+#         raw = ser.readline()
+#         if not raw:
+#             break  # no data to read
+#
+#         line = raw.decode("utf-8", errors="ignore").strip()
+#         if not line:
+#             continue
+#
+#         parts = line.split(",")
+#         if len(parts) != 7:
+#             continue
+#
+#         try:
+#             # last three are ax, ay, az
+#             ax = float(parts[-3])
+#             ay = float(parts[-2])
+#             az = float(parts[-1])
+#             latest_accel[:] = (ax, ay, az)
+#         except ValueError:
+#             continue
 
 
 # set the canvas
@@ -125,10 +127,14 @@ def update_visuals():
 
 
 def on_timer(event):
-    read_latest_packet()
+    looping_function()
     update_visuals()
 
-# timer is setting the refresh rate of the function
-timer = app.Timer(interval=UPDATE_INTERVAL, connect=on_timer, start=True)
+with ThreadedMultiDeviceReader() as reader:
+    # timer is setting the refresh rate of the function
+    reader.add_device(relay_id=1,port=PORT)
+    packet_count = 0
+    start_time = time.time()
+    timer = app.Timer(interval=UPDATE_INTERVAL, connect=on_timer, start=True)
 
-app.run()
+    app.run()
