@@ -1,7 +1,15 @@
 import csv
-from JazzHands import ThreadedMultiDeviceReader, COM_PORTS, DevicePacket
+import math
+from vispy.visuals.transforms import MatrixTransform  # type: ignore[import-untyped]
 from vispy import app, scene  # type: ignore[import-untyped]
 import numpy as np
+import os
+import sys
+
+here = os.path.dirname('/Users/cyrus/Coding/PycharmProjects/Jazz-Hands')
+sys.path.append(os.path.join(here, '..'))
+
+from JazzHands import DevicePacket, ThreadedMultiDeviceReader, GlovePair, quat_to_euler, COM_PORTS
 
 
 def log_packet_to_csv(packet: DevicePacket):
@@ -73,7 +81,6 @@ def setup_canvas():
     return canvas, view, grid, axes, x_label, y_label, z_label
 
 
-alpha = 0.025
 # 1. Setup CSV Logging
 
 csv_file = open('glove_data.csv', mode='w', newline='')
@@ -88,24 +95,43 @@ reader.packet_callback_function = log_packet_to_csv
 
 # Add devices using the ports defined in your configuration
 reader.add_device(relay_id=1, port=COM_PORTS[0])
+melody_glove = GlovePair(device_ids=(1, 2), relay_id=1, instrument_type="melody",
+                         relay_queue=reader.processing_queues[1])
 
-# 3. VisPy Visualization Setup
+# region VisPy Visualization Setup
 
 # General canvas setup
 canvas, view, grid, axes, x_label, y_label, z_label = setup_canvas()
 
 # Specific setup for this test
 # create the line for mapping acceleration
-acc_line = scene.visuals.Line(
+acc_line = scene.visuals.Arrow(
     pos=np.array([[0, 0, 0], [0, 0, 0]], dtype=np.float32),
     color=(1, 1, 0, 1),  # yellow
+    arrow_size=3,
     width=4,
     method="gl",
     parent=view.scene
 )
 
-# show text on screen (this is actually pretty cool i didn't know you could do this)
-mag_text = scene.visuals.Text(
+vel_line = scene.visuals.Arrow(
+    pos=np.array([[0, 0, 0], [0, 0, 0]], dtype=np.float32),
+    color=(1, 1, 0, 1),  # yellow
+    arrow_size=3,
+    width=4,
+    method="gl",
+    parent=view.scene
+)
+
+hand_object = scene.visuals.Sphere(radius=0.35, method='latitude', parent=view.scene,
+                                   edge_color='white')
+ellipsoid_transform = MatrixTransform()
+hand_object.transform = ellipsoid_transform
+ellipsoid_scale = np.array([2, 1, 0.5])
+ellipsoid_transform.scale(ellipsoid_scale)
+
+# show text on screen (this is actually pretty cool I didn't know you could do this)
+on_screen_text = scene.visuals.Text(
     "",
     color="white",
     font_size=14,
@@ -116,39 +142,79 @@ mag_text = scene.visuals.Text(
 )
 
 
+@canvas.events.key_press.connect
+def on_key_press(event):
+    if event.key == 'Space':
+        on_space_key_pressed()
+
+    elif event.key == 'A':
+        on_a_key_pressed()
+
+
+def on_a_key_pressed():
+    pass
+
+
+def on_space_key_pressed():
+    pass
+
+
+# endregion
+def quat_to_axis_angle(q):
+    """
+    Quaternion (x, y, z, w) → (axis, angle_deg).
+    axis: (ax, ay, az) unit vector
+    angle_deg: rotation angle in degrees
+    """
+    x, y, z, w = q
+    half = math.acos(max(-1.0, min(1.0, w)))
+    angle = 2.0 * half
+    s = math.sin(half)
+    if s < 1e-10:
+        return (1.0, 0.0, 0.0), 0.0
+    return math.degrees(angle), np.array([x, y, z], dtype=np.float32)
+
+
+def apply_euler(transform, roll, pitch, yaw):
+    """Apply intrinsic ZYX Euler rotation (in degrees) to a MatrixTransform."""
+    transform.rotate(yaw, (0, 0, 1))
+    transform.rotate(pitch, (0, 1, 0))
+    transform.rotate(roll, (1, 0, 0))
+
+
+def quat_to_euler_deg(q):
+    """Same as quat_to_euler but returns degrees."""
+    r, p, y = quat_to_euler(q)
+    return math.degrees(r), math.degrees(p), math.degrees(y)
+
+
 def update(event):
-    global alpha
-    latest_packet = None
-    acc_scale: int = 1
-    # "Drain" the queue to skip past all the old, lagged data
-    print(reader.processing_queues[1].qsize())
-    while not reader.processing_queues[1].empty():
-        try:
-            # get_nowait() prevents the script from hanging if the queue becomes empty exactly while we are checking it.
-            latest_packet = reader.processing_queues[1].get_nowait()
-        except Exception as e:
-            print(e)
-            break
-    if latest_packet:
-        # print("Latest packet received: ", latest_packet)
-        ax, ay, az = latest_packet.data.accel_x, latest_packet.data.accel_y, latest_packet.data.accel_z
-        tip = np.array([ax, ay, az], dtype=np.float32) * acc_scale
-        print("Tip: ", tip)
-        if latest_packet.data.error_handler:
-            alpha = latest_packet.data.error_handler * 0.005 % 1 + 0.025
+    """Fetch up-to-date data from the glove, update the physical object, and the"""
+    # Get updated data from the glove
+    pos = melody_glove.left_hand.position.astype(np.float32)
+    vel = melody_glove.left_hand.velocity.astype(np.float32)
+    acc = melody_glove.left_hand.global_acceleration.astype(np.float32)
+    rot = quat_to_euler(melody_glove.left_hand.rotation_quaternion)
 
-        acc_line.set_data(pos=np.array([[0, 0, 0], tip], dtype=np.float32))
+    # Transform the ellipsoid to reflect this new data.
+    ellipsoid_transform.reset()  # reset transformation matrix so we don't accumulate matrix operations from previous frames
+    ellipsoid_transform.translate(pos)  # 3) applied last → moves in world space
+    apply_euler(ellipsoid_transform, rot[0], rot[1], rot[2])  # 2) applied second → rotates around origin
+    ellipsoid_transform.scale(ellipsoid_scale)  # 1) applied first → shapes the ellipsoid
 
-        mag = float(np.linalg.norm([ax, ay, az]))
-        mag_text.text = f"ax, ay, az = {ax:2.3f}, {ay:2.3f}, {az:2.3f}  |a|={mag:2.3f} m/s²  |   α = {alpha:1.3f}"
+    # Add Vel and Acc vectors coming off of the object.
+    acc_line.set_data(pos=np.array([pos, pos + acc], dtype=np.float32))
+    vel_line.set_data(pos=np.array([pos, pos + vel], dtype=np.float32))
 
 
 # Start systems
 reader.start()  # Start the serial threads
+melody_glove.start()  # Start packet processing for
 timer = app.Timer(interval=(1 / 100), connect=update, start=True)
 
 try:
     app.run()
+
 
 finally:
     # Ensure resources are closed properly when the window is closed
