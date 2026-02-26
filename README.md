@@ -1,5 +1,16 @@
 # Jazz-Hands
 E-SONIC glove-based musical instrument
+## Planned UWB Locations
+2D plane of our performance
+{X} = UWB,    * = glove 
+```
+{X} - - - - - Known Distance - - - - {X}
+
+          ____           ____
+         |  * |         | *  |
+         |____|         |____|
+
+```
 ___
 # Box Initialization plans
 * Upon first button press, set that position as the origin

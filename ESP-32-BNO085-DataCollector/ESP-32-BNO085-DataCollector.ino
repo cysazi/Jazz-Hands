@@ -29,13 +29,13 @@ const uint8_t ESP_NOW_relayMAC[] = { 0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08 };  // T
 #define SPI_MOSI 23
 #define DW_CS 4
 
-// connection pins
+// Connection Pins
 const uint8_t PIN_RST = 27;  // reset pin
 const uint8_t PIN_IRQ = 34;  // irq pin
 const uint8_t PIN_SS = 4;    // spi select pin
 
 // Misc. definitions
-#define button_pin 23
+#define BUTTON_PIN 33
 
 // Jazz Hand (1/2) (LEFT/RIGHT) <- to be decided
 #define HEADER 0xAAAA
@@ -43,22 +43,23 @@ const uint8_t PIN_SS = 4;    // spi select pin
 
 // Packet Type Bitflags
 #define PACKET_HAS_ACCEL 0b00000001
-#define PACKET_HAS_QUAT 0b00000010
+#define PACKET_HAS_QUAT  0b00000010
 #define PACKET_HAS_UWB_1 0b00000100
 #define PACKET_HAS_UWB_2 0b00001000
+#define PACKET_HAS_ERROR 0b10000000
 
 // Packet struct definition
 typedef struct __attribute__((__packed__)) {  // has some special syntax to tell arduino to leave the raw data in byte form
   uint16_t header = HEADER;                   // 2 bytes
   uint8_t device_id = DEVICE_ID;              // 1 byte
+  uint32_t timestamp;                         // 4 bytes
   uint8_t packet_type;                        // 1 byte
-  unsigned long timestamp;                    // 8 bytes
   uint8_t button_state;                       // 1 byte
   float accel_x, accel_y, accel_z;            // 4*3 = 12 bytes
   float UWB_distance1, UWB_distance2;         // 4*2 = 8 bytes
   float quat_w, quat_i, quat_j, quat_k;       // 4*4 = 16 bytes
   uint8_t error_handler;                      // 1 byte
-} datapacket_t;                               // Total: 50 bytes
+} datapacket_t;                               // Total: 46 bytes
 
 // IMU Declarations
 Adafruit_BNO08x bno08x(BNO08X_RESET);
@@ -70,6 +71,9 @@ bool ready_to_send;
 bool has_rotation_vector = false;
 uint32_t last_accel_time = 0;     // For 400Hz timing
 uint32_t last_rotation_time = 0;  // For 100Hz timing
+// Global variables for filtered acceleration
+float filtered_acc_x = 0, filtered_acc_y = 0, filtered_acc_z = 0;
+float acc_alpha = 0.035;  // Constant between 0 and 1.
 
 // Set desired data for BNO085
 void setReports() {
@@ -87,7 +91,8 @@ void setup() {
   // Initialize Serial
   Serial.begin(115200);
   delay(100);
-
+  // Initialize Button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   // Initialize Wire
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);  // 400kHz for stability/faster I2C
@@ -123,8 +128,6 @@ void setup() {
   DW1000Ranging.attachNewRange(newRange);
   DW1000Ranging.attachNewDevice(newDevice);
   DW1000Ranging.attachInactiveDevice(inactiveDevice);
-  //Enable this filter to smooth the distance
-  //DW1000Ranging.useRangeFilter(true);
 
   // Start the module as a tag
   DW1000Ranging.startAsTag("7D:00:22:EA:82:60:3B:9C", DW1000.MODE_SHORTDATA_FAST_ACCURACY);
@@ -136,13 +139,12 @@ void loop() {
   DW1000Ranging.loop();
 
   // Button State Reading
-  current_readings.button_state = digitalRead(button_pin);
-
+  current_readings.button_state = digitalRead(BUTTON_PIN);
   // IMU Data Collection
   while (bno08x.getSensorEvent(&sensorValue)) {
     switch (sensorValue.sensorId) {
       case SH2_ROTATION_VECTOR:
-        if (!current_readings.packet_type & PACKET_HAS_QUAT) {
+        if ((current_readings.packet_type & PACKET_HAS_QUAT) != PACKET_HAS_QUAT) {
           current_readings.quat_w = sensorValue.un.rotationVector.real;
           current_readings.quat_i = sensorValue.un.rotationVector.i;
           current_readings.quat_j = sensorValue.un.rotationVector.j;
@@ -151,12 +153,17 @@ void loop() {
         }
         break;
       case SH2_LINEAR_ACCELERATION:
-        if (!current_readings.packet_type & PACKET_HAS_ACCEL) {
-          current_readings.accel_x = sensorValue.un.linearAcceleration.x;
-          current_readings.accel_y = sensorValue.un.linearAcceleration.y;
-          current_readings.accel_z = sensorValue.un.linearAcceleration.z;
-          current_readings.packet_type |= PACKET_HAS_ACCEL;  // tells python that this packet has accel data
-        }
+        // One pole recursive Low-Pass Filter
+        filtered_acc_x = (acc_alpha * sensorValue.un.linearAcceleration.x) + (1.0 - acc_alpha) * filtered_acc_x;
+        filtered_acc_y = (acc_alpha * sensorValue.un.linearAcceleration.y) + (1.0 - acc_alpha) * filtered_acc_y;
+        filtered_acc_z = (acc_alpha * sensorValue.un.linearAcceleration.z) + (1.0 - acc_alpha) * filtered_acc_z;
+
+        // Assign the smoothed values to the data packet
+        current_readings.accel_x = filtered_acc_x;
+        current_readings.accel_y = filtered_acc_y;
+        current_readings.accel_z = filtered_acc_z;
+
+        current_readings.packet_type |= PACKET_HAS_ACCEL;  // Tells python that this packet has accel data
         break;
     }
     // If both Rotation and Accel are acquired, break out of the while loop regardless of queue contents
@@ -164,12 +171,13 @@ void loop() {
       break;
     }
   }
-  if (current_readings.packet_type != 0) {
+  if ((current_readings.packet_type & PACKET_HAS_QUAT) == PACKET_HAS_QUAT) {
     sendPacket(&current_readings);
   }
 }
 
 void sendPacket(datapacket_t* data) {
+  current_readings.timestamp = micros();
   esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(&data));
   data->packet_type = 0;  // Reset the packet type
   // Optional Error Handling
@@ -203,12 +211,12 @@ void newRange() {
 }
 
 void newDevice(DW1000Device* device) {
-  Serial.print("ranging init; 1 device added ! -> ");
-  Serial.print(" short:");
-  Serial.println(device->getShortAddress(), HEX);
+  // Serial.print("ranging init; 1 device added ! -> ");
+  // Serial.print(" short:");
+  // Serial.println(device->getShortAddress(), HEX);
 }
 
 void inactiveDevice(DW1000Device* device) {
-  Serial.print("deleting inactive device: ");
-  Serial.println(device->getShortAddress(), HEX);
+  // Serial.print("deleting inactive device: ");
+  // Serial.println(device->getShortAddress(), HEX);
 }
