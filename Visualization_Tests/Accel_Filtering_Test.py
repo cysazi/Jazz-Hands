@@ -1,10 +1,13 @@
 import csv
 import math
+import time
+
 from vispy.visuals.transforms import MatrixTransform  # type: ignore[import-untyped]
 from vispy import app, scene  # type: ignore[import-untyped]
 import numpy as np
 import os
 import sys
+import Visualization_Helper_Functions  # type: ignore[import-not-found]
 
 here = os.path.dirname('/Users/cyrus/Coding/PycharmProjects/Jazz-Hands')
 sys.path.append(os.path.join(here, '..'))
@@ -14,71 +17,17 @@ from JazzHands import DevicePacket, ThreadedMultiDeviceReader, GlovePair, quat_t
 
 def log_packet_to_csv(packet: DevicePacket):
     """Callback function that writes every received packet to the CSV."""
+    global melody_glove
     print("callback triggered: ", packet)
     csv_writer.writerow([
         packet.data.device_number, packet.data.timestamp,
         packet.data.accel_x, packet.data.accel_y, packet.data.accel_z,
         packet.data.UWB_distance_1, packet.data.UWB_distance_2,
         packet.data.button_state, packet.data.quat_w, packet.data.quat_i,
-        packet.data.quat_j, packet.data.quat_k
+        packet.data.quat_j, packet.data.quat_k,
+        melody_glove.left_hand.velocity[0], melody_glove.left_hand.velocity[1], melody_glove.left_hand.velocity[2],
+        melody_glove.left_hand.position[0], melody_glove.left_hand.position[1], melody_glove.left_hand.position[2]
     ])
-
-
-def setup_canvas():
-    """Call as:
-
-    canvas, view, grid, axes, x_label, y_label, z_label = setup_canvas()
-
-    Sets up the Canvas window in 1 function for importing and repeatability
-
-    """
-    # Set the canvas
-    canvas = scene.SceneCanvas(
-        keys="interactive",
-        show=True,
-        bgcolor="black",
-        size=(900, 700)
-    )
-    view = canvas.central_widget.add_view()
-    view.camera = scene.cameras.TurntableCamera(
-        fov=45,
-        distance=6.0,
-        center=(0, 0, 0)
-    )
-
-    # Grid + axes
-    grid = scene.visuals.GridLines(
-        scale=(1, 1),
-        color=(0.3, 0.3, 0.3, 1.0)
-    )
-    view.add(grid)
-
-    axes = scene.visuals.XYZAxis(width=2)
-    view.add(axes)
-
-    #
-    x_label = scene.visuals.Text(
-        "X",
-        color="red",
-        font_size=25,
-        pos=(1.2, 0, 0),
-        parent=view.scene
-    )
-    y_label = scene.visuals.Text(
-        "Y",
-        color="green",
-        font_size=25,
-        pos=(0, 1.2, 0),
-        parent=view.scene
-    )
-    z_label = scene.visuals.Text(
-        "Z",
-        color="blue",
-        font_size=25,
-        pos=(0, 0, 1.2),
-        parent=view.scene
-    )
-    return canvas, view, grid, axes, x_label, y_label, z_label
 
 
 # 1. Setup CSV Logging
@@ -86,8 +35,9 @@ def setup_canvas():
 csv_file = open('glove_data.csv', mode='w', newline='')
 csv_writer = csv.writer(csv_file)
 # Headers based on PacketData class in JazzHands.py
-csv_writer.writerow(['device_id', 'timestamp', 'accel_x', 'accel_y', 'accel_z',
-                     'uwb_1', 'uwb_2', 'button', 'quat_w', 'quat_i', 'quat_j', 'quat_k'])
+csv_writer.writerow({'device_id', 'timestamp', 'accel_x', 'accel_y', 'accel_z',
+                     'uwb_1', 'uwb_2', 'button', 'quat_w', 'quat_i', 'quat_j',
+                     'quat_k', 'vel_x', 'vel_y', 'vel_z', 'pos_x', })
 
 # 2. Initialize the Reader
 reader = ThreadedMultiDeviceReader()
@@ -127,7 +77,7 @@ hand_object = scene.visuals.Sphere(radius=0.35, method='latitude', parent=view.s
                                    edge_color='white')
 ellipsoid_transform = MatrixTransform()
 hand_object.transform = ellipsoid_transform
-ellipsoid_scale = np.array([2, 1, 0.5])
+ellipsoid_scale = np.array([.2, .1, 0.05])
 ellipsoid_transform.scale(ellipsoid_scale)
 
 # show text on screen (this is actually pretty cool I didn't know you could do this)
@@ -156,7 +106,17 @@ def on_a_key_pressed():
 
 
 def on_space_key_pressed():
-    pass
+    global reader, melody_glove
+    reader.stop()
+    melody_glove.stop()
+    melody_glove.left_hand.velocity.fill(0)
+    melody_glove.left_hand.position.fill(0)
+    melody_glove.left_hand.global_acceleration.fill(0)
+    melody_glove.left_hand.local_acceleration.fill(0)
+    print("Resetting...")
+    time.sleep(0.5)
+    reader.start()
+    melody_glove.start()
 
 
 # endregion
@@ -175,12 +135,6 @@ def quat_to_axis_angle(q):
     return math.degrees(angle), np.array([x, y, z], dtype=np.float32)
 
 
-def apply_euler(transform, roll, pitch, yaw):
-    """Apply intrinsic ZYX Euler rotation (in degrees) to a MatrixTransform."""
-    transform.rotate(yaw, (0, 0, 1))
-    transform.rotate(pitch, (0, 1, 0))
-    transform.rotate(roll, (1, 0, 0))
-
 
 def quat_to_euler_deg(q):
     """Same as quat_to_euler but returns degrees."""
@@ -195,6 +149,9 @@ def update(event):
     vel = melody_glove.left_hand.velocity.astype(np.float32)
     acc = melody_glove.left_hand.global_acceleration.astype(np.float32)
     rot = quat_to_euler(melody_glove.left_hand.rotation_quaternion)
+    on_screen_text.text = (f"Pos: {pos[0]:+.2}, {pos[1]:+.2}, {pos[2]:+.2} \n"
+                           f"Vel: {vel[0]:+.2}, {vel[1]:+.2}, {vel[2]:+.2} \n"
+                           f"")
 
     # Transform the ellipsoid to reflect this new data.
     ellipsoid_transform.reset()  # reset transformation matrix so we don't accumulate matrix operations from previous frames
