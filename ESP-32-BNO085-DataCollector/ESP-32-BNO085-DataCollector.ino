@@ -139,7 +139,7 @@ void loop() {
   DW1000Ranging.loop();
 
   // Button State Reading
-  current_readings.button_state = digitalRead(button_pin);
+  current_readings.button_state = digitalRead(BUTTON_PIN);
   // IMU Data Collection
   while (bno08x.getSensorEvent(&sensorValue)) {
     switch (sensorValue.sensorId) {
