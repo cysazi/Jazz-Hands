@@ -106,17 +106,7 @@ def on_a_key_pressed():
 
 
 def on_space_key_pressed():
-    global reader, melody_glove
-    reader.stop()
-    melody_glove.stop()
-    melody_glove.left_hand.velocity.fill(0)
-    melody_glove.left_hand.position.fill(0)
-    melody_glove.left_hand.global_acceleration.fill(0)
-    melody_glove.left_hand.local_acceleration.fill(0)
-    print("Resetting...")
-    time.sleep(0.5)
-    reader.start()
-    melody_glove.start()
+    pass
 
 
 # endregion
