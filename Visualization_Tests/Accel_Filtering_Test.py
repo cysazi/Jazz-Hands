@@ -138,7 +138,7 @@ def update(event):
     pos = melody_glove.left_hand.position.astype(np.float32)
     vel = melody_glove.left_hand.velocity.astype(np.float32)
     acc = melody_glove.left_hand.global_acceleration.astype(np.float32)
-    rot = quat_to_euler(melody_glove.left_hand.rotation_quaternion)
+    rot = quat_to_euler_deg(melody_glove.left_hand.rotation_quaternion)
     on_screen_text.text = (f"Pos: {pos[0]:+.2}, {pos[1]:+.2}, {pos[2]:+.2} \n"
                            f"Vel: {vel[0]:+.2}, {vel[1]:+.2}, {vel[2]:+.2} \n"
                            f"")
