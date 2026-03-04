@@ -680,18 +680,34 @@ class Glove:
         calculated_threshold: np.floating = base_noise_floor + (variance * dynamic_scaling)
         return min(calculated_threshold, max_threshold)  # type: ignore[return-value]
 
-    def needs_zupt(self, local_accel: np.ndarray) -> bool:
+    def needs_zupt(self) -> bool:
         """Check if local accel is just signal noise."""
-        magnitude = np.linalg.norm(local_accel)
+        magnitude = np.linalg.norm(self.local_acceleration)
         # dynamic_threshold = self.get_dynamic_zupt_threshold()
         dynamic_threshold = 0.15
         return bool(magnitude < dynamic_threshold)  # return the True or False that this generates
 
     def integrate_function(self):
         """Calculate and integrate global-frame accel to find velocity and position"""
-        # ZUPT on the LOCAL acceleration
+
         dt = get_dt_seconds(self.current_packet_timestamp, self.last_packet_timestamp)
-        if self.needs_zupt(self.local_acceleration):
+        # Check for ESP32 Reset:
+        # if dt is very large, go back to zero everything.
+        if dt > 1.0:
+            print(f"[!] ESP32 Reset or major lag detected on Glove {self.device_id}. Re-zeroing...")
+
+            # Reset the physics state
+            self.velocity = np.array([0.0, 0.0, 0.0])
+            self.position = np.array([0.0, 0.0, 0.0])
+
+            # Re-establish our base coordinate frame
+            self.calibrate_zero_frame()
+
+            # Skip integration for this frame to avoid physics explosions
+            return
+
+        # ZUPT on the LOCAL acceleration
+        if self.needs_zupt():
             self.velocity *= 0.5  # dampen velocity by 1 half
             if np.linalg.norm(self.velocity) < 0.01:
                 self.velocity = np.array([0.0, 0.0, 0.0])
