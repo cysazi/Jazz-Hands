@@ -2,12 +2,13 @@ import csv
 import math
 import time
 
+from vispy.geometry import create_sphere
 from vispy.visuals.transforms import MatrixTransform  # type: ignore[import-untyped]
 from vispy import app, scene  # type: ignore[import-untyped]
 import numpy as np
 import os
 import sys
-import Visualization_Helper_Functions  # type: ignore[import-not-found]
+import Visualization_Helper_Functions as vp  # type: ignore[import-not-found]
 
 here = os.path.dirname('/Users/cyrus/Coding/PycharmProjects/Jazz-Hands')
 sys.path.append(os.path.join(here, '..'))
@@ -51,7 +52,7 @@ melody_glove = GlovePair(device_ids=(1, 2), relay_id=1, instrument_type="melody"
 # region VisPy Visualization Setup
 
 # General canvas setup
-canvas, view, grid, axes, x_label, y_label, z_label = setup_canvas()
+canvas, view, grid, axes, x_label, y_label, z_label = vp.setup_canvas()
 
 # Specific setup for this test
 # create the line for mapping acceleration
@@ -73,12 +74,35 @@ vel_line = scene.visuals.Arrow(
     parent=view.scene
 )
 
-hand_object = scene.visuals.Sphere(radius=0.35, method='latitude', parent=view.scene,
-                                   edge_color='white')
+# ── Ellipsoid Semi-Axes ────────────────────────────────────────────────────────
+a = 2.0   # semi-axis along X
+b = 1.0   # semi-axis along Y
+c = 0.5   # semi-axis along Z
+# ── Build Ellipsoid Mesh ───────────────────────────────────────────────────────
+# Start from a unit sphere (centered at origin) and scale each axis
+sphere_data = create_sphere(rows=60, cols=60, radius=1.0)
+vertices = sphere_data.get_vertices().copy()   # shape: (N, 3)
+faces    = sphere_data.get_faces()             # shape: (M, 3)
+
+# Scale each axis to transform the sphere into an ellipsoid:
+#   x = a·sin(φ)·cos(θ),  y = b·sin(φ)·sin(θ),  z = c·cos(φ)
+vertices[:, 0] *= a
+vertices[:, 1] *= b
+vertices[:, 2] *= c
+
+# ── Solid Mesh Visual ──────────────────────────────────────────────────────────
+ellipsoid = scene.visuals.Mesh(
+    vertices=vertices,
+    faces=faces,
+    color=(0.2, 0.6, 1.0, 1.0),
+    shading='smooth'
+)
+
+hand_object = ellipsoid
+view.add(hand_object)
+# ── Set up  ──────────────────────────────────────────────────────────
 ellipsoid_transform = MatrixTransform()
 hand_object.transform = ellipsoid_transform
-ellipsoid_scale = np.array([.2, .1, 0.05])
-ellipsoid_transform.scale(ellipsoid_scale)
 
 # show text on screen (this is actually pretty cool I didn't know you could do this)
 on_screen_text = scene.visuals.Text(
@@ -145,10 +169,8 @@ def update(event):
 
     # Transform the ellipsoid to reflect this new data.
     ellipsoid_transform.reset()  # reset transformation matrix so we don't accumulate matrix operations from previous frames
-    ellipsoid_transform.translate(pos)  # 3) applied last → moves in world space
-    apply_euler(ellipsoid_transform, rot[0], rot[1], rot[2])  # 2) applied second → rotates around origin
-    ellipsoid_transform.scale(ellipsoid_scale)  # 1) applied first → shapes the ellipsoid
-
+    ellipsoid_transform.translate(pos)  # 2) applied last → moves in world space
+    vp.apply_euler(ellipsoid_transform, rot[0], rot[1], rot[2])  # 1) applied second → rotates around origin
     # Add Vel and Acc vectors coming off of the object.
     acc_line.set_data(pos=np.array([pos, pos + acc], dtype=np.float32))
     vel_line.set_data(pos=np.array([pos, pos + vel], dtype=np.float32))
