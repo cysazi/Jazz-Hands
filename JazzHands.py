@@ -490,7 +490,7 @@ class ThreadedMultiDeviceReader:
 
 def quat_to_euler(q):
     """
-    Quaternion (x, y, z, w) → Euler angles (roll, pitch, yaw) in radians.
+    Quaternion (w, x, y, z) → Euler angles (roll, pitch, yaw) in radians.
 
     Convention: Intrinsic ZYX (Tait-Bryan angles)
       - Roll  = rotation about X
