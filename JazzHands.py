@@ -706,16 +706,28 @@ class Glove:
             self.velocity = np.array([0.0, 0.0, 0.0])
             self.position = np.array([0.0, 0.0, 0.0])
 
+            self.rotation_history.clear()
+            self.velocity_history.clear()
+            self.position_history.clear()
+
             # Re-establish our base coordinate frame
             self.calibrate_zero_frame()
 
             # Skip integration for this frame to avoid physics explosions
             return
 
+        # Calculate Angular Velocity (deg/s)
+        angular_speed = 0.0
+        if len(self.rotation_history) > 0:
+            q_diff = quat_multiply(self.rotation_quaternion, quat_conjugate(self.rotation_history[-1]))
+            w_diff = max(-1.0, min(1.0, q_diff[0]))  # Clamp for safety
+            if dt > 0:
+                angular_speed = math.degrees(2 * math.acos(w_diff)) / dt
+
         # ZUPT on the LOCAL acceleration
         if self.needs_zupt():
             self.velocity *= 0.5  # dampen velocity by 1 half
-            if np.linalg.norm(self.velocity) < 0.01:
+            if np.linalg.norm(self.velocity) < 0.05:
                 self.velocity = np.array([0.0, 0.0, 0.0])
         else:
             # Calculate the relative orientation
@@ -725,8 +737,16 @@ class Glove:
             # Rotate local accel into your CUSTOM global frame
             global_accel = rotate_vector(q_relative, self.local_acceleration)
 
+            # Rotation Suppression: If rotating fast, kill linear acceleration
+            if angular_speed > 50.0:
+                global_accel *= 0.0
+
             # Integrate velocity (only if ZUPT ≠ True)
             self.velocity += global_accel * dt
+
+            # Apply drag/friction to velocity to prevent infinite drift
+            self.velocity *= 0.95
+
         # Integrate position always (ve.locity could be dampening
         self.position += self.velocity * dt
 
