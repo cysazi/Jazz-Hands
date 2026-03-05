@@ -1,7 +1,5 @@
 import csv
 import math
-import time
-
 from vispy.geometry import create_sphere
 from vispy.visuals.transforms import MatrixTransform  # type: ignore[import-untyped]
 from vispy import app, scene  # type: ignore[import-untyped]
@@ -136,17 +134,18 @@ def on_space_key_pressed():
 # endregion
 def quat_to_axis_angle(q):
     """
-    Quaternion (x, y, z, w) → (axis, angle_deg).
-    axis: (ax, ay, az) unit vector
-    angle_deg: rotation angle in degrees
+    Quaternion (w, x, y, z) -> (angle_deg, axis_vec).
     """
-    x, y, z, w = q
+    w, x, y, z = q
     half = math.acos(max(-1.0, min(1.0, w)))
     angle = 2.0 * half
     s = math.sin(half)
     if s < 1e-10:
-        return (1.0, 0.0, 0.0), 0.0
-    return math.degrees(angle), np.array([x, y, z], dtype=np.float32)
+        return 0.0, np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    
+    # Normalize the axis
+    axis = np.array([x, y, z], dtype=np.float32) / s
+    return math.degrees(angle), axis
 
 
 
@@ -162,7 +161,7 @@ def update(event):
     pos = melody_glove.left_hand.position.astype(np.float32)
     vel = melody_glove.left_hand.velocity.astype(np.float32)
     acc = melody_glove.left_hand.global_acceleration.astype(np.float32)
-    rot = quat_to_euler_deg(melody_glove.left_hand.rotation_quaternion)
+    angle, axis = quat_to_axis_angle(melody_glove.left_hand.rotation_quaternion)
     on_screen_text.text = (f"Pos: {pos[0]:+.2}, {pos[1]:+.2}, {pos[2]:+.2} \n"
                            f"Vel: {vel[0]:+.2}, {vel[1]:+.2}, {vel[2]:+.2} \n"
                            f"")
@@ -170,7 +169,7 @@ def update(event):
     # Transform the ellipsoid to reflect this new data.
     ellipsoid_transform.reset()  # reset transformation matrix so we don't accumulate matrix operations from previous frames
     ellipsoid_transform.translate(pos)  # 2) applied last → moves in world space
-    vp.apply_euler(ellipsoid_transform, rot[0], rot[1], rot[2])  # 1) applied second → rotates around origin
+    ellipsoid_transform.rotate(angle, axis)  # 1) applied second → rotates around origin
     # Add Vel and Acc vectors coming off of the object.
     acc_line.set_data(pos=np.array([pos, pos + acc], dtype=np.float32))
     vel_line.set_data(pos=np.array([pos, pos + vel], dtype=np.float32))
@@ -188,4 +187,5 @@ try:
 finally:
     # Ensure resources are closed properly when the window is closed
     reader.stop()
+    melody_glove.stop()
     csv_file.close()

@@ -43,7 +43,7 @@ const uint8_t PIN_SS = 4;    // spi select pin
 
 // Packet Type Bitflags
 #define PACKET_HAS_ACCEL 0b00000001
-#define PACKET_HAS_QUAT  0b00000010
+#define PACKET_HAS_QUAT 0b00000010
 #define PACKET_HAS_UWB_1 0b00000100
 #define PACKET_HAS_UWB_2 0b00001000
 #define PACKET_HAS_ERROR 0b10000000
@@ -73,7 +73,11 @@ uint32_t last_accel_time = 0;     // For 400Hz timing
 uint32_t last_rotation_time = 0;  // For 100Hz timing
 // Global variables for filtered acceleration
 float filtered_acc_x = 0, filtered_acc_y = 0, filtered_acc_z = 0;
-float acc_alpha = 0.04;  // Constant between 0 and 1.
+float acc_alpha = 0.05;  // Constant between 0 and 1.
+// Testing Acc alpha values
+int acc_alpha_increment_counter = 1;
+const float ACC_ALPHA_INCREMENT_AMOUNT = 0.05;
+const int ACC_ALPHA_MAX_INCREMENT = 1 / ACC_ALPHA_INCREMENT_AMOUNT;
 
 // Set desired data for BNO085
 void setReports() {
@@ -133,7 +137,7 @@ void setup() {
   DW1000Ranging.startAsTag("7D:00:22:EA:82:60:3B:9C", DW1000.MODE_SHORTDATA_FAST_ACCURACY);
 }
 
-int acc_alpha_increment_counter = 1;
+
 
 void loop() {
 
@@ -142,14 +146,17 @@ void loop() {
   // Button State Reading
   current_readings.button_state = digitalRead(BUTTON_PIN);
   if (current_readings.button_state == 0) {
-    acc_alpha += 0.005;
-    if (acc_alpha >= 1.0) {
-      acc_alpha -= 1.0;
+    acc_alpha_increment_counter++;
+    if (acc_alpha_increment_counter >= ACC_ALPHA_MAX_INCREMENT) {
+      acc_alpha_increment_counter = 1;
+
     }
+    acc_alpha = acc_alpha_increment_counter * ACC_ALPHA_INCREMENT_AMOUNT;
     filtered_acc_x = 0;
     filtered_acc_y = 0;
     filtered_acc_z = 0;
     delay(500);
+
     acc_alpha_increment_counter++;
     current_readings.error_handler = acc_alpha_increment_counter;
     current_readings.packet_type |= PACKET_HAS_ERROR;

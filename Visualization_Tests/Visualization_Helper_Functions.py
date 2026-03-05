@@ -1,5 +1,4 @@
-import numpy as np
-from vispy import scene, app
+from vispy import scene
 def setup_canvas():
     """Call as:
 
