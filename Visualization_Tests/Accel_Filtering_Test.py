@@ -1,7 +1,5 @@
 import csv
 import math
-import time
-
 from vispy.geometry import create_sphere
 from vispy.visuals.transforms import MatrixTransform  # type: ignore[import-untyped]
 from vispy import app, scene  # type: ignore[import-untyped]
@@ -189,4 +187,5 @@ try:
 finally:
     # Ensure resources are closed properly when the window is closed
     reader.stop()
+    melody_glove.stop()
     csv_file.close()

@@ -689,6 +689,11 @@ class Glove:
 
     def integrate_function(self):
         """Calculate and integrate global-frame accel to find velocity and position"""
+        #TODO: REMOVE THIS IN PLACE OF THE INITIALIZATION LOGIC
+
+        # For the first packet, remember the initial state. After, this will be a set value and therefore won't run
+        if self.reference_quaternion is None:
+            self.calibrate_zero_frame()
 
         dt = get_dt_seconds(self.current_packet_timestamp, self.last_packet_timestamp)
         # Check for ESP32 Reset:
@@ -888,7 +893,13 @@ def main():
     timer = app.Timer(interval=(1 / 60), connect=update_visuals, start=False)
     app.run()
     # region ======================= Initiation Logic =======================
+    # Main While loop for
+    while True:
 
+
+
+
+        pass
 
 if __name__ == "__main__":
     main()
