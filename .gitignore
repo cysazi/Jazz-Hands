@@ -1,3 +1,6 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+Jazz-Hands.iml
+.gitignore
+misc.xml
