@@ -154,22 +154,26 @@ def quat_to_euler_deg(q):
     r, p, y = quat_to_euler(q)
     return math.degrees(r), math.degrees(p), math.degrees(y)
 
+alpha = 0.05
 
 def update(event):
     """Fetch up-to-date data from the glove, update the physical object, and the"""
     # Get updated data from the glove
+    global alpha
+    if melody_glove.left_hand.error:
+        alpha = 0.05 * melody_glove.left_hand.error
     pos = melody_glove.left_hand.position.astype(np.float32)
     vel = melody_glove.left_hand.velocity.astype(np.float32)
     acc = melody_glove.left_hand.global_acceleration.astype(np.float32)
     angle, axis = quat_to_axis_angle(melody_glove.left_hand.rotation_quaternion)
     on_screen_text.text = (f"Pos: {pos[0]:+.2}, {pos[1]:+.2}, {pos[2]:+.2} \n"
                            f"Vel: {vel[0]:+.2}, {vel[1]:+.2}, {vel[2]:+.2} \n"
-                           f"")
+                           f"α = {alpha:.2}")
 
     # Transform the ellipsoid to reflect this new data.
     ellipsoid_transform.reset()  # reset transformation matrix so we don't accumulate matrix operations from previous frames
-    ellipsoid_transform.translate(pos)  # 2) applied last → moves in world space
     ellipsoid_transform.rotate(angle, axis)  # 1) applied second → rotates around origin
+    ellipsoid_transform.translate(pos)  # 2) applied last → moves in world space
     # Add Vel and Acc vectors coming off of the object.
     acc_line.set_data(pos=np.array([pos, pos + acc], dtype=np.float32))
     vel_line.set_data(pos=np.array([pos, pos + vel], dtype=np.float32))
