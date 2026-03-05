@@ -624,6 +624,7 @@ class Glove:
     UWB_2_timestamp: int | None = None  # in µs
     is_initiated: bool = False
     button_state: bool = False
+    error: int = 0
 
     # Current 3D orientation data
     local_acceleration: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
