@@ -1,5 +1,4 @@
 import csv
-import math
 from vispy.geometry import create_sphere
 from vispy.visuals.transforms import MatrixTransform  # type: ignore[import-untyped]
 from vispy import app, scene  # type: ignore[import-untyped]
@@ -7,7 +6,7 @@ from vispy.io import read_mesh
 import numpy as np
 import os
 import Visualization_Helper_Functions as vp  # type: ignore[import-not-found]
-from JazzHands import DevicePacket, ThreadedMultiDeviceReader, GlovePair, quat_to_euler, COM_PORTS
+from JazzHands import DevicePacket, ThreadedMultiDeviceReader, GlovePair, quat_to_axis_angle, COM_PORTS
 
 CURRENT_FILEPATH = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_FILEPATH)
@@ -136,34 +135,6 @@ def on_space_key_pressed():
 
 
 # endregion
-def quat_to_axis_angle(q):
-    """
-    Quaternion (w, x, y, z) → (angle_deg, axis).
-    angle_deg: rotation angle in degrees
-    axis: (ax, ay, az) unit vector
-    """
-    w, x, y, z = q
-    # Clamp w to the valid range for acos
-    w_clamped = max(-1.0, min(1.0, w))
-    half_angle_rad = math.acos(w_clamped)
-    angle_deg = math.degrees(2.0 * half_angle_rad)
-
-    sin_half_angle = math.sin(half_angle_rad)
-
-    # If angle is close to 0, axis is not well-defined.
-    # In this case, we can return any unit vector, like (1, 0, 0).
-    if abs(sin_half_angle) < 1e-8:
-        return 0.0, (1.0, 0.0, 0.0)
-
-    # Normalize the vector part of the quaternion to get the rotation axis.
-    axis = np.array([x, y, z], dtype=np.float32) / sin_half_angle
-    return angle_deg, axis
-
-
-def quat_to_euler_deg(q):
-    """Same as quat_to_euler but returns degrees."""
-    r, p, y = quat_to_euler(q)
-    return math.degrees(r), math.degrees(p), math.degrees(y)
 
 alpha = 0.05
 

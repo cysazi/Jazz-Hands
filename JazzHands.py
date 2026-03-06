@@ -571,6 +571,36 @@ def rotate_vector(quaternion: np.ndarray, local_vector: np.ndarray) -> np.ndarra
     ])
 
 
+def quat_to_axis_angle(q):
+    """
+    Quaternion (w, x, y, z) → (angle_deg, axis).
+    angle_deg: rotation angle in degrees
+    axis: (ax, ay, az) unit vector
+    """
+    w, x, y, z = q
+    # Clamp w to the valid range for acos
+    w_clamped = max(-1.0, min(1.0, w))
+    half_angle_rad = math.acos(w_clamped)
+    angle_deg = math.degrees(2.0 * half_angle_rad)
+
+    sin_half_angle = math.sin(half_angle_rad)
+
+    # If angle is close to 0, axis is not well-defined.
+    # In this case, we can return any unit vector, like (1, 0, 0).
+    if abs(sin_half_angle) < 1e-8:
+        return 0.0, (1.0, 0.0, 0.0)
+
+    # Normalize the vector part of the quaternion to get the rotation axis.
+    axis = np.array([x, y, z], dtype=np.float32) / sin_half_angle
+    return angle_deg, axis
+
+
+def quat_to_euler_deg(q):
+    """Same as quat_to_euler but returns degrees."""
+    r, p, y = quat_to_euler(q)
+    return math.degrees(r), math.degrees(p), math.degrees(y)
+
+
 def get_dt_seconds(current_us: int, last_us: int) -> float:
     """Calculates dt in seconds, perfectly handling 32-bit microsecond rollovers."""
 
@@ -651,8 +681,8 @@ class Glove:
         self.reference_quaternion = self.rotation_quaternion.copy()
         # Find current UWB coordinates
         if self.UWB_distance_1 is not None and self.UWB_distance_2 is not None:
-        self.reference_UWB_coordinates = triangulate_position(self.UWB_distance_1, self.UWB_distance_2,
-                                                              DISTANCE_BETWEEN_UWB_ANCHORS)
+            self.reference_UWB_coordinates = triangulate_position(self.UWB_distance_1, self.UWB_distance_2,
+                                                                  DISTANCE_BETWEEN_UWB_ANCHORS)
         print(f"Glove {self.device_id} frame calibrated!")
 
     def get_dynamic_zupt_threshold(self) -> float:
