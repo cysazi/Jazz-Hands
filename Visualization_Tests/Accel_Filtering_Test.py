@@ -3,15 +3,17 @@ import math
 from vispy.geometry import create_sphere
 from vispy.visuals.transforms import MatrixTransform  # type: ignore[import-untyped]
 from vispy import app, scene  # type: ignore[import-untyped]
+from vispy.io import read_mesh
 import numpy as np
 import os
 import sys
 import Visualization_Helper_Functions as vp  # type: ignore[import-not-found]
-
-here = os.path.dirname('/Users/cyrus/Coding/PycharmProjects/Jazz-Hands')
-sys.path.append(os.path.join(here, '..'))
-
 from JazzHands import DevicePacket, ThreadedMultiDeviceReader, GlovePair, quat_to_euler, COM_PORTS
+
+CURRENT_FILEPATH = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_FILEPATH)
+HAND_OBJ_PATH = os.path.join(CURRENT_FILEPATH, "hand.obj")
+
 
 
 def log_packet_to_csv(packet: DevicePacket):
@@ -89,24 +91,27 @@ vertices[:, 1] *= b
 vertices[:, 2] *= c
 
 # ── Solid Mesh Visual ──────────────────────────────────────────────────────────
-ellipsoid = scene.visuals.Mesh(
+
+if not os.path.exists(HAND_OBJ_PATH):
+    raise FileNotFoundError(f"Could not find model: {HAND_OBJ_PATH}")
+
+vertices, faces, _normals, _texcoords = read_mesh(HAND_OBJ_PATH)
+hand = scene.visuals.Mesh(
     vertices=vertices,
     faces=faces,
-    color=(0.2, 0.6, 1.0, 1.0),
-    shading='smooth'
+    color=(0.25, 0.75, 0.95, 1.0),
+    shading="smooth",
+    parent=view.scene,
 )
 
-hand_object = ellipsoid
-view.add(hand_object)
-# ── Set up  ──────────────────────────────────────────────────────────
-ellipsoid_transform = MatrixTransform()
-hand_object.transform = ellipsoid_transform
+hand_transform = MatrixTransform()
+hand.transform = hand_transform
 
-# show text on screen (this is actually pretty cool I didn't know you could do this)
+# show text on the screen
 on_screen_text = scene.visuals.Text(
     "",
     color="white",
-    font_size=14,
+    font_size=12,
     pos=(10, 10),
     anchor_x="left",
     anchor_y="bottom",
@@ -134,19 +139,26 @@ def on_space_key_pressed():
 # endregion
 def quat_to_axis_angle(q):
     """
-    Quaternion (w, x, y, z) -> (angle_deg, axis_vec).
+    Quaternion (w, x, y, z) → (angle_deg, axis).
+    angle_deg: rotation angle in degrees
+    axis: (ax, ay, az) unit vector
     """
     w, x, y, z = q
-    half = math.acos(max(-1.0, min(1.0, w)))
-    angle = 2.0 * half
-    s = math.sin(half)
-    if s < 1e-10:
-        return 0.0, np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    
-    # Normalize the axis
-    axis = np.array([x, y, z], dtype=np.float32) / s
-    return math.degrees(angle), axis
+    # Clamp w to the valid range for acos
+    w_clamped = max(-1.0, min(1.0, w))
+    half_angle_rad = math.acos(w_clamped)
+    angle_deg = math.degrees(2.0 * half_angle_rad)
 
+    sin_half_angle = math.sin(half_angle_rad)
+
+    # If angle is close to 0, axis is not well-defined.
+    # In this case, we can return any unit vector, like (1, 0, 0).
+    if abs(sin_half_angle) < 1e-8:
+        return 0.0, (1.0, 0.0, 0.0)
+
+    # Normalize the vector part of the quaternion to get the rotation axis.
+    axis = np.array([x, y, z], dtype=np.float32) / sin_half_angle
+    return angle_deg, axis
 
 
 def quat_to_euler_deg(q):
@@ -162,18 +174,20 @@ def update(event):
     global alpha
     if melody_glove.left_hand.error:
         alpha = 0.05 * melody_glove.left_hand.error
+
     pos = melody_glove.left_hand.position.astype(np.float32)
     vel = melody_glove.left_hand.velocity.astype(np.float32)
     acc = melody_glove.left_hand.global_acceleration.astype(np.float32)
-    angle, axis = quat_to_axis_angle(melody_glove.left_hand.rotation_quaternion)
-    on_screen_text.text = (f"Pos: {pos[0]:+.2}, {pos[1]:+.2}, {pos[2]:+.2} \n"
-                           f"Vel: {vel[0]:+.2}, {vel[1]:+.2}, {vel[2]:+.2} \n"
-                           f"α = {alpha:.2}")
+    on_screen_text.text = (f"Pos: {pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:+.3f} \n"
+                           f"Vel: {vel[0]:+.3f}, {vel[1]:+.3f}, {vel[2]:+.3f} ; |v| = {np.linalg.norm(vel):+.3f} \n"
+                           f"Acc: {acc[0]:+.3f}, {acc[1]:+.3f}, {acc[2]:+.3f} ; |a| = {np.linalg.norm(acc):+.3f} \n"
+                           f"α = {alpha:.2f}")
 
     # Transform the ellipsoid to reflect this new data.
-    ellipsoid_transform.reset()  # reset transformation matrix so we don't accumulate matrix operations from previous frames
-    ellipsoid_transform.rotate(angle, axis)  # 1) applied second → rotates around origin
-    ellipsoid_transform.translate(pos)  # 2) applied last → moves in world space
+    hand_transform.reset()  # reset transformation matrix so we don't accumulate matrix operations from previous frames
+    hand_transform.rotate(*quat_to_axis_angle(melody_glove.left_hand.rotation_quaternion))
+    hand_transform.translate(pos)  # 2) applied last → moves in world space
+
     # Add Vel and Acc vectors coming off of the object.
     acc_line.set_data(pos=np.array([pos, pos + acc], dtype=np.float32))
     vel_line.set_data(pos=np.array([pos, pos + vel], dtype=np.float32))
@@ -191,5 +205,4 @@ try:
 finally:
     # Ensure resources are closed properly when the window is closed
     reader.stop()
-    melody_glove.stop()
     csv_file.close()
