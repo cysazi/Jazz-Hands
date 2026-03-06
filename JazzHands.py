@@ -622,7 +622,7 @@ class Glove:
     UWB_distance_2: float | None = field(init=False)
     UWB_1_timestamp: int | None = None  # in µs
     UWB_2_timestamp: int | None = None  # in µs
-    is_initiated: bool = False
+    is_calibrated: bool = False
     button_state: bool = False
     error: int = 0
 
@@ -647,9 +647,10 @@ class Glove:
 
     def calibrate_zero_frame(self):
         """Sets the current orientation as the new global 'zero' frame."""
-        # Set current rotation as global reference frame
+        # Set the current rotation as a global reference frame
         self.reference_quaternion = self.rotation_quaternion.copy()
         # Find current UWB coordinates
+        if self.UWB_distance_1 is not None and self.UWB_distance_2 is not None:
         self.reference_UWB_coordinates = triangulate_position(self.UWB_distance_1, self.UWB_distance_2,
                                                               DISTANCE_BETWEEN_UWB_ANCHORS)
         print(f"Glove {self.device_id} frame calibrated!")
@@ -690,10 +691,9 @@ class Glove:
 
     def integrate_function(self):
         """Calculate and integrate global-frame accel to find velocity and position"""
-        #TODO: REMOVE THIS IN PLACE OF THE INITIALIZATION LOGIC
 
         # For the first packet, remember the initial state. After, this will be a set value and therefore won't run
-        if self.reference_quaternion is None:
+        if not self.is_calibrated:
             self.calibrate_zero_frame()
 
         dt = get_dt_seconds(self.current_packet_timestamp, self.last_packet_timestamp)
@@ -701,17 +701,7 @@ class Glove:
         # if dt is very large, go back to zero everything.
         if dt > 1.0:
             print(f"[!] ESP32 Reset or major lag detected on Glove {self.device_id}. Re-zeroing...")
-
-            # Reset the physics state
-            self.velocity = np.array([0.0, 0.0, 0.0])
-            self.position = np.array([0.0, 0.0, 0.0])
-
-            self.rotation_history.clear()
-            self.velocity_history.clear()
-            self.position_history.clear()
-
-            # Re-establish our base coordinate frame
-            self.calibrate_zero_frame()
+            self.reset_glove()
 
             # Skip integration for this frame to avoid physics explosions
             return
@@ -726,6 +716,7 @@ class Glove:
 
         # ZUPT on the LOCAL acceleration
         if self.needs_zupt():
+            self.global_acceleration = np.array([0.0, 0.0, 0.0])
             self.velocity *= 0.5  # dampen velocity by 1 half
             if np.linalg.norm(self.velocity) < 0.05:
                 self.velocity = np.array([0.0, 0.0, 0.0])
@@ -735,14 +726,14 @@ class Glove:
             q_relative = quat_multiply(q_ref_inv, self.rotation_quaternion)
 
             # Rotate local accel into your CUSTOM global frame
-            global_accel = rotate_vector(q_relative, self.local_acceleration)
+            self.global_acceleration = rotate_vector(q_relative, self.local_acceleration)
 
             # Rotation Suppression: If rotating fast, kill linear acceleration
             if angular_speed > 50.0:
-                global_accel *= 0.0
+                self.global_acceleration *= 0.0
 
             # Integrate velocity (only if ZUPT ≠ True)
-            self.velocity += global_accel * dt
+            self.velocity += self.global_acceleration * dt
 
             # Apply drag/friction to velocity to prevent infinite drift
             self.velocity *= 0.95
@@ -784,6 +775,7 @@ class Glove:
         self.position_history.append(self.position.copy())
 
     def update_values(self, p: DevicePacket):
+
         # Set new data if we have it
         self.last_packet_timestamp = self.current_packet_timestamp if self.current_packet_timestamp else 0
         self.current_packet_timestamp = p.data.timestamp
@@ -795,6 +787,9 @@ class Glove:
             print(f"Error with updating Acceleration: {e}")
         try:
             self.rotation_quaternion = np.array([p.data.quat_w, p.data.quat_i, p.data.quat_j, p.data.quat_k])
+            if not self.is_calibrated:
+                self.reference_quaternion = self.rotation_quaternion.copy()
+                self.is_calibrated = True
         except Exception as e:
             print(f"Error with updating Quaternion: {e}")
         # UWB is not always in the packet, so only update the values if needed
@@ -807,6 +802,18 @@ class Glove:
 
         # After getting the latest data, integrate it
         self.integrate_function()
+
+    def reset_glove(self):
+        # Reset the physics state
+        self.velocity = np.array([0.0, 0.0, 0.0])
+        self.position = np.array([0.0, 0.0, 0.0])
+
+        self.rotation_history.clear()
+        self.velocity_history.clear()
+        self.position_history.clear()
+
+        # Tell code to re-establish our base coordinate frame on next cycle
+        self.is_calibrated = False
 
 
 @dataclass
@@ -915,12 +922,6 @@ def main():
     app.run()
     # region ======================= Initiation Logic =======================
     # Main While loop for
-    while True:
-
-
-
-
-        pass
 
 if __name__ == "__main__":
     main()
