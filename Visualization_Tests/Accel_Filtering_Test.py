@@ -6,7 +6,6 @@ from vispy import app, scene  # type: ignore[import-untyped]
 from vispy.io import read_mesh
 import numpy as np
 import os
-import sys
 import Visualization_Helper_Functions as vp  # type: ignore[import-not-found]
 from JazzHands import DevicePacket, ThreadedMultiDeviceReader, GlovePair, quat_to_euler, COM_PORTS
 
@@ -99,7 +98,7 @@ vertices, faces, _normals, _texcoords = read_mesh(HAND_OBJ_PATH)
 hand = scene.visuals.Mesh(
     vertices=vertices,
     faces=faces,
-    color=(0.25, 0.75, 0.95, 1.0),
+    color=(0.25, 0.75, 0.95, 0.75),
     shading="smooth",
     parent=view.scene,
 )
