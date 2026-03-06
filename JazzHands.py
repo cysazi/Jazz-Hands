@@ -647,9 +647,9 @@ class Glove:
     # Basic Data
     device_id: int
     current_packet_timestamp: int = 0  # in µs
-    last_packet_timestamp: int = field(init=False)  # in µs
-    UWB_distance_1: float | None = field(init=False)
-    UWB_distance_2: float | None = field(init=False)
+    last_packet_timestamp: int = 0  # in µs
+    UWB_distance_1: float | None = None
+    UWB_distance_2: float | None = None
     UWB_1_timestamp: int | None = None  # in µs
     UWB_2_timestamp: int | None = None  # in µs
     is_calibrated: bool = False
@@ -684,6 +684,7 @@ class Glove:
             self.reference_UWB_coordinates = triangulate_position(self.UWB_distance_1, self.UWB_distance_2,
                                                                   DISTANCE_BETWEEN_UWB_ANCHORS)
         print(f"Glove {self.device_id} frame calibrated!")
+        self.is_calibrated = True
 
     def get_dynamic_zupt_threshold(self) -> float:
         """Calculates a dynamic ZUPT threshold based on recent movement variance.

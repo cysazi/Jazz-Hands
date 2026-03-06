@@ -56,7 +56,7 @@ canvas, view, grid, axes, x_label, y_label, z_label = vp.setup_canvas()
 # create the line for mapping acceleration
 acc_line = scene.visuals.Arrow(
     pos=np.array([[0, 0, 0], [0, 0, 0]], dtype=np.float32),
-    color=(1, 1, 0, 1),  # yellow
+    color=(1, 0, 0, 1),  # red
     arrow_size=3,
     width=4,
     method="gl",
@@ -65,7 +65,7 @@ acc_line = scene.visuals.Arrow(
 
 vel_line = scene.visuals.Arrow(
     pos=np.array([[0, 0, 0], [0, 0, 0]], dtype=np.float32),
-    color=(1, 1, 0, 1),  # yellow
+    color=(0, 1, 0, 1),  # green
     arrow_size=3,
     width=4,
     method="gl",
@@ -142,9 +142,13 @@ def update(event):
     """Fetch up-to-date data from the glove, update the physical object, and the"""
     # Get updated data from the glove
     global alpha
+    VECTOR_SCALE = 3
+
     if melody_glove.left_hand.error:
         alpha = 0.05 * melody_glove.left_hand.error
-
+    melody_glove.left_hand.local_acceleration = np.array([1,1,0.2], dtype=np.float32)
+    melody_glove.left_hand.rotation_quaternion = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    melody_glove.left_hand.integrate_function()
     pos = melody_glove.left_hand.position.astype(np.float32)
     vel = melody_glove.left_hand.velocity.astype(np.float32)
     acc = melody_glove.left_hand.global_acceleration.astype(np.float32)
@@ -159,8 +163,8 @@ def update(event):
     hand_transform.translate(pos)  # 2) applied last → moves in world space
 
     # Add Vel and Acc vectors coming off of the object.
-    acc_line.set_data(pos=np.array([pos, pos + acc], dtype=np.float32))
-    vel_line.set_data(pos=np.array([pos, pos + vel], dtype=np.float32))
+    acc_line.set_data(pos=np.array([pos, (pos + acc) * VECTOR_SCALE], dtype=np.float32))
+    vel_line.set_data(pos=np.array([pos, (pos + vel) * VECTOR_SCALE], dtype=np.float32))
 
 
 # Start systems
