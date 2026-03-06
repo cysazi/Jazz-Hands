@@ -17,7 +17,7 @@ def setup_canvas():
     view = canvas.central_widget.add_view()
     view.camera = scene.cameras.TurntableCamera(
         fov=45,
-        distance=6.0,
+        distance=20.0,
         center=(0, 0, 0)
     )
 
