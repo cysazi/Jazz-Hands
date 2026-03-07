@@ -652,17 +652,20 @@ class Glove:
     UWB_distance_2: float | None = None
     UWB_1_timestamp: int | None = None  # in µs
     UWB_2_timestamp: int | None = None  # in µs
-    is_calibrated: bool = False
+    is_rotation_calibrated: bool = False
+    is_UWB_calibrated: bool = False
     button_state: bool = False
     error: int = 0
 
     # Current 3D orientation data
     local_acceleration: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     global_acceleration: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
-    position: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     velocity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
+    position: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     rotation_quaternion: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0]))
     rotation_euler: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
+    angular_speed: float = 0.0 # in degrees/sec
+
 
     # History of past 100ms-worth of data
     acceleration_history: deque = field(default_factory=lambda: deque(maxlen=10))
@@ -676,15 +679,15 @@ class Glove:
     reference_UWB_coordinates: tuple[float, float] = (0.0, 0.0)
 
     def calibrate_zero_frame(self):
-        """Sets the current orientation as the new global 'zero' frame."""
-        # Set the current rotation as a global reference frame
-        self.reference_quaternion = self.rotation_quaternion.copy()
+        """Resets the rotational reference frame to the world's coordinate system."""
+        # Set the reference quaternion to identity, making all rotations relative to the world frame.
+        self.reference_quaternion = np.array([1.0, 0.0, 0.0, 0.0])
         # Find current UWB coordinates
         if self.UWB_distance_1 is not None and self.UWB_distance_2 is not None:
             self.reference_UWB_coordinates = triangulate_position(self.UWB_distance_1, self.UWB_distance_2,
                                                                   DISTANCE_BETWEEN_UWB_ANCHORS)
         print(f"Glove {self.device_id} frame calibrated!")
-        self.is_calibrated = True
+        self.is_rotation_calibrated = True
 
     def get_dynamic_zupt_threshold(self) -> float:
         """Calculates a dynamic ZUPT threshold based on recent movement variance.
@@ -714,17 +717,20 @@ class Glove:
         return min(calculated_threshold, max_threshold)  # type: ignore[return-value]
 
     def needs_zupt(self) -> bool:
-        """Check if local accel is just signal noise."""
-        magnitude = np.linalg.norm(self.local_acceleration)
-        # dynamic_threshold = self.get_dynamic_zupt_threshold()
-        dynamic_threshold = 0.15
-        return bool(magnitude < dynamic_threshold)  # return the True or False that this generates
+        """Check if the glove is stationary by looking at both accel and velocity."""
+        accel_magnitude = np.linalg.norm(self.local_acceleration)
+        velocity_magnitude = np.linalg.norm(self.velocity)
+
+        accel_threshold = 0.15
+        velocity_threshold = 0.05
+
+        return accel_magnitude < accel_threshold and velocity_magnitude < velocity_threshold
 
     def integrate_function(self):
         """Calculate and integrate global-frame accel to find velocity and position"""
 
         # For the first packet, remember the initial state. After, this will be a set value and therefore won't run
-        if not self.is_calibrated:
+        if not self.is_rotation_calibrated:
             self.calibrate_zero_frame()
 
         dt = get_dt_seconds(self.current_packet_timestamp, self.last_packet_timestamp)
@@ -738,20 +744,23 @@ class Glove:
             return
 
         # Calculate Angular Velocity (deg/s)
-        angular_speed = 0.0
+        self.angular_speed = 0.0
         if len(self.rotation_history) > 0:
             q_diff = quat_multiply(self.rotation_quaternion, quat_conjugate(self.rotation_history[-1]))
             w_diff = max(-1.0, min(1.0, q_diff[0]))  # Clamp for safety
             if dt > 0:
-                angular_speed = math.degrees(2 * math.acos(w_diff)) / dt
+                self.angular_speed = math.degrees(2 * math.acos(w_diff)) / dt
 
-        # ZUPT on the LOCAL acceleration
+        # ZUPT (Zero-velocity update)
         if self.needs_zupt():
+            # If stationary, kill velocity and acceleration to prevent drift.
             self.global_acceleration = np.array([0.0, 0.0, 0.0])
-            self.velocity *= 0.5  # dampen velocity by 1 half
-            if np.linalg.norm(self.velocity) < 0.05:
-                self.velocity = np.array([0.0, 0.0, 0.0])
+            self.velocity = np.array([0.0, 0.0, 0.0])
         else:
+            # --- We are moving ---
+            # If at constant velocity, local_acceleration is near-zero, so global_acceleration will be too.
+            # This means velocity will not change much from integration, which is correct.
+
             # Calculate the relative orientation
             q_ref_inv = quat_conjugate(self.reference_quaternion)
             q_relative = quat_multiply(q_ref_inv, self.rotation_quaternion)
@@ -760,16 +769,16 @@ class Glove:
             self.global_acceleration = rotate_vector(q_relative, self.local_acceleration)
 
             # Rotation Suppression: If rotating fast, kill linear acceleration
-            if angular_speed > 50.0:
+            if self.angular_speed > 25.0:
                 self.global_acceleration *= 0.0
 
-            # Integrate velocity (only if ZUPT ≠ True)
+            # Integrate velocity
             self.velocity += self.global_acceleration * dt
 
             # Apply drag/friction to velocity to prevent infinite drift
             self.velocity *= 0.95
 
-        # Integrate position always (ve.locity could be dampening
+        # Integrate position always (velocity could be dampening
         self.position += self.velocity * dt
 
         # If both UWB values have been populated, pull position closer to UWB position
@@ -807,10 +816,17 @@ class Glove:
 
     def update_values(self, p: DevicePacket):
 
-        # Set new data if we have it
+        # Set new data if we have it (these fields are always filled)
         self.last_packet_timestamp = self.current_packet_timestamp if self.current_packet_timestamp else 0
         self.current_packet_timestamp = p.data.timestamp
         self.button_state = p.data.button_state
+        
+        # Error handler is not always filled
+
+        if p.data.error_handler:
+            self.error = p.data.error_handler
+            # self.display_error()
+            
         # Accel and Quat should always run, therefore not using an If statement
         try:
             self.local_acceleration = np.array([p.data.accel_x, p.data.accel_y, p.data.accel_z])
@@ -818,9 +834,6 @@ class Glove:
             print(f"Error with updating Acceleration: {e}")
         try:
             self.rotation_quaternion = np.array([p.data.quat_w, p.data.quat_i, p.data.quat_j, p.data.quat_k])
-            if not self.is_calibrated:
-                self.reference_quaternion = self.rotation_quaternion.copy()
-                self.is_calibrated = True
         except Exception as e:
             print(f"Error with updating Quaternion: {e}")
         # UWB is not always in the packet, so only update the values if needed
@@ -834,6 +847,14 @@ class Glove:
         # After getting the latest data, integrate it
         self.integrate_function()
 
+    def display_error(self):
+        match self.error:
+            case 1:
+                print("ERROR 1")
+            case 2:
+                print("ERROR 2")
+        pass
+
     def reset_glove(self):
         # Reset the physics state
         self.velocity = np.array([0.0, 0.0, 0.0])
@@ -844,7 +865,8 @@ class Glove:
         self.position_history.clear()
 
         # Tell code to re-establish our base coordinate frame on next cycle
-        self.is_calibrated = False
+        self.is_rotation_calibrated = False
+        self.is_UWB_calibrated = False
 
 
 @dataclass
