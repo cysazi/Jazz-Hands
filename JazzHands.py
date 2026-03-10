@@ -716,69 +716,69 @@ class Glove:
         calculated_threshold: np.floating = base_noise_floor + (variance * dynamic_scaling)
         return min(calculated_threshold, max_threshold)  # type: ignore[return-value]
 
-    def needs_zupt(self) -> bool:
-        """Check if the glove is stationary by looking at both accel and velocity."""
-        accel_magnitude = np.linalg.norm(self.local_acceleration)
-        velocity_magnitude = np.linalg.norm(self.velocity)
+    def zupt_acceleration(self, threshold: float = 0.15) -> bool:
+        """
+        Checks if the glove is stationary based on acceleration magnitude.
+        Helps reduce signal noise when the glove is not moving.
+        """
+        return np.linalg.norm(self.local_acceleration) < threshold
 
-        accel_threshold = 0.15
-        velocity_threshold = 0.05
-
-        return accel_magnitude < accel_threshold and velocity_magnitude < velocity_threshold
+    def zupt_velocity(self, threshold: float = 0.03) -> bool:
+        """
+        Checks if the glove has stopped moving based on velocity magnitude.
+        Helps reduce drift when the glove is stationary.
+        """
+        return np.linalg.norm(self.velocity) < threshold
 
     def integrate_function(self):
         """Calculate and integrate global-frame accel to find velocity and position"""
 
-        # For the first packet, remember the initial state. After, this will be a set value and therefore won't run
+        # For the first packet, remember the initial state.
         if not self.is_rotation_calibrated:
             self.calibrate_zero_frame()
 
         dt = get_dt_seconds(self.current_packet_timestamp, self.last_packet_timestamp)
-        # Check for ESP32 Reset:
-        # if dt is very large, go back to zero everything.
+        # Check for ESP32 Reset or major lag
         if dt > 1.0:
             print(f"[!] ESP32 Reset or major lag detected on Glove {self.device_id}. Re-zeroing...")
             self.reset_glove()
+            return  # Skip integration for this frame
 
-            # Skip integration for this frame to avoid physics explosions
-            return
-
-        # Calculate Angular Velocity (deg/s)
+        # --- Orientation and Angular Velocity ---
         self.angular_speed = 0.0
-        if len(self.rotation_history) > 0:
+        if len(self.rotation_history) > 0 and dt > 0:
             q_diff = quat_multiply(self.rotation_quaternion, quat_conjugate(self.rotation_history[-1]))
             w_diff = max(-1.0, min(1.0, q_diff[0]))  # Clamp for safety
-            if dt > 0:
-                self.angular_speed = math.degrees(2 * math.acos(w_diff)) / dt
+            self.angular_speed = math.degrees(2 * math.acos(w_diff)) / dt
 
-        # ZUPT (Zero-velocity update)
-        if self.needs_zupt():
-            # If stationary, kill velocity and acceleration to prevent drift.
+        # --- Acceleration Processing ---
+        # Calculate the relative orientation
+        q_ref_inv = quat_conjugate(self.reference_quaternion)
+        q_relative = quat_multiply(q_ref_inv, self.rotation_quaternion)
+
+        # Rotate local acceleration into the global frame
+        self.global_acceleration = rotate_vector(q_relative, self.local_acceleration)
+
+        # Suppress acceleration if rotating quickly to reduce noise
+        if self.angular_speed > 25.0:
+            self.global_acceleration *= 0.0
+
+        # Apply ZUPT to acceleration if the glove is not moving to reduce noise
+        if self.zupt_acceleration():
             self.global_acceleration = np.array([0.0, 0.0, 0.0])
+
+        # --- Velocity and Position Integration ---
+        # Integrate velocity from acceleration
+        self.velocity += self.global_acceleration * dt
+
+        # Apply drag/friction to velocity
+        self.velocity *= 0.995
+
+        # Apply ZUPT to velocity to halt drift when stopped
+        if self.zupt_velocity():
             self.velocity = np.array([0.0, 0.0, 0.0])
-        else:
-            # --- We are moving ---
-            # If at constant velocity, local_acceleration is near-zero, so global_acceleration will be too.
-            # This means velocity will not change much from integration, which is correct.
 
-            # Calculate the relative orientation
-            q_ref_inv = quat_conjugate(self.reference_quaternion)
-            q_relative = quat_multiply(q_ref_inv, self.rotation_quaternion)
-
-            # Rotate local accel into your CUSTOM global frame
-            self.global_acceleration = rotate_vector(q_relative, self.local_acceleration)
-
-            # Rotation Suppression: If rotating fast, kill linear acceleration
-            if self.angular_speed > 25.0:
-                self.global_acceleration *= 0.0
-
-            # Integrate velocity
-            self.velocity += self.global_acceleration * dt
-
-            # Apply drag/friction to velocity to prevent infinite drift
-            self.velocity *= 0.95
-
-        # Integrate position always (velocity could be dampening
+        # Integrate position from velocity
         self.position += self.velocity * dt
 
         # If both UWB values have been populated, pull position closer to UWB position
