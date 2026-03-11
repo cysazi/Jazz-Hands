@@ -637,6 +637,16 @@ def triangulate_position(d1, d2, D) -> tuple[float, float]:
     return x, y
 
 
+def translate_uwb_to_relative_frame(uwb_coords: tuple[float, float],
+                                    reference_coords: tuple[float, float]) -> tuple[float, float]:
+    """
+    Translates absolute UWB coordinates into a relative frame based on a reference point.
+    """
+    x_rel = uwb_coords[0] - reference_coords[0]
+    y_rel = uwb_coords[1] - reference_coords[1]
+    return x_rel, y_rel
+
+
 # endregion
 
 # region ======================= Glove Classes=======================
@@ -677,17 +687,24 @@ class Glove:
     reference_quaternion: np.ndarray = field(default_factory=lambda: np.array(
         [1.0, 0.0, 0.0, 0.0]))  # Stores a Quat to define XYZ relative to the start position
     reference_UWB_coordinates: tuple[float, float] = (0.0, 0.0)
+    reference_UWB_position: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
 
     def calibrate_zero_frame(self):
         """Resets the rotational reference frame to the world's coordinate system."""
         # Set the reference quaternion to identity, making all rotations relative to the world frame.
         self.reference_quaternion = np.array([1.0, 0.0, 0.0, 0.0])
-        # Find current UWB coordinates
-        if self.UWB_distance_1 is not None and self.UWB_distance_2 is not None:
-            self.reference_UWB_coordinates = triangulate_position(self.UWB_distance_1, self.UWB_distance_2,
-                                                                  DISTANCE_BETWEEN_UWB_ANCHORS)
         print(f"Glove {self.device_id} frame calibrated!")
         self.is_rotation_calibrated = True
+
+    def calibrate_uwb(self):
+        """Sets the current UWB position as the (0,0,0) reference."""
+        if self.UWB_distance_1 is not None and self.UWB_distance_2 is not None:
+            x, y = triangulate_position(self.UWB_distance_1, self.UWB_distance_2, DISTANCE_BETWEEN_UWB_ANCHORS)
+            self.reference_UWB_position = np.array([x, y, self.position[2]])  # Assume z is the same
+            self.is_UWB_calibrated = True
+            print(f"Glove {self.device_id} UWB calibrated at {self.reference_UWB_position}")
+        else:
+            print(f"Glove {self.device_id}: UWB calibration failed. No UWB data.")
 
     def get_dynamic_zupt_threshold(self) -> float:
         """Calculates a dynamic ZUPT threshold based on recent movement variance.
@@ -736,6 +753,8 @@ class Glove:
         # For the first packet, remember the initial state.
         if not self.is_rotation_calibrated:
             self.calibrate_zero_frame()
+        if not self.is_UWB_calibrated:
+            self.calibrate_uwb()
 
         dt = get_dt_seconds(self.current_packet_timestamp, self.last_packet_timestamp)
         # Check for ESP32 Reset or major lag
@@ -800,15 +819,33 @@ class Glove:
 
             # 10,000 µs = 100 ms threshold
             if uwb_time_gap < 100000:
-                triangulate_position(self.UWB_distance_1, self.UWB_distance_2, DISTANCE_BETWEEN_UWB_ANCHORS)
+                # Triangulate the absolute UWB position
+                abs_uwb_x, abs_uwb_y = triangulate_position(self.UWB_distance_1, self.UWB_distance_2,
+                                                            DISTANCE_BETWEEN_UWB_ANCHORS)
+
+                # Translate to a relative frame
+                rel_uwb_x, rel_uwb_y = translate_uwb_to_relative_frame((abs_uwb_x, abs_uwb_y),
+                                                                       (self.reference_UWB_position[0],
+                                                                        self.reference_UWB_position[1]))
+
+                # Create a target UWB position vector (keeping the IMU's Z)
+                uwb_target_position = np.array([rel_uwb_x, rel_uwb_y, self.position[2]])
+
+                # Define pulling strengths (alphas)
+                alpha_xy = 0.1  # Stronger pull for x and y
+                alpha_z = 0.01  # Weaker pull for z
+
+                # Apply the pulling force (interpolation)
+                self.position[0] = (1 - alpha_xy) * self.position[0] + alpha_xy * uwb_target_position[0]
+                self.position[1] = (1 - alpha_xy) * self.position[1] + alpha_xy * uwb_target_position[1]
+                self.position[2] = (1 - alpha_z) * self.position[2] + alpha_z * uwb_target_position[2]
+
             else:
                 # Discard the older reading to fix temporal shearing
                 if older_is_1:
                     self.UWB_distance_1 = None
                 else:
                     self.UWB_distance_2 = None
-
-            # TODO: finish Triangulation "pulling" system
 
         # Save history
         self.velocity_history.append(self.velocity.copy())
@@ -819,7 +856,7 @@ class Glove:
         # Set new data if we have it (these fields are always filled)
         self.last_packet_timestamp = self.current_packet_timestamp if self.current_packet_timestamp else 0
         self.current_packet_timestamp = p.data.timestamp
-        self.button_state = p.data.button_state
+        self.button_state = bool(p.data.button_state)
         
         # Error handler is not always filled
 
@@ -827,7 +864,7 @@ class Glove:
             self.error = p.data.error_handler
             # self.display_error()
             
-        # Accel and Quat should always run, therefore not using an If statement
+        # Accel and Quat should always be present, therefore not using an If statement
         try:
             self.local_acceleration = np.array([p.data.accel_x, p.data.accel_y, p.data.accel_z])
         except Exception as e:
