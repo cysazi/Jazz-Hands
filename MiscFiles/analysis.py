@@ -21,18 +21,10 @@ def analyze_accel_data(filepath='accel_data.csv'):
         accel_y = df['accel_y'].values
         accel_z = df['accel_z'].values
     except FileNotFoundError:
-        print(f"Warning: '{filepath}' not found. Generating sample data.")
-        # Generate sample data if the file doesn't exist
-        fs = 100  # Sampling frequency
-        t = np.arange(0, 10, 1/fs)
-        time = t
-        # A signal with a 5Hz and a 15Hz component
-        accel_x = 0.7 * np.sin(2 * np.pi * 5 * t) + 1.2 * np.sin(2 * np.pi * 15 * t) + 0.3 * np.random.randn(len(t))
-        accel_y = 0.5 * np.sin(2 * np.pi * 5 * t) + 1.0 * np.sin(2 * np.pi * 15 * t) + 0.3 * np.random.randn(len(t))
-        accel_z = 0.9 * np.sin(2 * np.pi * 5 * t) + 1.5 * np.sin(2 * np.pi * 15 * t) + 0.3 * np.random.randn(len(t))
+        raise FileNotFoundError(f"File not found: {filepath}")
 
     # --- Analysis ---
-    # Calculate total acceleration magnitude
+    # Calculate total acceleration magnitude for each datapoint
     accel_mag = np.sqrt(accel_x**2 + accel_y**2 + accel_z**2)
 
     # Calculate average sampling interval
