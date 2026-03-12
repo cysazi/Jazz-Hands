@@ -11,9 +11,8 @@
 #include <SPI.h>
 #include "DW1000Ranging.h"
 
-// ESP NOW Definitions
-#define ESPNOW_WIFI_CHANNEL 6
-const uint8_t ESP_NOW_relayMAC[] = { 0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08 };  // The MAC address of the relay ESP-32 (device 4); constant for this device.
+// Local Kalman Filter Library
+#include "Kalman.h"
 
 // BNO085 definitions
 #define BNO08X_RESET -1
@@ -23,233 +22,240 @@ const uint8_t ESP_NOW_relayMAC[] = { 0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08 };  // T
 // UWB Definitions
 #define UWB_1_ADDRESS 0x1111
 #define UWB_2_ADDRESS 0x2222
-
 #define SPI_SCK 18
 #define SPI_MISO 19
 #define SPI_MOSI 23
 #define DW_CS 4
-
-// Connection Pins
-const uint8_t PIN_RST = 27;  // reset pin
-const uint8_t PIN_IRQ = 34;  // irq pin
-const uint8_t PIN_SS = 4;    // spi select pin
+const uint8_t PIN_RST = 27;
+const uint8_t PIN_IRQ = 34;
+const uint8_t PIN_SS = 4;
 
 // Misc. definitions
 #define BUTTON_PIN 33
-
-// Jazz Hand (1/2) (LEFT/RIGHT) <- to be decided
 #define HEADER 0xAAAA
 #define DEVICE_ID 1
 
 // Packet Type Bitflags
-#define PACKET_HAS_ACCEL 0b00000001
-#define PACKET_HAS_QUAT 0b00000010
 #define PACKET_HAS_UWB_1 0b00000100
 #define PACKET_HAS_UWB_2 0b00001000
 #define PACKET_HAS_ERROR 0b10000000
 
-// Packet struct definition
-typedef struct __attribute__((__packed__)) {  // has some special syntax to tell arduino to leave the raw data in byte form
+// New Packet Structure for Dead Reckoning
+typedef struct __attribute__((__packed__)) {
   uint16_t header = HEADER;                   // 2 bytes
   uint8_t device_id = DEVICE_ID;              // 1 byte
   uint32_t timestamp;                         // 4 bytes
   uint8_t packet_type;                        // 1 byte
   uint8_t button_state;                       // 1 byte
-  float accel_x, accel_y, accel_z;            // 4*3 = 12 bytes
-  float UWB_distance1, UWB_distance2;         // 4*2 = 8 bytes
-  float quat_w, quat_i, quat_j, quat_k;       // 4*4 = 16 bytes
+
+  // Integrated State from Kalman Filter
+  float pos_x, pos_y, pos_z;                  // 12 bytes
+  float vel_x, vel_y, vel_z;                  // 12 bytes
+
+  // Raw UWB distances (if available)
+  float UWB_distance1, UWB_distance2;         // 8 bytes
+
+  // Quaternion for rotation
+  float quat_w, quat_i, quat_j, quat_k;       // 16 bytes
+
   uint8_t error_handler;                      // 1 byte
-} datapacket_t;                               // Total: 46 bytes
+} datapacket_t;                               // Total: 58 bytes
 
 // IMU Declarations
 Adafruit_BNO08x bno08x(BNO08X_RESET);
 sh2_SensorValue_t sensorValue;
 
-// Global Variables
-datapacket_t current_readings = {};
-bool ready_to_send;
-bool has_rotation_vector = false;
-uint32_t last_accel_time = 0;     // For 400Hz timing
-uint32_t last_rotation_time = 0;  // For 100Hz timing
-// Global variables for filtered acceleration
-float filtered_acc_x = 0, filtered_acc_y = 0, filtered_acc_z = 0;
-float acc_alpha = 0.425;  // Constant between 0 and 1.
-// Testing Acc alpha values
-int acc_alpha_increment_counter = 1;
-const float ACC_ALPHA_INCREMENT_AMOUNT = 0.05;
-const int ACC_ALPHA_MAX_INCREMENT = 1 / ACC_ALPHA_INCREMENT_AMOUNT;
+// Kalman Filter Instance
+KalmanFilter kf;
 
-// Set desired data for BNO085
+// ZUPT (Zero-Velocity Update) state
+const int ZUPT_BUFFER_SIZE = 15;
+float accel_buffer[ZUPT_BUFFER_SIZE][3];
+int zupt_buffer_index = 0;
+bool is_stationary = false;
+const float ZUPT_STATIONARY_THRESHOLD = 0.05f; // Variance threshold
+
+// Global Variables
+datapacket_t current_packet = {};
+unsigned long last_send_time = 0;
+const unsigned long SEND_INTERVAL_MS = 10; // 100Hz send rate
+
 void setReports() {
   Serial.println("Setting desired reports");
-  // 2500µs = 400Hz for acceleration, 10000µs = 100Hz for rotation vector
-  if (!bno08x.enableReport(SH2_ROTATION_VECTOR, 10000)) {
+  if (!bno08x.enableReport(SH2_ROTATION_VECTOR, 10000)) { // 100Hz
     Serial.println("Could not enable rotation vector");
   }
-  if (!bno08x.enableReport(SH2_LINEAR_ACCELERATION, 2500)) {
+  if (!bno08x.enableReport(SH2_LINEAR_ACCELERATION, 2500)) { // 400Hz
     Serial.println("Could not enable linear acceleration");
   }
 }
 
 void setup() {
-  // Initialize Serial
   Serial.begin(115200);
   delay(100);
-  // Initialize Button
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  // Initialize Wire
   Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(400000);  // 400kHz for stability/faster I2C
+  Wire.setClock(400000);
   delay(100);
 
-  // Initialize the IMU
   if (!bno08x.begin_I2C(0x4A, &Wire)) {
-    Serial.println("Failed to find BNO08x chip, please RST the ESP32 and try again");
+    Serial.println("Failed to find BNO08x chip");
     while (1) { delay(10); }
   }
   Serial.println("BNO085 Found!");
   setReports();
 
-  // Intialize ESP-NOW
-  WiFi.mode(WIFI_STA);
-  esp_now_init();
-
-  // Add relay as peer once
-  esp_now_peer_info_t relay = {};
-  memcpy(relay.peer_addr, ESP_NOW_relayMAC, 6);
-  relay.channel = ESPNOW_WIFI_CHANNEL;  // Fixed channel for reliability
-  relay.encrypt = false;                // No encryption for speed
-  esp_now_add_peer(&relay);
-
-  // Initialize the global struct
-  current_readings.header = HEADER;
-  current_readings.device_id = DEVICE_ID;
-  current_readings.packet_type = 0x00;
-
-  // UWB Initialization
+  // UWB Initialization (remains the same)
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
   DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ);
   DW1000Ranging.attachNewRange(newRange);
-  DW1000Ranging.attachNewDevice(newDevice);
-  DW1000Ranging.attachInactiveDevice(inactiveDevice);
-
-  // Start the module as a tag
   DW1000Ranging.startAsTag("7D:00:22:EA:82:60:3B:9C", DW1000.MODE_SHORTDATA_FAST_ACCURACY);
+
+  current_packet.header = HEADER;
+  current_packet.device_id = DEVICE_ID;
 }
 
+// --- High-Frequency IMU Processing ---
+void processIMU() {
+  static unsigned long last_predict_time = 0;
 
+  if (bno08x.getSensorEvent(&sensorValue)) {
+    if (sensorValue.sensorId == SH2_LINEAR_ACCELERATION) {
+      float ax = sensorValue.un.linearAcceleration.x;
+      float ay = sensorValue.un.linearAcceleration.y;
+      float az = sensorValue.un.linearAcceleration.z;
+
+      // Update ZUPT buffer
+      accel_buffer[zupt_buffer_index][0] = ax;
+      accel_buffer[zupt_buffer_index][1] = ay;
+      accel_buffer[zupt_buffer_index][2] = az;
+      zupt_buffer_index = (zupt_buffer_index + 1) % ZUPT_BUFFER_SIZE;
+
+      updateZUPT();
+
+      // Calculate dt for Kalman predict
+      unsigned long now = micros();
+      float dt = (last_predict_time == 0) ? 0.0025f : (now - last_predict_time) / 1000000.0f;
+      last_predict_time = now;
+
+      if (is_stationary) {
+        // If stationary, force velocity to zero in the Kalman state
+        kf.x[3] = 0; kf.x[4] = 0; kf.x[5] = 0;
+        // Don't predict with acceleration noise
+        kf.predict(0, 0, 0, dt);
+      } else {
+        // If moving, predict normally
+        kf.predict(ax, ay, az, dt);
+      }
+
+    } else if (sensorValue.sensorId == SH2_ROTATION_VECTOR) {
+      current_packet.quat_w = sensorValue.un.rotationVector.real;
+      current_packet.quat_i = sensorValue.un.rotationVector.i;
+      current_packet.quat_j = sensorValue.un.rotationVector.j;
+      current_packet.quat_k = sensorValue.un.rotationVector.k;
+    }
+  }
+}
+
+void updateZUPT() {
+  float mean_x = 0, mean_y = 0, mean_z = 0;
+  for (int i = 0; i < ZUPT_BUFFER_SIZE; ++i) {
+    mean_x += accel_buffer[i][0];
+    mean_y += accel_buffer[i][1];
+    mean_z += accel_buffer[i][2];
+  }
+  mean_x /= ZUPT_BUFFER_SIZE;
+  mean_y /= ZUPT_BUFFER_SIZE;
+  mean_z /= ZUPT_BUFFER_SIZE;
+
+  float var_x = 0, var_y = 0, var_z = 0;
+  for (int i = 0; i < ZUPT_BUFFER_SIZE; ++i) {
+    var_x += pow(accel_buffer[i][0] - mean_x, 2);
+    var_y += pow(accel_buffer[i][1] - mean_y, 2);
+    var_z += pow(accel_buffer[i][2] - mean_z, 2);
+  }
+  var_x /= ZUPT_BUFFER_SIZE;
+  var_y /= ZUPT_BUFFER_SIZE;
+  var_z /= ZUPT_BUFFER_SIZE;
+
+  float total_variance = var_x + var_y + var_z;
+  is_stationary = total_variance < ZUPT_STATIONARY_THRESHOLD;
+}
+
+// --- Low-Frequency Sending and Correction ---
+void sendPacket() {
+  current_packet.timestamp = micros();
+  current_packet.button_state = digitalRead(BUTTON_PIN);
+
+  // Populate packet with current Kalman state
+  current_packet.pos_x = kf.x[0];
+  current_packet.pos_y = kf.x[1];
+  current_packet.pos_z = kf.x[2];
+  current_packet.vel_x = kf.x[3];
+  current_packet.vel_y = kf.x[4];
+  current_packet.vel_z = kf.x[5];
+
+  Serial.write((uint8_t*)&current_packet, sizeof(datapacket_t));
+
+  // Reset UWB flags after sending
+  current_packet.packet_type &= ~(PACKET_HAS_UWB_1 | PACKET_HAS_UWB_2);
+}
+
+void checkForCorrection() {
+  if (Serial.available() > 0) {
+    char header = Serial.read();
+    if (header == 'C') { // 'C' for Correction
+      float dx, dy, dz;
+      if (Serial.readBytes((char*)&dx, sizeof(dx)) == sizeof(dx) &&
+          Serial.readBytes((char*)&dy, sizeof(dy)) == sizeof(dy) &&
+          Serial.readBytes((char*)&dz, sizeof(dz)) == sizeof(dz)) {
+
+        // Apply correction to the Kalman filter's position state
+        kf.x[0] += dx;
+        kf.x[1] += dy;
+        kf.x[2] += dz;
+      }
+    }
+  }
+}
 
 void loop() {
-
-  // Check for BNO085 reset
   if (bno08x.wasReset()) {
-    Serial.println("BNO085 has reset! Re-enabling reports.");
+    Serial.println("BNO085 reset");
     setReports();
   }
 
-  // UWB Data Collection
-  // DW1000Ranging.loop();
-  // Button State Reading
-  current_readings.button_state = digitalRead(BUTTON_PIN);
-  if (current_readings.button_state == 0) {
-    acc_alpha_increment_counter++;
-    if (acc_alpha_increment_counter >= ACC_ALPHA_MAX_INCREMENT) {
-      acc_alpha_increment_counter = 1;
+  // High-frequency processing of all available IMU data
+  processIMU();
 
-    }
-    acc_alpha = acc_alpha_increment_counter * ACC_ALPHA_INCREMENT_AMOUNT;
-    filtered_acc_x = 0;
-    filtered_acc_y = 0;
-    filtered_acc_z = 0;
-    delay(500);
-
-    acc_alpha_increment_counter++;
-    current_readings.error_handler = acc_alpha_increment_counter;
-    current_readings.packet_type |= PACKET_HAS_ERROR;
+  // Low-frequency tasks
+  unsigned long now = millis();
+  if (now - last_send_time >= SEND_INTERVAL_MS) {
+    last_send_time = now;
+    sendPacket();
   }
-  // IMU Data Collection
-  while (bno08x.getSensorEvent(&sensorValue)) {
-    switch (sensorValue.sensorId) {
-      case SH2_ROTATION_VECTOR:
-        if ((current_readings.packet_type & PACKET_HAS_QUAT) != PACKET_HAS_QUAT) {
-          current_readings.quat_w = sensorValue.un.rotationVector.real;
-          current_readings.quat_i = sensorValue.un.rotationVector.i;
-          current_readings.quat_j = sensorValue.un.rotationVector.j;
-          current_readings.quat_k = sensorValue.un.rotationVector.k;
-          current_readings.packet_type |= PACKET_HAS_QUAT;  // tells python that this packet has quaternion
-        }
-        break;
-      case SH2_LINEAR_ACCELERATION:
-        // One pole recursive Low-Pass Filter
-        // filtered_acc_x = (acc_alpha * sensorValue.un.linearAcceleration.x) + (1.0 - acc_alpha) * filtered_acc_x;
-        // filtered_acc_y = (acc_alpha * sensorValue.un.linearAcceleration.y) + (1.0 - acc_alpha) * filtered_acc_y;
-        // filtered_acc_z = (acc_alpha * sensorValue.un.linearAcceleration.z) + (1.0 - acc_alpha) * filtered_acc_z;
 
-        filtered_acc_x = sensorValue.un.linearAcceleration.x;
-        filtered_acc_y = sensorValue.un.linearAcceleration.y;
-        filtered_acc_z = sensorValue.un.linearAcceleration.z;
+  // Always check for incoming corrections from PC
+  checkForCorrection();
 
-        // Assign the smoothed values to the data packet
-        current_readings.accel_x = filtered_acc_x;
-        current_readings.accel_y = filtered_acc_y;
-        current_readings.accel_z = filtered_acc_z;
-
-        current_readings.packet_type |= PACKET_HAS_ACCEL;  // Tells python that this packet has accel data
-        break;
-    }
-    // If both Rotation and Accel are acquired, break out of the while loop regardless of queue contents
-    if ((current_readings.packet_type & PACKET_HAS_ACCEL) && (current_readings.packet_type & PACKET_HAS_QUAT)) {
-      break;
-    }
-  }
-  // If we have both acceleration and quaternion data, send the packet.
-  if ((current_readings.packet_type & PACKET_HAS_ACCEL) && (current_readings.packet_type & PACKET_HAS_QUAT)) {
-    sendPacket(&current_readings);
-  }
+  // UWB ranging loop
+  DW1000Ranging.loop();
 }
 
-void sendPacket(datapacket_t* data) {
-  current_readings.timestamp = micros();
-  // esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(&data));
-  Serial.write((uint8_t*)data, sizeof(datapacket_t));
-  data->packet_type = 0;  // Reset the packet type
-  // Optional Error Handling
-  // if (result != ESP_OK) {
-  //   current_readings.error_handler = 1;  // Set error flag
-  // } else {
-  //   current_readings.error_handler = 0;  // Clear error flag
-  // }
-}
-
-
+// --- UWB Callbacks ---
 void newRange() {
-  // Get new UWB Data when available
-  // Get the specific device that just talked to us
   DW1000Device* device = DW1000Ranging.getDistantDevice();
-
-  // Extract its address
   int shortAddress = device->getShortAddress();
 
-
-  switch (shortAddress) {
-    case UWB_1_ADDRESS:
-      current_readings.UWB_distance1 = DW1000Ranging.getDistantDevice()->getRange();
-      current_readings.packet_type |= PACKET_HAS_UWB_1;
-      break;
-    case UWB_2_ADDRESS:
-      current_readings.UWB_distance2 = DW1000Ranging.getDistantDevice()->getRange();
-      current_readings.packet_type |= PACKET_HAS_UWB_2;
-      break;
+  if (shortAddress == UWB_1_ADDRESS) {
+    current_packet.UWB_distance1 = device->getRange();
+    current_packet.packet_type |= PACKET_HAS_UWB_1;
+  } else if (shortAddress == UWB_2_ADDRESS) {
+    current_packet.UWB_distance2 = device->getRange();
+    current_packet.packet_type |= PACKET_HAS_UWB_2;
   }
 }
 
-void newDevice(DW1000Device* device) {
-  // Serial.print("ranging init; 1 device added ! -> ");
-  // Serial.print(" short:");
-  // Serial.println(device->getShortAddress(), HEX);
-}
-
-void inactiveDevice(DW1000Device* device) {
-  // Serial.print("deleting inactive device: ");
-  // Serial.println(device->getShortAddress(), HEX);
-}
+// Empty UWB callbacks
+void newDevice(DW1000Device* device) {}
+void inactiveDevice(DW1000Device* device) {}
