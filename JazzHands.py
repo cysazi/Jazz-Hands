@@ -733,14 +733,14 @@ class Glove:
         calculated_threshold: np.floating = base_noise_floor + (variance * dynamic_scaling)
         return min(calculated_threshold, max_threshold)  # type: ignore[return-value]
 
-    def zupt_acceleration(self, threshold: float = 0.15) -> bool:
+    def zupt_acceleration(self, threshold: float = 0.03) -> bool:
         """
         Checks if the glove is stationary based on acceleration magnitude.
         Helps reduce signal noise when the glove is not moving.
         """
         return np.linalg.norm(self.local_acceleration) < threshold
 
-    def zupt_velocity(self, threshold: float = 0.03) -> bool:
+    def zupt_velocity(self, threshold: float = 0.00) -> bool:
         """
         Checks if the glove has stopped moving based on velocity magnitude.
         Helps reduce drift when the glove is stationary.
@@ -753,8 +753,8 @@ class Glove:
         # For the first packet, remember the initial state.
         if not self.is_rotation_calibrated:
             self.calibrate_zero_frame()
-        if not self.is_UWB_calibrated:
-            self.calibrate_uwb()
+        # if not self.is_UWB_calibrated:
+        #     self.calibrate_uwb()
 
         dt = get_dt_seconds(self.current_packet_timestamp, self.last_packet_timestamp)
         # Check for ESP32 Reset or major lag
