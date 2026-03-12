@@ -73,7 +73,7 @@ uint32_t last_accel_time = 0;     // For 400Hz timing
 uint32_t last_rotation_time = 0;  // For 100Hz timing
 // Global variables for filtered acceleration
 float filtered_acc_x = 0, filtered_acc_y = 0, filtered_acc_z = 0;
-float acc_alpha = 0.05;  // Constant between 0 and 1.
+float acc_alpha = 0.425;  // Constant between 0 and 1.
 // Testing Acc alpha values
 int acc_alpha_increment_counter = 1;
 const float ACC_ALPHA_INCREMENT_AMOUNT = 0.05;
@@ -141,8 +141,14 @@ void setup() {
 
 void loop() {
 
+  // Check for BNO085 reset
+  if (bno08x.wasReset()) {
+    Serial.println("BNO085 has reset! Re-enabling reports.");
+    setReports();
+  }
+
   // UWB Data Collection
-  DW1000Ranging.loop();
+  // DW1000Ranging.loop();
   // Button State Reading
   current_readings.button_state = digitalRead(BUTTON_PIN);
   if (current_readings.button_state == 0) {
@@ -175,9 +181,13 @@ void loop() {
         break;
       case SH2_LINEAR_ACCELERATION:
         // One pole recursive Low-Pass Filter
-        filtered_acc_x = (acc_alpha * sensorValue.un.linearAcceleration.x) + (1.0 - acc_alpha) * filtered_acc_x;
-        filtered_acc_y = (acc_alpha * sensorValue.un.linearAcceleration.y) + (1.0 - acc_alpha) * filtered_acc_y;
-        filtered_acc_z = (acc_alpha * sensorValue.un.linearAcceleration.z) + (1.0 - acc_alpha) * filtered_acc_z;
+        // filtered_acc_x = (acc_alpha * sensorValue.un.linearAcceleration.x) + (1.0 - acc_alpha) * filtered_acc_x;
+        // filtered_acc_y = (acc_alpha * sensorValue.un.linearAcceleration.y) + (1.0 - acc_alpha) * filtered_acc_y;
+        // filtered_acc_z = (acc_alpha * sensorValue.un.linearAcceleration.z) + (1.0 - acc_alpha) * filtered_acc_z;
+
+        filtered_acc_x = sensorValue.un.linearAcceleration.x;
+        filtered_acc_y = sensorValue.un.linearAcceleration.y;
+        filtered_acc_z = sensorValue.un.linearAcceleration.z;
 
         // Assign the smoothed values to the data packet
         current_readings.accel_x = filtered_acc_x;
@@ -188,11 +198,12 @@ void loop() {
         break;
     }
     // If both Rotation and Accel are acquired, break out of the while loop regardless of queue contents
-    if (current_readings.packet_type & (PACKET_HAS_ACCEL | PACKET_HAS_QUAT) == 0b00000011) {
+    if ((current_readings.packet_type & PACKET_HAS_ACCEL) && (current_readings.packet_type & PACKET_HAS_QUAT)) {
       break;
     }
   }
-  if ((current_readings.packet_type & PACKET_HAS_QUAT) == PACKET_HAS_QUAT) {
+  // If we have both acceleration and quaternion data, send the packet.
+  if ((current_readings.packet_type & PACKET_HAS_ACCEL) && (current_readings.packet_type & PACKET_HAS_QUAT)) {
     sendPacket(&current_readings);
   }
 }
