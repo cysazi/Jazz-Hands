@@ -77,8 +77,10 @@ const float ZUPT_STATIONARY_THRESHOLD = 0.05f; // Variance threshold
 
 // Global Variables
 datapacket_t current_packet = {};
-unsigned long last_send_time = 0;
-const unsigned long SEND_INTERVAL_MS = 10; // 100Hz send rate
+
+// Receiver MAC Address (replace with your receiver's MAC)
+const uint8_t receiverMac[] = {0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08};
+
 
 void setReports() {
   Serial.println("Setting desired reports");
@@ -105,7 +107,26 @@ void setup() {
   Serial.println("BNO085 Found!");
   setReports();
 
-  // UWB Initialization (remains the same)
+  // --- Initialize ESP-NOW for 2-way communication ---
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  // Register the receive callback
+  esp_now_register_recv_cb(OnDataRecv);
+
+  // Register the send peer
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMac, 6);
+  peerInfo.channel = ESPNOW_WIFI_CHANNEL;`
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+  Serial.println("ESP-NOW Initialized.");
+
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
   DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ);
   DW1000Ranging.attachNewRange(newRange);
@@ -141,7 +162,6 @@ void processIMU() {
       if (is_stationary) {
         // If stationary, force velocity to zero in the Kalman state
         kf.x[3] = 0; kf.x[4] = 0; kf.x[5] = 0;
-        // Don't predict with acceleration noise
         kf.predict(0, 0, 0, dt);
       } else {
         // If moving, predict normally
@@ -153,6 +173,9 @@ void processIMU() {
       current_packet.quat_i = sensorValue.un.rotationVector.i;
       current_packet.quat_j = sensorValue.un.rotationVector.j;
       current_packet.quat_k = sensorValue.un.rotationVector.k;
+
+      // Send a packet every time we get a new rotation vector
+      sendPacket();
     }
   }
 }
@@ -178,8 +201,7 @@ void updateZUPT() {
   var_y /= ZUPT_BUFFER_SIZE;
   var_z /= ZUPT_BUFFER_SIZE;
 
-  float total_variance = var_x + var_y + var_z;
-  is_stationary = total_variance < ZUPT_STATIONARY_THRESHOLD;
+  is_stationary = (var_x + var_y + var_z) < ZUPT_STATIONARY_THRESHOLD;
 }
 
 // --- Low-Frequency Sending and Correction ---
@@ -195,26 +217,23 @@ void sendPacket() {
   current_packet.vel_y = kf.x[4];
   current_packet.vel_z = kf.x[5];
 
-  Serial.write((uint8_t*)&current_packet, sizeof(datapacket_t));
+  esp_now_send(receiverMac, (uint8_t*)&current_packet, sizeof(datapacket_t));
 
   // Reset UWB flags after sending
   current_packet.packet_type &= ~(PACKET_HAS_UWB_1 | PACKET_HAS_UWB_2);
 }
 
-void checkForCorrection() {
-  if (Serial.available() > 0) {
-    char header = Serial.read();
-    if (header == 'C') { // 'C' for Correction
-      float dx, dy, dz;
-      if (Serial.readBytes((char*)&dx, sizeof(dx)) == sizeof(dx) &&
-          Serial.readBytes((char*)&dy, sizeof(dy)) == sizeof(dy) &&
-          Serial.readBytes((char*)&dz, sizeof(dz)) == sizeof(dz)) {
+// --- ESP-NOW Receive Callback ---
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  if (len == sizeof(correction_t)) {
+    correction_t correction;
+    memcpy(&correction, incomingData, sizeof(correction));
 
-        // Apply correction to the Kalman filter's position state
-        kf.x[0] += dx;
-        kf.x[1] += dy;
-        kf.x[2] += dz;
-      }
+    if (correction.header == 'C') {
+      // Apply correction to the Kalman filter's position state
+      kf.x[0] += correction.dx;
+      kf.x[1] += correction.dy;
+      kf.x[2] += correction.dz;
     }
   }
 }
@@ -224,21 +243,7 @@ void loop() {
     Serial.println("BNO085 reset");
     setReports();
   }
-
-  // High-frequency processing of all available IMU data
   processIMU();
-
-  // Low-frequency tasks
-  unsigned long now = millis();
-  if (now - last_send_time >= SEND_INTERVAL_MS) {
-    last_send_time = now;
-    sendPacket();
-  }
-
-  // Always check for incoming corrections from PC
-  checkForCorrection();
-
-  // UWB ranging loop
   DW1000Ranging.loop();
 }
 
