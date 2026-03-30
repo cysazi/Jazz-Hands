@@ -45,7 +45,17 @@ PLAY_EXIT_THRESHOLD = 0.01
 PLANE_FACES = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.uint32)
 MIDI_OUTPUT_HINT = "JazzHands (A)"
 MIDI_BASE_NOTE = 60  # C4
-MIDI_VELOCITY = 100
+MIDI_VELOCITY_MAX = 100
+MIDI_VELOCITY_MIN = 0
+MIDI_NOTE_MIN = 0
+MIDI_NOTE_MAX = 127
+PALM_NORMAL_LOCAL = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+MIDI_EXPRESSION_CC = 11  # Expression (continuous dynamics)
+MIDI_VOLUME_CC = 7       # Channel volume
+MIDI_MODWHEEL_CC = 1     # Mod wheel
+MIDI_DEFAULT_CHANNEL = 0  # MIDI channels are 0-15 (0 == channel 1)
+MIDI_MIN_OCTAVE_OFFSET = math.ceil((MIDI_NOTE_MIN - MIDI_BASE_NOTE) / 12.0)
+MIDI_MAX_OCTAVE_OFFSET = math.floor((MIDI_NOTE_MAX - (MIDI_BASE_NOTE + NOTE_SECTION_COUNT - 1)) / 12.0)
 
 
 def rot_x(deg: float) -> np.ndarray:
@@ -152,7 +162,18 @@ class DebugVisualizer:
         self.active_note_index: int | None = None
         self.midi_out = None
         self.midi_output_name: str | None = None
+        self.current_midi_channel: int = MIDI_DEFAULT_CHANNEL
+        self.current_octave_offset: int = 0
         self.last_midi_note: int | None = None
+        self.last_midi_channel: int | None = None
+        self.last_midi_velocity: int = 0
+        self.current_midi_velocity: int = 0
+        self.last_expression_values: dict[int, int] = {}
+        self.last_channel_pressure_values: dict[int, int] = {}
+        self.last_cc_values: dict[tuple[int, int], int] = {}
+        self.velocity_reference_quaternion = normalize_quat(
+            np.asarray(self.left_hand.rotation_quaternion, dtype=np.float64)
+        )
         self._setup_midi_output()
         atexit.register(self._close_midi_output)
 
@@ -189,36 +210,171 @@ class DebugVisualizer:
             self.midi_out = None
             self.midi_output_name = None
 
-    def _send_note_off(self, note: int):
+    def _send_note_off(self, note: int, channel: int | None = None):
         if self.midi_out is None:
             return
-        self.midi_out.send(mido.Message("note_off", note=note, velocity=0))
+        channel_out = self.current_midi_channel if channel is None else int(channel)
+        self.midi_out.send(mido.Message("note_off", note=note, velocity=0, channel=channel_out))
 
-    def _send_note_on(self, note: int):
+    def _send_note_on(self, note: int, velocity: int, channel: int | None = None):
         if self.midi_out is None:
             return
-        self.midi_out.send(mido.Message("note_on", note=note, velocity=MIDI_VELOCITY))
+        channel_out = self.current_midi_channel if channel is None else int(channel)
+        note_velocity = max(1, int(velocity))
+        self.midi_out.send(mido.Message("note_on", note=note, velocity=note_velocity, channel=channel_out))
 
-    def _update_midi_note(self, note_index: int | None):
+    def _send_cc_if_changed(self, control: int, value: int, channel: int | None = None):
         if self.midi_out is None:
             return
-        desired_note = (MIDI_BASE_NOTE + note_index) if note_index is not None else None
-        if desired_note == self.last_midi_note:
+        channel_out = self.current_midi_channel if channel is None else int(channel)
+        value_i = int(np.clip(value, 0, 127))
+        key = (channel_out, int(control))
+        previous = self.last_cc_values.get(key)
+        if previous == value_i:
+            return
+        self.midi_out.send(
+            mido.Message("control_change", channel=channel_out, control=control, value=value_i)
+        )
+        self.last_cc_values[key] = value_i
+
+    def _send_channel_pressure_if_changed(self, value: int, channel: int | None = None):
+        if self.midi_out is None:
+            return
+        channel_out = self.current_midi_channel if channel is None else int(channel)
+        value_i = int(np.clip(value, 0, 127))
+        previous = self.last_channel_pressure_values.get(channel_out)
+        if previous == value_i:
+            return
+        self.midi_out.send(mido.Message("aftertouch", channel=channel_out, value=value_i))
+        self.last_channel_pressure_values[channel_out] = value_i
+
+    def _update_midi_note(self, note_index: int | None, note_velocity: int = 0):
+        if self.midi_out is None:
+            return
+        desired_note = None
+        if note_index is not None:
+            desired_note = MIDI_BASE_NOTE + (self.current_octave_offset * 12) + note_index
+            desired_note = int(np.clip(desired_note, MIDI_NOTE_MIN, MIDI_NOTE_MAX))
+        if desired_note == self.last_midi_note and self.last_midi_channel == self.current_midi_channel:
             return
 
         if self.last_midi_note is not None:
-            self._send_note_off(self.last_midi_note)
+            off_channel = self.last_midi_channel if self.last_midi_channel is not None else self.current_midi_channel
+            self._send_note_off(self.last_midi_note, channel=off_channel)
         if desired_note is not None:
-            self._send_note_on(desired_note)
+            self._send_note_on(desired_note, note_velocity, channel=self.current_midi_channel)
+            self._update_live_expression(True, note_velocity)
+            self.last_midi_velocity = note_velocity
+            self.last_midi_channel = self.current_midi_channel
+        else:
+            self.last_midi_velocity = 0
+            self.last_midi_channel = None
         self.last_midi_note = desired_note
 
     def _close_midi_output(self):
         if self.midi_out is not None:
             if self.last_midi_note is not None:
-                self._send_note_off(self.last_midi_note)
+                off_channel = self.last_midi_channel if self.last_midi_channel is not None else self.current_midi_channel
+                self._send_note_off(self.last_midi_note, channel=off_channel)
                 self.last_midi_note = None
+                self.last_midi_channel = None
             self.midi_out.close()
             self.midi_out = None
+
+    def _update_live_expression(self, note_active: bool, velocity_0_to_100: int):
+        if self.midi_out is None:
+            return
+
+        if not note_active:
+            return
+
+        channel = self.current_midi_channel
+        expression = int(round(np.clip(velocity_0_to_100, 0, 100) * 127.0 / 100.0))
+        if expression == self.last_expression_values.get(channel):
+            # Keep CC / aftertouch in sync even when legacy expression field did not change.
+            pass
+
+        # Compatibility bundle: different plugins/hosts honor different live controllers.
+        self._send_cc_if_changed(MIDI_EXPRESSION_CC, expression, channel=channel)
+        self._send_cc_if_changed(MIDI_VOLUME_CC, expression, channel=channel)
+        self._send_cc_if_changed(MIDI_MODWHEEL_CC, expression, channel=channel)
+        self._send_channel_pressure_if_changed(expression, channel=channel)
+        self.last_expression_values[channel] = expression
+
+    def _select_midi_channel(self, channel_1_based: int):
+        channel_zero_based = max(0, min(15, int(channel_1_based) - 1))
+        if channel_zero_based == self.current_midi_channel:
+            return
+
+        if self.last_midi_note is not None:
+            off_channel = self.last_midi_channel if self.last_midi_channel is not None else self.current_midi_channel
+            self._send_note_off(self.last_midi_note, channel=off_channel)
+            self.last_midi_note = None
+            self.last_midi_channel = None
+            self.last_midi_velocity = 0
+
+        self.current_midi_channel = channel_zero_based
+        print(f"Switched instrument MIDI channel to {self.current_midi_channel + 1}.")
+
+    def _midi_channel_from_key(self, key_name: str) -> int | None:
+        key_to_channel = {
+            "1": 1,
+            "2": 2,
+            "3": 3,
+            "4": 4,
+            "5": 5,
+            "6": 6,
+            "7": 7,
+            "8": 8,
+            "9": 9,
+            "0": 10,
+            "NUMPAD1": 1,
+            "NUMPAD2": 2,
+            "NUMPAD3": 3,
+            "NUMPAD4": 4,
+            "NUMPAD5": 5,
+            "NUMPAD6": 6,
+            "NUMPAD7": 7,
+            "NUMPAD8": 8,
+            "NUMPAD9": 9,
+            "NUMPAD0": 10,
+        }
+        return key_to_channel.get(key_name)
+
+    def _adjust_octave(self, delta: int):
+        proposed = self.current_octave_offset + int(delta)
+        clamped = max(MIDI_MIN_OCTAVE_OFFSET, min(MIDI_MAX_OCTAVE_OFFSET, proposed))
+        if clamped == self.current_octave_offset:
+            print(
+                f"Octave already at limit ({self.current_octave_offset:+d}). "
+                f"Range: {MIDI_MIN_OCTAVE_OFFSET:+d}..{MIDI_MAX_OCTAVE_OFFSET:+d}"
+            )
+            return
+        self.current_octave_offset = clamped
+        print(
+            f"Octave shift set to {self.current_octave_offset:+d} "
+            f"(effective base note: {MIDI_BASE_NOTE + self.current_octave_offset * 12})."
+        )
+
+    def _calibrate_velocity_baseline(self):
+        self.velocity_reference_quaternion = normalize_quat(
+            np.asarray(self.left_hand.rotation_quaternion, dtype=np.float64)
+        )
+        print("Velocity baseline calibrated (V): current palm orientation -> velocity 0.")
+
+    def _compute_rotation_velocity(self, q_current: np.ndarray) -> int:
+        # Compare palm-normal direction against baseline; opposite normal (180 deg flip) => max velocity.
+        ref_rot = quaternion_to_rotation_matrix(self.velocity_reference_quaternion)
+        cur_rot = quaternion_to_rotation_matrix(q_current)
+
+        ref_normal = ref_rot @ PALM_NORMAL_LOCAL
+        cur_normal = cur_rot @ PALM_NORMAL_LOCAL
+
+        dot = float(np.clip(np.dot(ref_normal, cur_normal), -1.0, 1.0))
+        angle_rad = math.acos(dot)
+        angle_ratio = angle_rad / math.pi  # 0..1 maps to 0..180 degrees
+        velocity = int(round(MIDI_VELOCITY_MIN + angle_ratio * (MIDI_VELOCITY_MAX - MIDI_VELOCITY_MIN)))
+        return int(np.clip(velocity, MIDI_VELOCITY_MIN, MIDI_VELOCITY_MAX))
 
     def _set_button_state(self, is_pressed: bool):
         if hasattr(self.left_hand, "button_state"):
@@ -439,10 +595,11 @@ class DebugVisualizer:
     def on_key_press(self, event):
         """Record that a key is being held down and update motion vectors."""
         if not event.key: return
-        self.keys_down[event.key.name.upper()] = True
+        key_name = event.key.name.upper()
+        was_held = self.keys_down.get(key_name, False)
+        self.keys_down[key_name] = True
         self._update_motion()
 
-        key_name = event.key.name.upper()
         if key_name == 'SPACE':
             self._set_button_state(True)
         elif key_name == 'C':
@@ -458,6 +615,18 @@ class DebugVisualizer:
             self.active_note_index = None
             self._update_midi_note(None)
             print("Cleared plane.")
+        elif key_name == 'V':
+            self._calibrate_velocity_baseline()
+        elif key_name == 'UP':
+            if not was_held:
+                self._adjust_octave(1)
+        elif key_name == 'DOWN':
+            if not was_held:
+                self._adjust_octave(-1)
+        else:
+            selected_channel = self._midi_channel_from_key(key_name)
+            if selected_channel is not None:
+                self._select_midi_channel(selected_channel)
 
     def on_key_release(self, event):
         """Record that a key is no longer held down and update motion vectors."""
@@ -547,6 +716,7 @@ class DebugVisualizer:
 
         # --- Update Visual Transform ---
         q_current = normalize_quat(np.asarray(self.left_hand.rotation_quaternion, dtype=np.float64))
+        self.current_midi_velocity = self._compute_rotation_velocity(q_current)
         R = quaternion_to_rotation_matrix(q_current)
         R = FRAME_MAP @ R @ FRAME_MAP.T
         R = R @ MODEL_OFFSET
@@ -561,6 +731,7 @@ class DebugVisualizer:
         plane_status = "Plane: not set"
         gate_status = "Zone: N/A"
         note_status = "Note: inactive"
+        note_active = False
         if self.plane_definition is not None:
             u_pct, v_pct, inside, plane_offset = self._plane_position_metrics(pos, self.plane_definition)
             play_metric = self.play_side_sign * plane_offset
@@ -576,12 +747,13 @@ class DebugVisualizer:
             if inside and self.is_on_play_side:
                 note_index, note_name, note_axis_name, note_axis_pct = self._note_section_from_position(pos, self.plane_definition)
                 current_note_index = note_index
+                note_active = True
                 note_status = f"Note: {note_name} ({note_index + 1}/{NOTE_SECTION_COUNT}) axis={note_axis_name} pos={note_axis_pct:5.1f}%"
             else:
                 note_status = "Note: inactive (need inside plane + play zone)"
 
             self.active_note_index = current_note_index
-            self._update_midi_note(current_note_index)
+            self._update_midi_note(current_note_index, self.current_midi_velocity)
             plane_status = (
                 f"Plane UV({self.last_plane_axes[0]}/{self.last_plane_axes[1]}): "
                 f"[{self.last_plane_size[0]:.2f}, {self.last_plane_size[1]:.2f}]  "
@@ -590,14 +762,21 @@ class DebugVisualizer:
         else:
             self._update_midi_note(None)
 
-        midi_status = f"MIDI: {self.midi_output_name}" if self.midi_output_name else "MIDI: disconnected"
+        self._update_live_expression(note_active, self.current_midi_velocity)
+
+        if self.midi_output_name:
+            midi_status = f"MIDI: {self.midi_output_name}  Channel: {self.current_midi_channel + 1}"
+        else:
+            midi_status = "MIDI: disconnected"
         self.status_text.text = (
             f"Button: {'PRESSED' if self.current_button_state else 'RELEASED'}  "
             f"transitions={self.button_transition_count}  Draw: {draw_state}\n"
             f"{plane_status}\n"
             f"{gate_status}  {note_status}\n"
+            f"Velocity(rot): {self.current_midi_velocity}  (0=palm baseline, 100=flipped)\n"
+            f"Octave offset: {self.current_octave_offset:+d}  (Up/Down arrows)\n"
             f"{midi_status}\n"
-            "Controls: WASD move with view, Q/E up/down, IJKLUO rotate, SPACE draw plane, C clear"
+            "Controls: WASD move with view, Q/E up/down, IJKLUO rotate, SPACE draw plane, C clear, V calibrate velocity baseline, Up/Down octave, 0-9 select instrument channel (0=10)"
         )
 
         self.canvas.update()
@@ -625,6 +804,9 @@ def main():
     print("  - Movement: WASD (camera-relative), Q/E (up/down)")
     print("  - Rotation: IJKL (Pitch/Yaw), UO (Roll)")
     print("  - Action: Space press/hold/release to draw plane, C to clear.")
+    print("  - MIDI Velocity: V to set palm-down baseline (velocity 0), flipped palm = velocity 100.")
+    print("  - MIDI Octave: Up/Down arrows to shift octave.")
+    print("  - MIDI Instrument Select: 1-9 -> channels 1-9, 0 -> channel 10.")
     
     visualizer = DebugVisualizer(glove_pair)
     
