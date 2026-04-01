@@ -40,8 +40,10 @@
 #define BNO08X_RESET -1
 #define SDA_PIN 21
 #define SCL_PIN 22
-#define UWB_1_ADDRESS 0x1111 // Short address of Anchor 1
-#define UWB_2_ADDRESS 0x2222 // Short address of Anchor 2
+#define UWB_1_ADDRESS 0x0084 // Short address of Anchor 1
+#define UWB_2_ADDRESS 0x0085 // Short address of Anchor 2
+#define UWB_3_ADDRESS 0x0086 // Short address of Anchor 3
+#define UWB_4_ADDRESS 0x0087 // Short address of Receiver Anchor 4
 #define SPI_SCK 18
 #define SPI_MISO 19
 #define SPI_MOSI 23
@@ -56,6 +58,10 @@ const uint8_t PIN_SS = 4;
 
 #define PACKET_HAS_UWB_1 0b00000100
 #define PACKET_HAS_UWB_2 0b00001000
+#define PACKET_HAS_UWB_3 0b00010000
+#define PACKET_HAS_UWB_4 0b00100000
+#define PACKET_HAS_ACCEL 0b00000001
+#define PACKET_HAS_QUAT 0b00000010
 #define PACKET_HAS_ERROR 0b10000000
 
 // MAC Address of the receiver (Anchor/Relay)
@@ -68,12 +74,13 @@ typedef struct __attribute__((__packed__)) {
   uint32_t timestamp;
   uint8_t packet_type;
   uint8_t button_state;
+  float accel_x, accel_y, accel_z;
   float pos_x, pos_y, pos_z;
   float vel_x, vel_y, vel_z;
-  float UWB_distance1, UWB_distance2;
+  float UWB_distance1, UWB_distance2, UWB_distance3, UWB_distance4;
   float quat_w, quat_i, quat_j, quat_k;
   uint8_t error_handler;
-} datapacket_t;
+} datapacket_t; // 78 bytes
 
 typedef struct __attribute__((__packed__)) {
   char header; // 'C'
@@ -170,7 +177,7 @@ void setup() {
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
   DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ);
   DW1000Ranging.attachNewRange(newRange);
-  DW1000Ranging.startAsTag(UWB_TAG_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY);
+  DW1000Ranging.startAsTag(UWB_TAG_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY, false);
 
   current_packet.header = HEADER;
   current_packet.device_id = DEVICE_ID;
@@ -183,6 +190,10 @@ void processIMU() {
       float ax = sensorValue.un.linearAcceleration.x;
       float ay = sensorValue.un.linearAcceleration.y;
       float az = sensorValue.un.linearAcceleration.z;
+      current_packet.packet_type |= PACKET_HAS_ACCEL;
+      current_packet.accel_x = ax;
+      current_packet.accel_y = ay;
+      current_packet.accel_z = az;
 
       accel_buffer[zupt_buffer_index][0] = ax;
       accel_buffer[zupt_buffer_index][1] = ay;
@@ -201,6 +212,7 @@ void processIMU() {
         kf.predict(ax, ay, az, dt);
       }
     } else if (sensorValue.sensorId == SH2_ROTATION_VECTOR) {
+      current_packet.packet_type |= PACKET_HAS_QUAT;
       current_packet.quat_w = sensorValue.un.rotationVector.real;
       current_packet.quat_i = sensorValue.un.rotationVector.i;
       current_packet.quat_j = sensorValue.un.rotationVector.j;
@@ -237,6 +249,7 @@ void updateZUPT() {
 void sendPacket() {
   current_packet.timestamp = micros();
   current_packet.button_state = digitalRead(BUTTON_PIN);
+  current_packet.packet_type |= (PACKET_HAS_ACCEL | PACKET_HAS_QUAT);
   current_packet.pos_x = kf.x[0];
   current_packet.pos_y = kf.x[1];
   current_packet.pos_z = kf.x[2];
@@ -246,7 +259,7 @@ void sendPacket() {
 
   relay.send_data(&current_packet);
 
-  current_packet.packet_type &= ~(PACKET_HAS_UWB_1 | PACKET_HAS_UWB_2);
+  current_packet.packet_type &= ~(PACKET_HAS_UWB_1 | PACKET_HAS_UWB_2 | PACKET_HAS_UWB_3 | PACKET_HAS_UWB_4);
 }
 
 void loop() {
@@ -267,6 +280,12 @@ void newRange() {
   } else if (shortAddress == UWB_2_ADDRESS) {
     current_packet.UWB_distance2 = device->getRange();
     current_packet.packet_type |= PACKET_HAS_UWB_2;
+  } else if (shortAddress == UWB_3_ADDRESS) {
+    current_packet.UWB_distance3 = device->getRange();
+    current_packet.packet_type |= PACKET_HAS_UWB_3;
+  } else if (shortAddress == UWB_4_ADDRESS) {
+    current_packet.UWB_distance4 = device->getRange();
+    current_packet.packet_type |= PACKET_HAS_UWB_4;
   }
 }
 
