@@ -14,6 +14,7 @@ from collections import deque
 from vispy import app, scene
 from vispy.scene import visuals
 from vispy.app import Timer
+from vispy.io import mesh
 
 import mido
 
@@ -21,20 +22,36 @@ import mido
 
 # region ======================= Constants and Definitions =======================
 
+ # --- UWB Configuration ---
+NUM_UWB_ANCHORS: int = 4  # Set to 3, 4, or 5
+# Set to None for auto-calibration, or provide positions as [(x,y,z), ...] to skip calibration
+# Positions should be in meters. Example: [(0,0,0), (5,0,0), (2.5,4.33,0), (2.5,2.16,3)]
+MANUAL_ANCHOR_POSITIONS: list[tuple[float, float, float]] | None = [(0.0,0.0,0.0), (1.66,0.0,0.0), (0.0,0.915, 0.74), (1.36, 0.255, 2.15)]
+# Alternative: specify individual distances and let Python calculate positions
+# Format: {(anchor1, anchor2): distance, ...} - distances in meters
+MANUAL_ANCHOR_DISTANCES: dict[tuple[int, int], float] | None = None
+# Example: {(1,2): 5.0, (1,3): 5.0, (2,3): 5.0, (1,4): 6.0, (2,4): 6.0, (3,4): 6.0}
+
 # --- Serial and Packet Definitions ---
-COM_PORTS: list[str] = ["/dev/cu.usbserial-023B6AC7", "/dev/cu.usbserial-023B6B29"]
-PACKET_SIZE: int = 58  # Updated packet size
+COM_PORTS: list[str] = ["/dev/cu.usbserial-023BB305"]
+PACKET_SIZE: int = 70  # Updated for 5 UWB distances (4 bytes per extra anchor)
+CALIBRATION_PACKET_SIZE: int = 8  # header(2) + source(1) + dest(1) + distance(4)
 HEADER_BYTE: bytes = b'\xAA\xAA'
-# Updated format: pos(3f), vel(3f), uwb(2f), quat(4f)
-PACKET_FORMAT: str = '<HBIBB 3f 3f 2f 4f B'
+CALIBRATION_HEADER_BYTE: bytes = b'\xBB\xBB'
+# Updated format: pos(3f), vel(3f), uwb(5f), quat(4f)
+PACKET_FORMAT: str = '<HBIBB 3f 3f 5f 4f B'
+CALIBRATION_FORMAT: str = '<H B B f'
 
 # --- Bit Flagging Constants ---
 PACKET_HAS_UWB_1: int = 0b00000100
 PACKET_HAS_UWB_2: int = 0b00001000
+PACKET_HAS_UWB_3: int = 0b00010000
+PACKET_HAS_UWB_4: int = 0b00100000
+PACKET_HAS_UWB_5: int = 0b01000000
 PACKET_HAS_ERROR: int = 0b10000000
 
 # --- System and Physics Constants ---
-DISTANCE_BETWEEN_UWB_ANCHORS: float = 10.0  # meters
+BOUNDING_BOX_NORMAL_TOLERANCE: float = 0.15  # meters, ±tolerance in normal direction
 MIDI_DEBUG_LOGGING: bool = True
 PERFORMANCE_MODE: bool = False  # for mirroring the L and R hands
 INSTRUMENT_CYCLE: tuple[str, ...] = (
@@ -73,6 +90,9 @@ class PacketData:
     vel_z: float
     UWB_distance_1: float | None
     UWB_distance_2: float | None
+    UWB_distance_3: float | None
+    UWB_distance_4: float | None
+    UWB_distance_5: float | None
     quat_w: float
     quat_i: float
     quat_j: float
@@ -101,11 +121,35 @@ class PacketData:
             vel_z=unpacked[10],
             UWB_distance_1=unpacked[11] if (temp_packet_flag & PACKET_HAS_UWB_1) else None,
             UWB_distance_2=unpacked[12] if (temp_packet_flag & PACKET_HAS_UWB_2) else None,
-            quat_w=unpacked[13],
-            quat_i=unpacked[14],
-            quat_j=unpacked[15],
-            quat_k=unpacked[16],
-            error_handler=unpacked[17] if (temp_packet_flag & PACKET_HAS_ERROR) else None
+            UWB_distance_3=unpacked[13] if (temp_packet_flag & PACKET_HAS_UWB_3) else None,
+            UWB_distance_4=unpacked[14] if (temp_packet_flag & PACKET_HAS_UWB_4) else None,
+            UWB_distance_5=unpacked[15] if (temp_packet_flag & PACKET_HAS_UWB_5) else None,
+            quat_w=unpacked[16],
+            quat_i=unpacked[17],
+            quat_j=unpacked[18],
+            quat_k=unpacked[19],
+            error_handler=unpacked[20] if (temp_packet_flag & PACKET_HAS_ERROR) else None
+        )
+
+
+@dataclass
+class CalibrationData:
+    """Represents a calibration packet from the anchors."""
+    source_anchor: int
+    dest_anchor: int
+    distance: float
+
+    @classmethod
+    def from_bytes(cls, binary_data: bytes) -> "CalibrationData":
+        """Parses a calibration packet."""
+        if len(binary_data) != CALIBRATION_PACKET_SIZE:
+            raise ValueError(f"Expected calibration packet size {CALIBRATION_PACKET_SIZE}, got {len(binary_data)}")
+
+        unpacked = struct.unpack(CALIBRATION_FORMAT, binary_data)
+        return cls(
+            source_anchor=unpacked[1],
+            dest_anchor=unpacked[2],
+            distance=unpacked[3]
         )
 
 
@@ -126,10 +170,12 @@ class ThreadedMultiDeviceReader:
 
     def __init__(self):
         self.processing_queues: dict[int, queue.Queue] = {}
+        self.calibration_queue: queue.Queue = queue.Queue()  # Global calibration queue
         self.relays: dict[int, dict] = {}
         self.threads: dict[int, threading.Thread] = {}
         self.running: bool = False
         self.lock = threading.Lock()
+        self.calibration_mode: bool = (MANUAL_ANCHOR_POSITIONS is None and MANUAL_ANCHOR_DISTANCES is None)
 
     def add_device(self, relay_id: int, port: str, baudrate: int = 115200) -> bool:
         """Adds a device to be monitored and starts its reading thread."""
@@ -160,6 +206,26 @@ class ThreadedMultiDeviceReader:
             try:
                 if ser.in_waiting > 0:
                     buffer.extend(ser.read(ser.in_waiting))
+
+                    # Check for calibration packets first (smaller, higher priority)
+                    if self.calibration_mode and len(buffer) >= CALIBRATION_PACKET_SIZE:
+                        cal_header_index = buffer.find(CALIBRATION_HEADER_BYTE)
+                        if cal_header_index != -1:
+                            if cal_header_index > 0:
+                                buffer[:] = buffer[cal_header_index:]
+                            if len(buffer) >= CALIBRATION_PACKET_SIZE:
+                                cal_packet_bytes = bytes(buffer[:CALIBRATION_PACKET_SIZE])
+                                try:
+                                    cal_data = CalibrationData.from_bytes(cal_packet_bytes)
+                                    self.calibration_queue.put(cal_data)
+                                    print(f"Calibration: Anchor {cal_data.source_anchor} -> {cal_data.dest_anchor}: {cal_data.distance:.3f}m")
+                                except ValueError as e:
+                                    print(f"Calibration packet error: {e}")
+                                finally:
+                                    buffer[:] = buffer[CALIBRATION_PACKET_SIZE:]
+                                continue
+
+                    # Check for normal data packets
                     while len(buffer) >= PACKET_SIZE:
                         header_index = buffer.find(HEADER_BYTE)
                         if header_index == -1:
@@ -200,12 +266,12 @@ class ThreadedMultiDeviceReader:
                 if device['serial'].is_open:
                     device['serial'].close()
 
-    def send_correction(self, relay_id: int, correction: np.ndarray):
+    def send_correction(self, relay_id: int, device_id:int, correction: np.ndarray):
         """Sends a position correction vector to the specified device."""
         with self.lock:
             if relay_id in self.relays and self.relays[relay_id]['serial'].is_open:
-                # Message format: 'C' for Correction, followed by 3 floats (dx, dy, dz)
-                message = struct.pack('<cb3f', b'C', relay_id.to_bytes(), correction[0], correction[1], correction[2])
+                # Message format: 'C' for Correction, the device number, followed by 3 floats (dx, dy, dz)
+                message = struct.pack('<cb3f', b'C', device_id.to_bytes(), correction[0], correction[1], correction[2])
                 self.relays[relay_id]['serial'].write(message)
 
 
@@ -213,14 +279,101 @@ class ThreadedMultiDeviceReader:
 
 # region ======================= Math Helper Functions =======================
 
-def triangulate_position(d1: float, d2: float, D: float) -> tuple[float, float]:
-    """Calculates 2D coordinates from two UWB distances."""
-    if d1 + d2 < D:
-        return (d1 / (d1 + d2)) * D, 0.0
-    x = (d1 ** 2 + D ** 2 - d2 ** 2) / (2 * D)
-    y_squared = d1 ** 2 - x ** 2
-    y = math.sqrt(y_squared) if y_squared >= 0 else 0.0
-    return x, y
+def calculate_anchor_positions_from_distances(distances: dict[tuple[int, int], float]) -> dict[int, np.ndarray]:
+    """
+    Calculate 3D anchor positions from pairwise distances.
+    This function defines a coordinate system based on the first few anchors:
+    - Anchor 1 is at the origin (0,0,0).
+    - Anchor 2 is on the positive X-axis.
+    - Anchor 3 is on the XY plane with a positive Y value.
+    - Anchors 4, 5, etc., are placed in 3D space relative to this frame.
+    """
+    positions = {}
+    if NUM_UWB_ANCHORS < 3:
+        raise ValueError("At least 3 anchors are required for 3D positioning.")
+
+    # Anchor 1 at origin
+    positions[1] = np.array([0.0, 0.0, 0.0])
+
+    # Anchor 2 on X-axis
+    d12 = distances.get((1, 2)) or distances.get((2, 1))
+    if d12 is None: raise ValueError("Missing distance between anchors 1 and 2")
+    positions[2] = np.array([d12, 0.0, 0.0])
+
+    # Anchor 3 in XY plane
+    d13 = distances.get((1, 3)) or distances.get((3, 1))
+    d23 = distances.get((2, 3)) or distances.get((3, 2))
+    if d13 is None or d23 is None: raise ValueError("Missing distances for anchor 3")
+    
+    # Law of cosines to find x3, y3
+    x3 = (d13**2 + d12**2 - d23**2) / (2 * d12)
+    y3_squared = d13**2 - x3**2
+    y3 = math.sqrt(max(0, y3_squared))
+    positions[3] = np.array([x3, y3, 0.0])
+
+    # General trilateration for subsequent anchors (4, 5, ...)
+    for i in range(4, NUM_UWB_ANCHORS + 1):
+        d1i = distances.get((1, i)) or distances.get((i, 1))
+        d2i = distances.get((2, i)) or distances.get((i, 2))
+        d3i = distances.get((3, i)) or distances.get((i, 3))
+        if d1i is None or d2i is None or d3i is None:
+            raise ValueError(f"Missing distances for anchor {i}")
+
+        # Solve for position (xi, yi, zi) using anchors 1, 2, and 3
+        p2_x = positions[2][0]
+        p3_x, p3_y = positions[3][0], positions[3][1]
+
+        # from sphere equations (x-x_n)^2 + ... = d_n^2
+        xi = (d1i**2 - d2i**2 + p2_x**2) / (2 * p2_x)
+        yi = (d1i**2 - d3i**2 + p3_x**2 + p3_y**2 - 2 * p3_x * xi) / (2 * p3_y)
+        zi_squared = d1i**2 - xi**2 - yi**2
+        zi = math.sqrt(max(0, zi_squared))
+        positions[i] = np.array([xi, yi, zi])
+
+    return positions
+
+
+def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.ndarray]) -> np.ndarray:
+    """
+    3D multilateration using Weighted Least Squares for N >= 3 anchors.
+    Returns (x, y, z) position.
+    """
+    # Build matrices for WLS: (A^T W A)^-1 A^T W b
+    n = len(distances)
+    if n < 3:
+        raise ValueError("Need at least 3 distances for 3D multilateration.")
+        
+    A = np.zeros((n - 1, 3))
+    b = np.zeros(n - 1)
+    W = np.eye(n - 1)
+
+    # Use the last anchor as the reference point to build a system of n-1 linear equations
+    ref_pos = anchor_positions[n]
+    ref_dist = distances[n-1]
+
+    for i in range(n - 1):
+        anchor_id = i + 1
+        p_i = anchor_positions[anchor_id]
+        d_i = distances[i]
+
+        # Linear least squares formulation by subtracting sphere equations
+        # 2(ref_pos - p_i) . X = d_i^2 - ref_dist^2 - |p_i|^2 + |ref_pos|^2
+        A[i, :] = 2 * (ref_pos - p_i)
+        b[i] = d_i**2 - ref_dist**2 - np.dot(p_i, p_i) + np.dot(ref_pos, ref_pos)
+
+        # Weight inversely proportional to distance (closer = more accurate)
+        W[i, i] = 1.0 / max(d_i, 0.1)**2
+
+    try:
+        # Weighted least squares solution: pos = (A^T W A)^-1 A^T W b
+        AT_W_A = A.T @ W @ A
+        AT_W_b = A.T @ W @ b
+        pos = np.linalg.solve(AT_W_A, AT_W_b)
+        return pos
+    except np.linalg.LinAlgError:
+        # Fallback to unweighted if singular
+        pos, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        return pos
 
 
 def quat_to_euler(q):
@@ -331,6 +484,8 @@ class Glove:
     device_id: int
     active_area_x_subsections: int
     active_area_y_subsections: int
+    anchor_positions: dict[int, np.ndarray] = field(default_factory=dict)  # 3D positions of UWB anchors
+    triangulate_func: callable = None  # Will be set based on NUM_UWB_ANCHORS
     is_UWB_calibrated: bool = False
     button_pressed: bool = False
     glove_state: int = 0
@@ -340,7 +495,7 @@ class Glove:
     1: drawing box
     2: box drawn, fully initialized
     """
-    visual: GloveVisual | None = None
+    visual: 'GloveVisual | None' = None
     active_area_half_extents: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     plane_normal_axis: int = 2  # Default to XY plane (Z-axis normal)
 
@@ -356,6 +511,9 @@ class Glove:
     # Raw UWB data for correction calculation
     UWB_distance_1: float | None = None
     UWB_distance_2: float | None = None
+    UWB_distance_3: float | None = None
+    UWB_distance_4: float | None = None
+    UWB_distance_5: float | None = None
 
     # Reference point for UWB coordinate system calibration
     reference_UWB_position: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
@@ -368,18 +526,28 @@ class Glove:
     quat_history: deque = field(default_factory=lambda: deque(maxlen=10))
     euler_history: deque = field(default_factory=lambda: deque(maxlen=10))
 
+    def _get_uwb_distances(self) -> list[float | None]:
+        """Returns a list of UWB distances based on NUM_UWB_ANCHORS."""
+        all_distances = [
+            self.UWB_distance_1, self.UWB_distance_2, self.UWB_distance_3,
+            self.UWB_distance_4, self.UWB_distance_5
+        ]
+        return all_distances[:NUM_UWB_ANCHORS]
+
     def calibrate_zero_frame(self):
         """Sets the current UWB position as the origin of the coordinate system."""
-        if self.UWB_distance_1 is not None and self.UWB_distance_2 is not None:
-            x, y = triangulate_position(self.UWB_distance_1, self.UWB_distance_2, DISTANCE_BETWEEN_UWB_ANCHORS)
-            # Use the ESP32's Z position for the reference, as UWB is 2D
-            self.reference_UWB_position = np.array([x, y, self.position[2]])
+        distances = self._get_uwb_distances()
+
+        if all(d is not None for d in distances):
+            # Use 3D multilateration to get absolute position
+            uwb_position = self.triangulate_func(distances, self.anchor_positions)
+            self.reference_UWB_position = uwb_position
             self.reference_orientation_quaternion = self.rotation_quaternion.copy()
             self.inverse_reference_orientation = quaternion_inverse(self.reference_orientation_quaternion)
             self.is_UWB_calibrated = True
             print(f"Glove {self.device_id} UWB calibrated at {self.reference_UWB_position}")
         else:
-            print(f"Glove {self.device_id}: UWB calibration failed. No UWB data available.")
+            print(f"Glove {self.device_id}: UWB calibration failed. Missing UWB data.")
 
     def update_from_packet(self, p: DevicePacket):
         """Updates the glove's state from an incoming ESP32 packet."""
@@ -402,30 +570,34 @@ class Glove:
 
         self.rotation_euler = np.array(quat_to_euler_deg(self.rotation_quaternion), dtype=np.float64)
 
-        if p.data.UWB_distance_1:
-            self.UWB_distance_1 = p.data.UWB_distance_1
-        if p.data.UWB_distance_2:
-            self.UWB_distance_2 = p.data.UWB_distance_2
+        if p.data.UWB_distance_1: self.UWB_distance_1 = p.data.UWB_distance_1
+        if p.data.UWB_distance_2: self.UWB_distance_2 = p.data.UWB_distance_2
+        if p.data.UWB_distance_3: self.UWB_distance_3 = p.data.UWB_distance_3
+        if p.data.UWB_distance_4: self.UWB_distance_4 = p.data.UWB_distance_4
+        if p.data.UWB_distance_5: self.UWB_distance_5 = p.data.UWB_distance_5
 
-    def calculate_and_send_correction(self, reader: ThreadedMultiDeviceReader, relay_id: int):
+    def calculate_and_send_correction(self, reader: ThreadedMultiDeviceReader, relay_id: int, device_id:int):
+        distances = self._get_uwb_distances()
+
         # Only proceed if we have fresh UWB data
-        if self.UWB_distance_1 is not None and self.UWB_distance_2 is not None:
+        if all(d is not None for d in distances):
             # 1. Calculate UWB ground truth in the absolute anchor frame
-            abs_uwb_x, abs_uwb_y = triangulate_position(self.UWB_distance_1, self.UWB_distance_2,
-                                                        DISTANCE_BETWEEN_UWB_ANCHORS)
+            abs_uwb_pos = self.triangulate_func(distances, self.anchor_positions)
 
             # 2. Translate to the relative frame based on the calibration origin
-            rel_uwb_x = abs_uwb_x - self.reference_UWB_position[0]
-            rel_uwb_y = abs_uwb_y - self.reference_UWB_position[1]
+            rel_uwb_pos = abs_uwb_pos - self.reference_UWB_position
 
-            # 3. Create the ground truth vector (using the ESP32's Z-axis value)
-            ground_truth_pos = np.array([rel_uwb_x, rel_uwb_y, self.position[2]])
+            # 3. Calculate the correction vector (the drift)
+            correction = rel_uwb_pos - self.position
 
-            # 4. Calculate the correction vector (the drift)
-            correction = ground_truth_pos - self.position
+            # 4. Apply bounding box clamping in the normal direction
+            if self.glove_state == 2:  # Only apply bounding when box is drawn
+                normal_component = correction[self.plane_normal_axis]
+                if abs(normal_component) > BOUNDING_BOX_NORMAL_TOLERANCE:
+                    correction[self.plane_normal_axis] = np.sign(normal_component) * BOUNDING_BOX_NORMAL_TOLERANCE
 
             # 5. Send the correction back to the ESP32
-            reader.send_correction(relay_id, correction)
+            reader.send_correction(relay_id, device_id, correction)
 
             # 6. Immediately apply the correction locally for smooth visualization
             self.position += correction
@@ -433,6 +605,9 @@ class Glove:
             # 7. Invalidate UWB data after use to prevent re-sending the same correction
             self.UWB_distance_1 = None
             self.UWB_distance_2 = None
+            self.UWB_distance_3 = None
+            self.UWB_distance_4 = None
+            self.UWB_distance_5 = None
 
     @staticmethod
     def _get_section_index(pos_val: float, num_sections: int, area_half_length: float) -> int:
@@ -562,7 +737,7 @@ class GlovePair:
     relay_id: int
     relay_queue: queue.Queue
     reader: ThreadedMultiDeviceReader
-    daw_interface: DawInterface
+    daw_interface: 'DawInterface'
     current_octave: int = 4
     right_roll_samples: deque = field(default_factory=lambda: deque(maxlen=10))
     last_instrument_gesture_ms: int = field(default=-10_000)
@@ -579,7 +754,7 @@ class GlovePair:
     def _process_single_packet(self, packet: DevicePacket, from_queue: bool = False):
         glove = self.left_hand if packet.data.device_number % 2 != 0 else self.right_hand
         glove.update_from_packet(packet)
-        glove.calculate_and_send_correction(self.reader, self.relay_id)
+        glove.calculate_and_send_correction(self.reader, self.relay_id, glove.device_id)
         if from_queue:
             self.relay_queue.task_done()
         glove.get_section_from_position()
@@ -984,35 +1159,113 @@ class Visualizer:
 
 # region ======================= Main Application =======================
 
+def perform_auto_calibration(reader: ThreadedMultiDeviceReader) -> dict[int, np.ndarray]:
+    """
+    Waits for calibration packets from anchors and calculates their 3D positions.
+    Returns a dictionary of anchor positions {anchor_id: np.ndarray([x, y, z])}.
+    """
+    print(f"\n{'='*60}")
+    print("AUTO-CALIBRATION MODE")
+    print(f"Waiting for {NUM_UWB_ANCHORS} UWB anchors to calibrate...")
+    print(f"{'='*60}\n")
+
+    # Collect all pairwise distances from calibration packets
+    distances = {}
+    required_measurements = NUM_UWB_ANCHORS * (NUM_UWB_ANCHORS - 1) // 2
+
+    while len(distances) < required_measurements:
+        try:
+            cal_data = reader.calibration_queue.get(timeout=30.0)
+            # Use a sorted tuple as key to handle (1,2) and (2,1) as the same measurement
+            key = tuple(sorted((cal_data.source_anchor, cal_data.dest_anchor)))
+            if key not in distances:
+                distances[key] = cal_data.distance
+                print(f"  [{len(distances)}/{required_measurements}] Anchor {cal_data.source_anchor} -> {cal_data.dest_anchor}: {cal_data.distance:.3f}m")
+        except queue.Empty:
+            print("Calibration timeout! Make sure all anchors are powered on and sending data.")
+            raise TimeoutError("Auto-calibration failed: timeout waiting for anchor data")
+
+    print(f"\n{'='*60}")
+    print("Calibration complete! Calculating anchor positions...")
+    print(f"{'='*60}\n")
+
+    # Calculate anchor positions from the collected distances
+    anchor_positions = calculate_anchor_positions_from_distances(distances)
+
+    for anchor_id, pos in sorted(anchor_positions.items()):
+        print(f"  Anchor {anchor_id}: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) m")
+
+    print(f"\n{'='*60}\n")
+    reader.calibration_mode = False
+    return anchor_positions
+
+
 def main():
     """Initializes and runs the main application."""
-    # Create MIDI Object with
-    daw_interface = DawInterface(port=None)  # Change this if you know your port
+    # Create MIDI Object
+    daw_interface = DawInterface(port=None)
 
     # Create reader object
     reader = ThreadedMultiDeviceReader()
     for i, port in enumerate(COM_PORTS, start=1):
         if not reader.add_device(relay_id=i, port=port):
             print(f"Could not connect to device on {port}. Please check connection.")
-            # return
-
-    # Create glove pairs
-    glove_pairs = []
-    if 1 in reader.processing_queues:
-        glove_pairs.append(
-            GlovePair(left_hand=LeftHand(device_id=1, active_area_x_subsections=3, active_area_y_subsections=12),
-                      right_hand=RightHand(device_id=2, active_area_x_subsections=5, active_area_y_subsections=8),
-                      relay_id=1,
-                      reader=reader,
-                      relay_queue=reader.processing_queues[1],
-                      daw_interface=daw_interface
-                      ))
 
     reader.start()
+
+    # Determine anchor positions
+    anchor_positions = {}
+    if MANUAL_ANCHOR_POSITIONS is not None:
+        print("Using manual anchor positions (skipping auto-calibration)")
+        for i, pos in enumerate(MANUAL_ANCHOR_POSITIONS, start=1):
+            anchor_positions[i] = np.array(pos)
+            print(f"  Anchor {i}: {pos}")
+    elif MANUAL_ANCHOR_DISTANCES is not None:
+        print("Using manual anchor distances")
+        anchor_positions = calculate_anchor_positions_from_distances(MANUAL_ANCHOR_DISTANCES)
+        for anchor_id, pos in anchor_positions.items():
+            print(f"  Anchor {anchor_id}: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) m")
+    else:
+        # Auto-calibration mode
+        anchor_positions = perform_auto_calibration(reader)
+
+    # Create glove pairs with anchor positions
+    glove_pairs = []
+    if 1 in reader.processing_queues:
+        left_hand = LeftHand(
+            device_id=1,
+            active_area_x_subsections=3,
+            active_area_y_subsections=12,
+            anchor_positions=anchor_positions,
+            triangulate_func=multilaterate_3d_wls
+        )
+        right_hand = RightHand(
+            device_id=2,
+            active_area_x_subsections=5,
+            active_area_y_subsections=8,
+            anchor_positions=anchor_positions,
+            triangulate_func=multilaterate_3d_wls
+        )
+
+        glove_pairs.append(
+            GlovePair(
+                left_hand=left_hand,
+                right_hand=right_hand,
+                relay_id=1,
+                reader=reader,
+                relay_queue=reader.processing_queues[1],
+                daw_interface=daw_interface
+            )
+        )
+
     for pair in glove_pairs:
         pair.start()
 
-    print("System running. Close the visualization window to stop.")
+    print("\n" + "="*60)
+    print("SYSTEM READY")
+    print("="*60)
+    print("System running. Close the visualization window to stop.\n")
+
     visualizer = Visualizer(glove_pairs)
     app.run()
 

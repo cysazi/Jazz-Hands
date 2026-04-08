@@ -81,9 +81,12 @@ No Wiring because we got an integrated UWB + ESP32n board (yay!)
 * Download `mf_DW10000.zip` then include it in Arduino IDE using `Sketch > Include Library > Add .ZIP Library`
 ## ESP 32 Info
 ### Mac Addresses
-| # | ESP32 Serial Address (MacOS)  | ESP-NOW Mac Address |  UWB Address|
-|---|-------------------------------|---------------------|---------------------------|
-| 1 | /dev/cu.usbserial-023B6AB4    | 34:98:7A:74:39:00   |                           |
-| 2 | /dev/cu.usbserial-023B6B01    | 34:98:7A:73:75:B8   |                           |
-| 3 | /dev/cu.usbserial-023B6AC7    | 34:98:7A:73:93:14   |  84:00:5B:D5:A9:9A:22:22  |
-| 4 | /dev/cu.usbserial-023B6B29    | 08:F9:E0:92:C0:08   |  84:00:5B:D5:A9:9A:11:11  |
+| # | ESP32 Serial Address (MacOS)  | ESP-NOW Mac Address |  UWB Address              | UWB Delay|
+|---|-------------------------------|---------------------|---------------------------|----------|
+| 1 | /dev/cu.usbserial-023B6AB4    | 34:98:7A:74:39:00   |                           |          |
+| 2 | /dev/cu.usbserial-023B6B01    | 34:98:7A:73:75:B8   |                           |  16533   |
+| 3 | /dev/cu.usbserial-023B6AC7    | 34:98:7A:73:93:14   |                           |          |
+| 4 | /dev/cu.usbserial-023B6B29    | 08:F9:E0:92:C0:08   |  84:00:5B:D5:A9:9A:44:44 |   16526  |
+| A1 | /dev/cu.usbserial-023BB305 | 34:98:7A:72:93:D4 | 84:00:5B:D5:A9:9A:11:11 | 16537 |
+| A2 |/dev/cu.usbserial-023BB2B5 | 34:98:7A:72:B0:10 | 84:00:5B:D5:A9:9A:22:22 | 16536 |
+| A3 | /dev/cu.usbserial-023BB2E3 | 64:B7:08:35:3C:38 | 84:00:5B:D5:A9:9A:33:33 | 16533 |

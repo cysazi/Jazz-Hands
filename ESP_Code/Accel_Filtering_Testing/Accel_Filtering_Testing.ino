@@ -2,9 +2,8 @@
 #include <Adafruit_BNO08x.h>
 #include <Wire.h>
 
-// Use the higher-level ESP-NOW wrapper libraries
-#include <ESP32_NOW.h>
-#include <ESP32_NOW_Serial.h>
+// Use the lower-level ESP-NOW library
+#include <esp_now.h>
 #include <WiFi.h>
 
 // UWB Libraries
@@ -20,8 +19,8 @@
 // UNCOMMENT the device you are flashing this code to.
 // This determines the DEVICE_ID in the packet and the UWB address.
 
-#define CONFIG_GLOVE_1
-// #define CONFIG_GLOVE_2
+// #define CONFIG_GLOVE_1
+#define CONFIG_GLOVE_2
 
 // =================================================================
 
@@ -42,6 +41,9 @@
 #define SCL_PIN 22
 #define UWB_1_ADDRESS 0x1111 // Short address of Anchor 1
 #define UWB_2_ADDRESS 0x2222 // Short address of Anchor 2
+#define UWB_3_ADDRESS 0x3333 // Short address of Anchor 3
+#define UWB_4_ADDRESS 0x4444 // Short address of Anchor 4
+#define UWB_4_ADDRESS 0x5555 // Short address of Anchor 5
 #define SPI_SCK 18
 #define SPI_MISO 19
 #define SPI_MOSI 23
@@ -52,14 +54,16 @@ const uint8_t PIN_SS = 4;
 #define BUTTON_PIN 33
 
 #define HEADER 0xAAAA
-#define ESPNOW_WIFI_CHANNEL 6
+#define ESPNOW_WIFI_CHANNEL 11
 
 #define PACKET_HAS_UWB_1 0b00000100
 #define PACKET_HAS_UWB_2 0b00001000
+#define PACKET_HAS_UWB_3 0b00010000
+#define PACKET_HAS_UWB_4 0b00100000
 #define PACKET_HAS_ERROR 0b10000000
 
 // MAC Address of the receiver (Anchor/Relay)
-uint8_t receiverMac[] = {0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08};
+uint8_t receiverMac[6] = {0x34, 0x98, 0x7A, 0x72, 0x93, 0xD4};
 
 // --- Data Structures ---
 typedef struct __attribute__((__packed__)) {
@@ -70,14 +74,14 @@ typedef struct __attribute__((__packed__)) {
   uint8_t button_state;
   float pos_x, pos_y, pos_z;
   float vel_x, vel_y, vel_z;
-  float UWB_distance1, UWB_distance2;
+  float UWB_distance1, UWB_distance2, UWB_distance3, UWB_distance4, UWB_distance5;
   float quat_w, quat_i, quat_j, quat_k;
   uint8_t error_handler;
 } datapacket_t;
 
 typedef struct __attribute__((__packed__)) {
   char header; // 'C'
-  uint8_t device_number;
+  uint8_t device_id;
   float dx, dy, dz;
 } correction_t;
 
@@ -94,39 +98,24 @@ bool is_stationary = false;
 const float ZUPT_STATIONARY_THRESHOLD = 0.05f;
 
 // ========================================
-// ESP-NOW Peer Class for the Relay
+// ESP-NOW Callbacks
 // ========================================
-class RelayPeer : public ESP_NOW_Peer {
-public:
-  RelayPeer(const uint8_t *mac_addr) : ESP_NOW_Peer(mac_addr, ESPNOW_WIFI_CHANNEL, WIFI_IF_STA, nullptr) {}
-
-  // Public wrapper to add this peer
-  bool begin() {
-    return add();
-  }
-
-  // Public wrapper to send data
-  void send_data(const datapacket_t* data) {
-    send((uint8_t*)data, sizeof(datapacket_t));
-  }
-
-protected:
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   // Handle incoming correction packets
-  void onReceive(const uint8_t *data, size_t len, bool broadcast) {
-    if (len == sizeof(correction_t)) {
-      correction_t correction;
-      memcpy(&correction, data, sizeof(correction));
-      if (correction.header == 'C') {
-        kf.x[0] += correction.dx;
-        kf.x[1] += correction.dy;
-        kf.x[2] += correction.dz;
-      }
+  if (len == sizeof(correction_t)) {
+    correction_t correction;
+    memcpy(&correction, data, sizeof(correction));
+    if (correction.header == 'C') {
+      kf.x[0] += correction.dx;
+      kf.x[1] += correction.dy;
+      kf.x[2] += correction.dz;
     }
   }
-};
+}
 
-// --- Global Instance of the Relay Peer ---
-RelayPeer relay(receiverMac);
+void onDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
+  // Optional: Handle send status
+}
 
 void setReports() {
   Serial.println("Setting desired reports");
@@ -154,14 +143,22 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setChannel(ESPNOW_WIFI_CHANNEL);
-  while(!WiFi.STA.started()) { delay(100); }
 
-  if (!ESP_NOW.begin()) {
+  if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
     return;
   }
 
-  if (!relay.begin()) {
+  esp_now_register_recv_cb(onDataRecv);
+  esp_now_register_send_cb(onDataSent);
+
+  // Add relay peer
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMac, 6);
+  peerInfo.channel = ESPNOW_WIFI_CHANNEL;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
     Serial.println("Failed to add relay peer");
     return;
   }
@@ -169,8 +166,9 @@ void setup() {
 
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
   DW1000Ranging.initCommunication(PIN_RST, PIN_SS, PIN_IRQ);
+
   DW1000Ranging.attachNewRange(newRange);
-  DW1000Ranging.startAsTag(UWB_TAG_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY);
+  DW1000Ranging.startAsTag(UWB_TAG_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY, false);
 
   current_packet.header = HEADER;
   current_packet.device_id = DEVICE_ID;
@@ -244,9 +242,9 @@ void sendPacket() {
   current_packet.vel_y = kf.x[4];
   current_packet.vel_z = kf.x[5];
 
-  relay.send_data(&current_packet);
+  esp_now_send(receiverMac, (uint8_t*)&current_packet, sizeof(datapacket_t));
 
-  current_packet.packet_type &= ~(PACKET_HAS_UWB_1 | PACKET_HAS_UWB_2);
+  current_packet.packet_type &= ~(PACKET_HAS_UWB_1 | PACKET_HAS_UWB_2 | PACKET_HAS_UWB_3 | PACKET_HAS_UWB_4);
 }
 
 void loop() {
@@ -267,6 +265,15 @@ void newRange() {
   } else if (shortAddress == UWB_2_ADDRESS) {
     current_packet.UWB_distance2 = device->getRange();
     current_packet.packet_type |= PACKET_HAS_UWB_2;
+  } else if (shortAddress == UWB_3_ADDRESS) {
+    current_packet.UWB_distance3 = device->getRange();
+    current_packet.packet_type |= PACKET_HAS_UWB_3;
+  } else if (shortAddress == UWB_4_ADDRESS) {
+    current_packet.UWB_distance4 = device->getRange();
+    current_packet.packet_type |= PACKET_HAS_UWB_4;
+  } else if (shortAddress == UWB_5_ADDRESS) {
+    current_packet.UWB_distance5 = device->getRange();
+    current_packet.packet_type |= PACKET_HAS_UWB_5;
   }
 }
 
