@@ -37,7 +37,7 @@ ANGULAR_STEP_MAX = 10.0
 
 
 class _NullReader:
-    def send_correction(self, relay_id, correction):
+    def send_correction(self, relay_id, device_id, correction):
         return
 
 
@@ -48,10 +48,21 @@ class DebugVisualizer(jhk.Visualizer):
         self.right_hand = self.glove_pair.right_hand
         self._ensure_debug_runtime_dependencies()
 
+        # Initialize the base class, which creates the scenes and GloveVisuals
         super().__init__([glove_pair])
-        for lh_view, rh_view in self.view_pairs:
-            lh_view.camera.distance = 3
-            rh_view.camera.distance = 3
+
+        # Hide the XYZ axes created by the base class to avoid visual clutter
+        for pair in self.glove_pairs:
+            pair.left_hand.visual.axis.visible = False
+            pair.right_hand.visual.axis.visible = False
+
+        # Explicitly link the cameras to ensure they are synchronized
+        lh_view, rh_view = self.view_pairs[0]
+        lh_view.camera.link(rh_view.camera)
+        
+        for view_pair in self.view_pairs:
+            view_pair[0].camera.distance = 3
+            view_pair[1].camera.distance = 3
 
         self.canvas.events.key_press.connect(self.on_key_press)
         self.canvas.events.key_release.connect(self.on_key_release)
@@ -65,11 +76,8 @@ class DebugVisualizer(jhk.Visualizer):
             "RIGHT": np.array([0.0, 0.0, 0.0], dtype=np.float64),
         }
         self.controlled_hand_label = "LEFT"
-        self.hand_meshes = {}
         self.debug_print_interval_seconds = 0.5
         self.last_debug_print_time = 0.0
-
-        self._setup_hand_meshes()
 
         # --- Status Text ---
         self.status_text = scene.visuals.Text(
@@ -85,61 +93,21 @@ class DebugVisualizer(jhk.Visualizer):
     def _ensure_debug_runtime_dependencies(self):
         if self.glove_pair.reader is None:
             self.glove_pair.reader = _NullReader()
+        # No need for a real queue in synchronous debug mode
         if self.glove_pair.relay_queue is None:
-            self.glove_pair.relay_queue = queue.Queue()
+            self.glove_pair.relay_queue = queue.Queue() # The class expects it, but we won't use it
         if not self.right_hand.instrument:
             self.right_hand.instrument = "Synth"
 
         if not hasattr(self.glove_pair.daw_interface, "previous_note"):
-            self.glove_pair.daw_interface.previous_note = jhk.NoteData(
-                note=0,
-                attack=0,
-                instrument="Synth",
-                volume=0,
-                stereo=0.0,
-                reverb_mode=0,
-            )
-
-    def _setup_hand_meshes(self):
-        if not os.path.exists(HAND_OBJ_PATH):
-            raise FileNotFoundError(f"Could not find model: {HAND_OBJ_PATH}")
-
-        vertices, faces, _normals, _texcoords = read_mesh(HAND_OBJ_PATH)
-        lh_view, rh_view = self.view_pairs[0]
-        self.hand_meshes["LEFT"] = scene.visuals.Mesh(
-            vertices=vertices,
-            faces=faces,
-            color=(0.25, 0.75, 0.95, 0.80),
-            shading="smooth",
-            parent=lh_view.scene,
-        )
-        self.hand_meshes["LEFT"].transform = MatrixTransform()
-        self.hand_meshes["RIGHT"] = scene.visuals.Mesh(
-            vertices=vertices,
-            faces=faces,
-            color=(0.95, 0.45, 0.25, 0.80),
-            shading="smooth",
-            parent=rh_view.scene,
-        )
-        self.hand_meshes["RIGHT"].transform = MatrixTransform()
-
-    def _mesh_transform_matrix(self, hand) -> np.ndarray:
-        q_current = np.asarray(hand.rotation_quaternion, dtype=np.float64)
-        rotation_matrix = jhk.quaternion_to_transform_matrix(q_current, np.array([0.0, 0.0, 0.0]))[:3, :3]
-        rotation_matrix = FRAME_MAP @ rotation_matrix @ FRAME_MAP.T
-        rotation_matrix = rotation_matrix @ MODEL_OFFSET
-
-        transform = np.eye(4, dtype=np.float32)
-        transform[:3, :3] = rotation_matrix * MODEL_SCALE
-        transform[3, :3] = np.asarray(hand.position, dtype=np.float32) * POSITION_SCALE
-        return transform
+            self.glove_pair.daw_interface.previous_note = jhk.NoteData.blank_note()
 
     def _build_debug_packet(self, hand, device_number: int) -> jhk.DevicePacket:
-        # Seed synthetic UWB only for the first calibration press.
-        should_seed_uwb = hand.glove_state == 0 and bool(hand.button_pressed)
+        is_controlled_hand = (self.controlled_hand_label == "LEFT" and hand is self.left_hand) or \
+                             (self.controlled_hand_label == "RIGHT" and hand is self.right_hand)
+        current_button_state = self.keys_down.get('SPACE', False) if is_controlled_hand else False
+        should_seed_uwb = hand.glove_state == 0 and current_button_state
 
-        # update_from_packet() expects raw sensor-frame values, then applies
-        # inverse_reference_orientation to produce calibrated/world values.
         raw_position = jhk.rotate_vector_by_quaternion(
             np.asarray(hand.position, dtype=np.float64),
             np.asarray(hand.reference_orientation_quaternion, dtype=np.float64),
@@ -156,18 +124,18 @@ class DebugVisualizer(jhk.Visualizer):
             device_number=device_number,
             timestamp=int(time.time() * 1000),
             packet_flags=0,
-            button_state=bool(hand.button_pressed),
+            button_state=current_button_state,
             pos_x=float(raw_position[0]),
             pos_y=float(raw_position[1]),
             pos_z=float(raw_position[2]),
             vel_x=float(raw_velocity[0]),
             vel_y=float(raw_velocity[1]),
             vel_z=float(raw_velocity[2]),
-            UWB_distance_1=float(jhk.DISTANCE_BETWEEN_UWB_ANCHORS) if should_seed_uwb else None,
-            UWB_distance_2=float(jhk.DISTANCE_BETWEEN_UWB_ANCHORS) if should_seed_uwb else None,
-            UWB_distance_3=float(jhk.DISTANCE_BETWEEN_UWB_ANCHORS) if should_seed_uwb else None,
-            UWB_distance_4=float(jhk.DISTANCE_BETWEEN_UWB_ANCHORS) if should_seed_uwb else None,
-            UWB_distance_5=float(jhk.DISTANCE_BETWEEN_UWB_ANCHORS) if should_seed_uwb else None,
+            UWB_distance_1=1.0 if should_seed_uwb else None,
+            UWB_distance_2=1.0 if should_seed_uwb else None,
+            UWB_distance_3=1.0 if should_seed_uwb else None,
+            UWB_distance_4=1.0 if should_seed_uwb else None,
+            UWB_distance_5=1.0 if should_seed_uwb else None,
             quat_w=float(raw_quaternion[0]),
             quat_i=float(raw_quaternion[1]),
             quat_j=float(raw_quaternion[2]),
@@ -177,7 +145,6 @@ class DebugVisualizer(jhk.Visualizer):
         return jhk.DevicePacket(relay_id=self.glove_pair.relay_id, data=p)
 
     def on_key_press(self, event):
-        """Record that a key is being held down and update motion vectors."""
         if not event.key: return
         key_name = event.key.name.upper()
         self.keys_down[key_name] = True
@@ -188,37 +155,25 @@ class DebugVisualizer(jhk.Visualizer):
             return
         if key_name == 'UP':
             self.velocity_step = float(np.clip(
-                self.velocity_step + VELOCITY_STEP_DELTA,
-                VELOCITY_STEP_MIN,
-                VELOCITY_STEP_MAX,
-            ))
+                self.velocity_step + VELOCITY_STEP_DELTA, VELOCITY_STEP_MIN, VELOCITY_STEP_MAX))
             print(f"[DEBUG VIS] velocity_step increased to {self.velocity_step:.2f}")
             self._update_motion()
             return
         if key_name == 'DOWN':
             self.velocity_step = float(np.clip(
-                self.velocity_step - VELOCITY_STEP_DELTA,
-                VELOCITY_STEP_MIN,
-                VELOCITY_STEP_MAX,
-            ))
+                self.velocity_step - VELOCITY_STEP_DELTA, VELOCITY_STEP_MIN, VELOCITY_STEP_MAX))
             print(f"[DEBUG VIS] velocity_step decreased to {self.velocity_step:.2f}")
             self._update_motion()
             return
         if key_name == 'RIGHT':
             self.rotation_step = float(np.clip(
-                self.rotation_step + ANGULAR_STEP_DELTA,
-                ANGULAR_STEP_MIN,
-                ANGULAR_STEP_MAX,
-            ))
+                self.rotation_step + ANGULAR_STEP_DELTA, ANGULAR_STEP_MIN, ANGULAR_STEP_MAX))
             print(f"[DEBUG VIS] rotation_step increased to {self.rotation_step:.2f}")
             self._update_motion()
             return
         if key_name == 'LEFT':
             self.rotation_step = float(np.clip(
-                self.rotation_step - ANGULAR_STEP_DELTA,
-                ANGULAR_STEP_MIN,
-                ANGULAR_STEP_MAX,
-            ))
+                self.rotation_step - ANGULAR_STEP_DELTA, ANGULAR_STEP_MIN, ANGULAR_STEP_MAX))
             print(f"[DEBUG VIS] rotation_step decreased to {self.rotation_step:.2f}")
             self._update_motion()
             return
@@ -226,32 +181,20 @@ class DebugVisualizer(jhk.Visualizer):
         self._update_motion()
 
         if key_name == 'SPACE':
-            controlled_hand = self._controlled_hand()
-            if not controlled_hand.button_pressed:
-                controlled_hand.button_pressed = True
-            # Hard-stop active rotation as soon as calibration/draw press begins.
             self.angular_velocity_vectors[self.controlled_hand_label] = np.array([0.0, 0.0, 0.0], dtype=np.float64)
             for rotate_key in ("I", "J", "K", "L", "U", "O"):
                 self.keys_down[rotate_key] = False
 
     def on_key_release(self, event):
-        """Record that a key is no longer held down and update motion vectors."""
         if not event.key: return
         key_name = event.key.name.upper()
         self.keys_down[key_name] = False
         self._update_motion()
 
-        if key_name == 'SPACE':
-            controlled_hand = self._controlled_hand()
-            if controlled_hand.button_pressed:
-                controlled_hand.button_pressed = False
-
     def _controlled_hand(self):
         return self.left_hand if self.controlled_hand_label == "LEFT" else self.right_hand
 
     def _update_motion(self):
-        """Calculate the final velocity and angular velocity vectors from the keys_down dictionary."""
-        # Linear velocity
         vel = np.array([0.0, 0.0, 0.0], dtype=np.float64)
         if self.keys_down.get('W', False): vel[1] += self.velocity_step
         if self.keys_down.get('S', False): vel[1] -= self.velocity_step
@@ -264,24 +207,24 @@ class DebugVisualizer(jhk.Visualizer):
         controlled_hand.velocity = vel
         other_hand.velocity = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
-        # Angular velocity (Pitch, Yaw, Roll)
         ang_vel = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-        if self.keys_down.get('I', False): ang_vel[1] += self.rotation_step  # Pitch
+        if self.keys_down.get('I', False): ang_vel[1] += self.rotation_step
         if self.keys_down.get('K', False): ang_vel[1] -= self.rotation_step
-        if self.keys_down.get('J', False): ang_vel[2] += self.rotation_step  # Yaw
+        if self.keys_down.get('J', False): ang_vel[2] += self.rotation_step
         if self.keys_down.get('L', False): ang_vel[2] -= self.rotation_step
-        if self.keys_down.get('U', False): ang_vel[0] += self.rotation_step  # Roll
+        if self.keys_down.get('U', False): ang_vel[0] += self.rotation_step
         if self.keys_down.get('O', False): ang_vel[0] -= self.rotation_step
         self.angular_velocity_vectors[self.controlled_hand_label] = ang_vel
         other_label = "RIGHT" if self.controlled_hand_label == "LEFT" else "LEFT"
         self.angular_velocity_vectors[other_label] = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
     def update(self, event):
-        """Called by the timer to update hand positions, rotations, and logic."""
         dt = float(event.dt) if (event is not None and event.dt is not None) else 0.0
 
         for label, hand in (("LEFT", self.left_hand), ("RIGHT", self.right_hand)):
             previous_state = hand.glove_state
+            
+            # Apply simulated physics
             hand.position += hand.velocity * dt
             angular_velocity = self.angular_velocity_vectors[label]
             rotation_angle = np.linalg.norm(angular_velocity) * dt
@@ -292,60 +235,27 @@ class DebugVisualizer(jhk.Visualizer):
                 sin_half = math.sin(angle_rad_half)
                 x, y, z = rotation_axis * sin_half
                 delta_q = np.array([w, x, y, z], dtype=np.float64)
-
-                # Apply rotation in world frame
                 hand.rotation_quaternion = jhk.quaternion_multiply(delta_q, hand.rotation_quaternion)
-
-                # Normalize to prevent drift
                 norm = np.linalg.norm(hand.rotation_quaternion)
                 if norm > 0:
                     hand.rotation_quaternion = hand.rotation_quaternion / norm
                     hand.rotation_euler = np.array(jhk.quat_to_euler_deg(hand.rotation_quaternion), dtype=np.float64)
 
+            # Build and process the packet synchronously
             device_number = hand.device_id
             packet = self._build_debug_packet(hand, device_number=device_number)
-            # Reuse GlovePair production callback path for packet handling.
-            self.glove_pair._packet_processor(packet)
+            self.glove_pair._process_single_packet(packet)
 
-            # On first calibration press, hard-stop any active translational/rotational motion.
             if previous_state == 0 and hand.glove_state == 1:
                 hand.velocity = np.array([0.0, 0.0, 0.0], dtype=np.float64)
                 self.angular_velocity_vectors[label] = np.array([0.0, 0.0, 0.0], dtype=np.float64)
                 for key_name in ("I", "J", "K", "L", "U", "O"):
                     self.keys_down[key_name] = False
 
-        if not (self.left_hand.in_active_area and self.right_hand.in_active_area):
-            now = time.perf_counter()
-            if (now - self.last_debug_print_time) >= self.debug_print_interval_seconds:
-                print(
-                    "[DEBUG VIS] MIDI not attempted: "
-                    f"left_glove_state={self.left_hand.glove_state}, "
-                    f"right_glove_state={self.right_hand.glove_state}, "
-                    f"left_active={self.left_hand.in_active_area}, "
-                    f"right_active={self.right_hand.in_active_area}, "
-                    f"left_calibrated={self.left_hand.is_UWB_calibrated}, "
-                    f"right_calibrated={self.right_hand.is_UWB_calibrated}"
-                )
-                self.last_debug_print_time = now
-
-        if self.glove_pair.daw_interface.port is None:
-            now = time.perf_counter()
-            if (now - self.last_debug_print_time) >= self.debug_print_interval_seconds:
-                print(
-                    "[DEBUG VIS] MIDI blocked: daw_interface.port is None."
-                )
-                self.last_debug_print_time = now
-
-        # Let the base class update both glove visuals in the shared window.
+        # Let the base class update all visuals
         super().update(event)
 
-        # Keep debug axes fixed at each view origin (no hand-driven transform).
-        for hand in (self.left_hand, self.right_hand):
-            if hand.visual is not None:
-                hand.visual.axis.transform = MatrixTransform()
-        self.hand_meshes["LEFT"].transform.matrix = self._mesh_transform_matrix(self.left_hand)
-        self.hand_meshes["RIGHT"].transform.matrix = self._mesh_transform_matrix(self.right_hand)
-
+        # Update status text
         controlled_hand = self._controlled_hand()
         state_names = {
             0: "Uncalibrated (Press SPACE to start drawing)",
@@ -365,8 +275,8 @@ class DebugVisualizer(jhk.Visualizer):
         self.status_text.text = (
             f"Controlling: {self.controlled_hand_label} (TAB to toggle)\n"
             f"Button: {'PRESSED' if controlled_hand.button_pressed else 'RELEASED'}\n"
-            f"Euler: {controlled_hand.in_active_area}\n"
             f"State: {status_text_content}\n"
+            f"Calibrated: {controlled_hand.is_UWB_calibrated}\n"
             f"Step Sizes: move={self.velocity_step:.2f}, rotate={self.rotation_step:.2f}\n"
             "Controls: WASDQE move, IJKLUO rotate, SPACE draw/finalize, TAB switch hand, "
             "UP/DOWN move step, LEFT/RIGHT rotate step"
@@ -374,24 +284,31 @@ class DebugVisualizer(jhk.Visualizer):
         self.canvas.update()
 
     def on_close(self, event):
-        """Ensure the application exits cleanly."""
         self.timer.stop()
+        # No need to stop the glove_pair thread as it's not running
         app.quit()
 
 def main():
-    """Initializes a mock GlovePair and runs the debug visualizer."""
-    mock_reader = None
-    mock_queue = None
+    mock_reader = _NullReader()
+    mock_queue = queue.Queue() # Still needed for class initialization
     daw_interface = DawInterface(None)
 
+    mock_anchor_positions = {
+        1: np.array([0.0, 0.0, 0.0]), 2: np.array([1.0, 0.0, 0.0]),
+        3: np.array([0.5, 0.866, 0.0]), 4: np.array([0.5, 0.433, 0.866]),
+        5: np.array([0.5, 0.433, -0.866]),
+    }
+
     glove_pair = jhk.GlovePair(
-        left_hand=jhk.LeftHand(device_id=1, active_area_x_subsections=3, active_area_y_subsections=12),
-        right_hand=jhk.RightHand(device_id=2, active_area_x_subsections=5, active_area_y_subsections=8),
-        relay_id=1,
-        reader=mock_reader,
-        relay_queue=mock_queue,
-        daw_interface = daw_interface
-    )
+        left_hand=jhk.LeftHand(
+            device_id=1, active_area_x_subsections=3, active_area_y_subsections=12,
+            anchor_positions=mock_anchor_positions, triangulate_func=jhk.multilaterate_3d_wls),
+        right_hand=jhk.RightHand(
+            device_id=2, active_area_x_subsections=5, active_area_y_subsections=8,
+            anchor_positions=mock_anchor_positions, triangulate_func=jhk.multilaterate_3d_wls),
+        relay_id=1, reader=mock_reader, relay_queue=mock_queue, daw_interface=daw_interface)
+
+    # Do not start the glove_pair thread in debug mode
 
     print("Starting Debug Visualizer...")
     print("Controls:")

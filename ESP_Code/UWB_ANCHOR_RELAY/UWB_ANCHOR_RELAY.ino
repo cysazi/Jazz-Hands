@@ -14,8 +14,8 @@
 // This determines the UWB address and calibration sequence.
 
 // #define CONFIG_ANCHOR_1  // This is the RELAY (connected to PC)
-// #define CONFIG_ANCHOR_2
-#define CONFIG_ANCHOR_3
+#define CONFIG_ANCHOR_2
+// #define CONFIG_ANCHOR_3
 // #define CONFIG_ANCHOR_4
 
 #if !defined(CONFIG_ANCHOR_1) && \
@@ -35,46 +35,46 @@
 #define SPI_MOSI 23
 #define DW_CS    4
 #define DW_RST   27
-#define DW_IRQ   3
+#define DW_IRQ   34
 
 #ifdef CONFIG_ANCHOR_1
-  #define ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:11:11"
+  #define ANCHOR_ADDRESS "11:11:11:11:11:11:11:11"
   #define ANCHOR_SHORT_ADDRESS 0x1111
   #define ANCHOR_ID 1
   #define ANCHOR_DELAY 16537
-  #define NEXT_ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:22:22"
+  #define NEXT_ANCHOR_ADDRESS "22:22:22:22:22:22:22:22"
 #endif
 
 #ifdef CONFIG_ANCHOR_2
-  #define ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:22:22"
+  #define ANCHOR_ADDRESS "22:22:22:22:22:22:22:22"
   #define ANCHOR_SHORT_ADDRESS 0x2222
   #define ANCHOR_ID 2
   #define ANCHOR_DELAY 16536
-  #define NEXT_ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:33:33"
+  #define NEXT_ANCHOR_ADDRESS "33:33:33:33:33:33:33:33"
 #endif
 
 #ifdef CONFIG_ANCHOR_3
-  #define ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:33:33"
+  #define ANCHOR_ADDRESS "33:33:33:33:33:33:33:33"
   #define ANCHOR_SHORT_ADDRESS 0x3333
   #define ANCHOR_ID 3
   #define ANCHOR_DELAY 16533
-  #define NEXT_ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:44:44"
+  #define NEXT_ANCHOR_ADDRESS "44:44:44:44:44:44:44:44"
 #endif
 
 #ifdef CONFIG_ANCHOR_4
-  #define ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:44:44"
+  #define ANCHOR_ADDRESS "44:44:44:44:44:44:44:44"
   #define ANCHOR_SHORT_ADDRESS 0x4444
   #define ANCHOR_ID 4
   #define ANCHOR_DELAY 16535
-  #define NEXT_ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:55:55"
+  #define NEXT_ANCHOR_ADDRESS "55:55:55:55:55:55:55:55"
 #endif
 
 #ifdef CONFIG_ANCHOR_5
-  #define ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:55:55"
+  #define ANCHOR_ADDRESS "55:55:55:55:55:55:55:55"
   #define ANCHOR_SHORT_ADDRESS 0x5555
   #define ANCHOR_ID 5
   #define ANCHOR_DELAY 16535
-  #define NEXT_ANCHOR_ADDRESS "84:00:5B:D5:A9:9A:11:11"
+  #define NEXT_ANCHOR_ADDRESS "11:11:11:11:11:11:11:11"
 #endif
 
 #define ESPNOW_WIFI_CHANNEL 11
@@ -97,7 +97,7 @@ typedef struct __attribute__((__packed__)) {
   uint8_t button_state;
   float pos_x, pos_y, pos_z;
   float vel_x, vel_y, vel_z;
-  float UWB_distance1, UWB_distance2, UWB_distance3, UWB_distance4;
+  float UWB_distance1, UWB_distance2, UWB_distance3, UWB_distance4, UWB_distance5;
   float quat_w, quat_i, quat_j, quat_k;
   uint8_t error_handler;
 } datapacket_t;
@@ -202,12 +202,12 @@ void setup() {
 #ifdef CONFIG_ANCHOR_1
   // Anchor 1 (relay) starts calibration as TAG to measure other anchors
   Serial.println("Starting calibration mode as TAG...");
-  DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY);
-  calibration_mode = true;
+  DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY, false);
+  calibration_mode = false;
 #else
   // Other anchors start as ANCHOR and wait for ranging requests
   Serial.println("Starting as ANCHOR, waiting for calibration...");
-  DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY);
+  DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY, false);
   calibration_mode = false;
 #endif
 
@@ -216,7 +216,7 @@ void setup() {
 
 // ========================================
 // Main Loop & Correction Logic
-// ========================================
+// ========================
 void loop() {
   DW1000Ranging.loop();
 
@@ -225,9 +225,10 @@ void loop() {
 #endif
 }
 
-void sendCorrection(uint8_t* target_mac, float dx, float dy, float dz) {
+void sendCorrection(uint8_t* target_mac, uint8_t device_number, float dx, float dy, float dz) {
   correction_t correction;
   correction.header = 'C';
+  correction.device_number = device_number;
   correction.dx = dx;
   correction.dy = dy;
   correction.dz = dz;
@@ -257,7 +258,7 @@ void checkForCorrectionCommand() {
       Serial.readBytes((char*)&dy, sizeof(dy));
       Serial.readBytes((char*)&dz, sizeof(dz));
 
-      sendCorrection(target_mac, dx, dy, dz);
+      sendCorrection(target_mac, device_id, dx, dy, dz);
     }
   }
 }
@@ -309,7 +310,7 @@ void onNewRange() {
 
 //         // Switch from TAG to ANCHOR mode
 //         delay(100);
-//         DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY);
+//         DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY, false);
 //       }
 //     }
 //   }

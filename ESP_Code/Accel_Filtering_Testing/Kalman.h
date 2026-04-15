@@ -59,7 +59,7 @@ public:
 
     // --- Tuning Parameters ---
     // Process noise: how much we trust our physics model (lower is more trust)
-    float Q_accel_noise = 0.2f;
+    float Q_accel_noise = 0.8f;
     // Measurement noise: how much we trust the UWB reading (lower is more trust)
     float R_uwb_noise = 0.5f;
 

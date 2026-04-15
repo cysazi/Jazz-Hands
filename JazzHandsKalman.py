@@ -1,5 +1,12 @@
 # region ======================= Imports =======================
 import math
+import os
+# Limit BLAS/OpenMP threads to 1 to avoid periodic thread contention and latency spikes in real-time.
+# Must be set before importing numpy.
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+
 import numpy as np
 
 import serial
@@ -9,12 +16,14 @@ import time
 import threading
 
 from dataclasses import dataclass, field
+from typing import Callable
 from collections import deque
 
 from vispy import app, scene
 from vispy.scene import visuals
 from vispy.app import Timer
-from vispy.io import mesh
+from vispy.io import read_mesh
+from vispy.visuals.transforms import MatrixTransform
 
 import mido
 
@@ -22,11 +31,14 @@ import mido
 
 # region ======================= Constants and Definitions =======================
 
- # --- UWB Configuration ---
+# --- UWB Configuration ---
 NUM_UWB_ANCHORS: int = 4  # Set to 3, 4, or 5
+UWB_OUTLIER_THRESHOLD: float = 3  # meters
+UWB_DATA_TIMEOUT_S: float = 1.0  # Seconds before UWB data is considered stale
 # Set to None for auto-calibration, or provide positions as [(x,y,z), ...] to skip calibration
 # Positions should be in meters. Example: [(0,0,0), (5,0,0), (2.5,4.33,0), (2.5,2.16,3)]
-MANUAL_ANCHOR_POSITIONS: list[tuple[float, float, float]] | None = [(0.0,0.0,0.0), (1.66,0.0,0.0), (0.0,0.915, 0.74), (1.36, 0.255, 2.15)]
+MANUAL_ANCHOR_POSITIONS: list[tuple[float, float, float]] | None = [(0.0, 0.0, 0.0), (0.0, 2.17, 0.56),
+                                                                    (1.83, 2.7, 0.91), (2.92, 0, 0)]
 # Alternative: specify individual distances and let Python calculate positions
 # Format: {(anchor1, anchor2): distance, ...} - distances in meters
 MANUAL_ANCHOR_DISTANCES: dict[tuple[int, int], float] | None = None
@@ -49,11 +61,22 @@ PACKET_HAS_UWB_3: int = 0b00010000
 PACKET_HAS_UWB_4: int = 0b00100000
 PACKET_HAS_UWB_5: int = 0b01000000
 PACKET_HAS_ERROR: int = 0b10000000
+# Maximum allowed UWB distance (meters). Distances larger than this are treated as missing/invalid.
+MAX_UWB_DISTANCE: float = 10.0
 
 # --- System and Physics Constants ---
 BOUNDING_BOX_NORMAL_TOLERANCE: float = 0.15  # meters, ±tolerance in normal direction
 MIDI_DEBUG_LOGGING: bool = True
 PERFORMANCE_MODE: bool = False  # for mirroring the L and R hands
+# Debug mode: when True, ignore IMU dead-reckoning and use multilateration-only
+# after the glove has been UWB-calibrated (useful for testing/validation).
+MULTILATERATION_ONLY: bool = True
+# Reduce console logging for real-time performance
+DEBUG_LOGGING: bool = True
+SHOWING_ANCHORS:bool = True
+# Minimum interval between sending corrections for a glove (ms)
+CORRECTION_MIN_INTERVAL_MS: int = 100
+
 INSTRUMENT_CYCLE: tuple[str, ...] = (
     "Synth",
     "Violin",
@@ -65,10 +88,41 @@ INSTRUMENT_CYCLE: tuple[str, ...] = (
     "Instrument8",
     "Instrument9",
 )
-GESTURE_ROLL_RATE_THRESHOLD_DPS: float = 220.0
-GESTURE_ROLL_DELTA_THRESHOLD_DEG: float = 28.0
+GESTURE_ROLL_RATE_THRESHOLD_DPS: float = 360.0
+GESTURE_ROLL_DELTA_THRESHOLD_DEG: float = 40.0
 GESTURE_WINDOW_MS: int = 220
 GESTURE_COOLDOWN_MS: int = 300
+
+CURRENT_FILEPATH = os.path.dirname(os.path.abspath(__file__))
+HAND_OBJ_PATH = os.path.join(CURRENT_FILEPATH, "Visualization_Tests", "hand.obj")
+POSITION_SCALE = 1.0
+MODEL_SCALE = 0.02
+FRAME_MAP = np.array([
+    [1, 0, 0],
+    [0, 0, 1],
+    [0, 1, 0],
+], dtype=np.float32)
+
+
+def rot_x(deg: float) -> np.ndarray:
+    a = np.deg2rad(deg)
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float32)
+
+
+MODEL_OFFSET = rot_x(-90.0)
+
+# Helper: validate positions to avoid NaNs or wildly incorrect multilateration results
+def is_reasonable_position(pos, max_norm=50.0):
+    if pos is None:
+        return False
+    arr = np.asarray(pos, dtype=float)
+    if not np.all(np.isfinite(arr)):
+        return False
+    if np.linalg.norm(arr) > max_norm:
+        return False
+    return True
+
 
 
 # endregion
@@ -218,7 +272,8 @@ class ThreadedMultiDeviceReader:
                                 try:
                                     cal_data = CalibrationData.from_bytes(cal_packet_bytes)
                                     self.calibration_queue.put(cal_data)
-                                    print(f"Calibration: Anchor {cal_data.source_anchor} -> {cal_data.dest_anchor}: {cal_data.distance:.3f}m")
+                                    print(
+                                        f"Calibration: Anchor {cal_data.source_anchor} -> {cal_data.dest_anchor}: {cal_data.distance:.3f}m")
                                 except ValueError as e:
                                     print(f"Calibration packet error: {e}")
                                 finally:
@@ -266,12 +321,14 @@ class ThreadedMultiDeviceReader:
                 if device['serial'].is_open:
                     device['serial'].close()
 
-    def send_correction(self, relay_id: int, device_id:int, correction: np.ndarray):
+    def send_correction(self, relay_id: int, device_id: int, correction: np.ndarray):
         """Sends a position correction vector to the specified device."""
+        if DEBUG_LOGGING:
+            print(f"Sending correction: {device_id}, {correction}")
         with self.lock:
             if relay_id in self.relays and self.relays[relay_id]['serial'].is_open:
                 # Message format: 'C' for Correction, the device number, followed by 3 floats (dx, dy, dz)
-                message = struct.pack('<cb3f', b'C', device_id.to_bytes(), correction[0], correction[1], correction[2])
+                message = struct.pack('<cb3f', b'C', device_id, correction[0], correction[1], correction[2])
                 self.relays[relay_id]['serial'].write(message)
 
 
@@ -304,11 +361,11 @@ def calculate_anchor_positions_from_distances(distances: dict[tuple[int, int], f
     d13 = distances.get((1, 3)) or distances.get((3, 1))
     d23 = distances.get((2, 3)) or distances.get((3, 2))
     if d13 is None or d23 is None: raise ValueError("Missing distances for anchor 3")
-    
+
     # Law of cosines to find x3, y3
-    x3 = (d13**2 + d12**2 - d23**2) / (2 * d12)
-    y3_squared = d13**2 - x3**2
-    y3 = math.sqrt(max(0, y3_squared))
+    x3 = (d13 ** 2 + d12 ** 2 - d23 ** 2) / (2 * d12)
+    y3_squared = d13 ** 2 - x3 ** 2
+    y3 = math.sqrt(max(0.0, y3_squared))
     positions[3] = np.array([x3, y3, 0.0])
 
     # General trilateration for subsequent anchors (4, 5, ...)
@@ -324,56 +381,66 @@ def calculate_anchor_positions_from_distances(distances: dict[tuple[int, int], f
         p3_x, p3_y = positions[3][0], positions[3][1]
 
         # from sphere equations (x-x_n)^2 + ... = d_n^2
-        xi = (d1i**2 - d2i**2 + p2_x**2) / (2 * p2_x)
-        yi = (d1i**2 - d3i**2 + p3_x**2 + p3_y**2 - 2 * p3_x * xi) / (2 * p3_y)
-        zi_squared = d1i**2 - xi**2 - yi**2
+        xi = (d1i ** 2 - d2i ** 2 + p2_x ** 2) / (2 * p2_x)
+        yi = (d1i ** 2 - d3i ** 2 + p3_x ** 2 + p3_y ** 2 - 2 * p3_x * xi) / (2 * p3_y)
+        zi_squared = d1i ** 2 - xi ** 2 - yi ** 2
         zi = math.sqrt(max(0, zi_squared))
         positions[i] = np.array([xi, yi, zi])
 
     return positions
 
 
-def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.ndarray]) -> np.ndarray:
+def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.ndarray],
+                         previous_position: np.ndarray) -> np.ndarray:
     """
     3D multilateration using Weighted Least Squares for N >= 3 anchors.
+    Includes outlier detection to reject impossible results.
     Returns (x, y, z) position.
     """
-    # Build matrices for WLS: (A^T W A)^-1 A^T W b
     n = len(distances)
     if n < 3:
         raise ValueError("Need at least 3 distances for 3D multilateration.")
-        
+
     A = np.zeros((n - 1, 3))
     b = np.zeros(n - 1)
     W = np.eye(n - 1)
 
-    # Use the last anchor as the reference point to build a system of n-1 linear equations
     ref_pos = anchor_positions[n]
-    ref_dist = distances[n-1]
+    ref_dist = distances[n - 1]
 
     for i in range(n - 1):
         anchor_id = i + 1
         p_i = anchor_positions[anchor_id]
         d_i = distances[i]
-
-        # Linear least squares formulation by subtracting sphere equations
-        # 2(ref_pos - p_i) . X = d_i^2 - ref_dist^2 - |p_i|^2 + |ref_pos|^2
         A[i, :] = 2 * (ref_pos - p_i)
-        b[i] = d_i**2 - ref_dist**2 - np.dot(p_i, p_i) + np.dot(ref_pos, ref_pos)
-
-        # Weight inversely proportional to distance (closer = more accurate)
-        W[i, i] = 1.0 / max(d_i, 0.1)**2
+        b[i] = d_i ** 2 - ref_dist ** 2 - np.dot(p_i, p_i) + np.dot(ref_pos, ref_pos)
+        W[i, i] = 1.0 / max(d_i, 0.1) ** 2
 
     try:
-        # Weighted least squares solution: pos = (A^T W A)^-1 A^T W b
         AT_W_A = A.T @ W @ A
         AT_W_b = A.T @ W @ b
         pos = np.linalg.solve(AT_W_A, AT_W_b)
-        return pos
     except np.linalg.LinAlgError:
-        # Fallback to unweighted if singular
         pos, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-        return pos
+        pos = np.asarray(pos).flatten()
+
+    # Validate solution
+    if not is_reasonable_position(pos, max_norm=50.0):
+        if previous_position is not None and is_reasonable_position(previous_position, max_norm=50.0):
+            print("Multilateration produced invalid position, reverting to previous_position.")
+            return previous_position
+        else:
+            print("Multilateration produced invalid position and no previous valid position, returning zeros.")
+            return np.zeros(3)
+
+    # Outlier detection relative to previous
+    if previous_position is not None and np.all(np.isfinite(previous_position)):
+        distance_from_last = np.linalg.norm(pos - previous_position)
+        if distance_from_last > UWB_OUTLIER_THRESHOLD:
+            print(f"UWB outlier detected. Dist: {distance_from_last:.2f}m. Discarding.")
+            return previous_position
+
+    return pos
 
 
 def quat_to_euler(q):
@@ -484,8 +551,9 @@ class Glove:
     device_id: int
     active_area_x_subsections: int
     active_area_y_subsections: int
+    triangulate_func: Callable | None = None  # Will be set based on NUM_UWB_ANCHORS
+    single_correction_func: Callable | None = None
     anchor_positions: dict[int, np.ndarray] = field(default_factory=dict)  # 3D positions of UWB anchors
-    triangulate_func: callable = None  # Will be set based on NUM_UWB_ANCHORS
     is_UWB_calibrated: bool = False
     button_pressed: bool = False
     glove_state: int = 0
@@ -514,6 +582,11 @@ class Glove:
     UWB_distance_3: float | None = None
     UWB_distance_4: float | None = None
     UWB_distance_5: float | None = None
+    UWB_timestamp_1: float = 0.0
+    UWB_timestamp_2: float = 0.0
+    UWB_timestamp_3: float = 0.0
+    UWB_timestamp_4: float = 0.0
+    UWB_timestamp_5: float = 0.0
 
     # Reference point for UWB coordinate system calibration
     reference_UWB_position: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
@@ -525,64 +598,165 @@ class Glove:
     velocity_history: deque = field(default_factory=lambda: deque(maxlen=10))
     quat_history: deque = field(default_factory=lambda: deque(maxlen=10))
     euler_history: deque = field(default_factory=lambda: deque(maxlen=10))
+    # Timestamp of last sent correction (seconds since epoch)
+    last_correction_time: float = 0.0
 
     def _get_uwb_distances(self) -> list[float | None]:
-        """Returns a list of UWB distances based on NUM_UWB_ANCHORS."""
+        """Returns a list of UWB distances, filtering out stale data."""
+        now = time.time()
         all_distances = [
-            self.UWB_distance_1, self.UWB_distance_2, self.UWB_distance_3,
-            self.UWB_distance_4, self.UWB_distance_5
+            self.UWB_distance_1 if now - self.UWB_timestamp_1 < UWB_DATA_TIMEOUT_S else None,
+            self.UWB_distance_2 if now - self.UWB_timestamp_2 < UWB_DATA_TIMEOUT_S else None,
+            self.UWB_distance_3 if now - self.UWB_timestamp_3 < UWB_DATA_TIMEOUT_S else None,
+            self.UWB_distance_4 if now - self.UWB_timestamp_4 < UWB_DATA_TIMEOUT_S else None,
+            self.UWB_distance_5 if now - self.UWB_timestamp_5 < UWB_DATA_TIMEOUT_S else None,
         ]
         return all_distances[:NUM_UWB_ANCHORS]
 
-    def calibrate_zero_frame(self):
+    def calibrate_zero_frame(self) -> bool:
         """Sets the current UWB position as the origin of the coordinate system."""
         distances = self._get_uwb_distances()
 
         if all(d is not None for d in distances):
             # Use 3D multilateration to get absolute position
-            uwb_position = self.triangulate_func(distances, self.anchor_positions)
+            uwb_position: np.ndarray = self.triangulate_func(distances, self.anchor_positions,
+                                                             self.position) if self.triangulate_func else ValueError(
+                "Triangulation function not set.")
+            # Validate
+            if not is_reasonable_position(uwb_position, max_norm=50.0):
+                print(f"Calibration multilateration returned invalid position for glove {self.device_id}: {uwb_position}")
+                return False
+
             self.reference_UWB_position = uwb_position
             self.reference_orientation_quaternion = self.rotation_quaternion.copy()
             self.inverse_reference_orientation = quaternion_inverse(self.reference_orientation_quaternion)
             self.is_UWB_calibrated = True
+            self.single_correction_func(self.device_id,
+                                        -self.position) if self.single_correction_func else ValueError(
+                "Single correction function (only for calibration) not set."
+            )
             print(f"Glove {self.device_id} UWB calibrated at {self.reference_UWB_position}")
+            return True
         else:
             print(f"Glove {self.device_id}: UWB calibration failed. Missing UWB data.")
+            return False
 
     def update_from_packet(self, p: DevicePacket):
         """Updates the glove's state from an incoming ESP32 packet."""
-        self.button_pressed = p.data.button_state
+        self.button_pressed = not p.data.button_state
+        now = time.time()
 
         # Remember previous states
         self.position_history.append(self.position)
         self.velocity_history.append(self.velocity)
         self.euler_history.append(self.rotation_euler)
-
         # Raw data from packet
         raw_position = np.array([p.data.pos_x, p.data.pos_y, p.data.pos_z])
         raw_velocity = np.array([p.data.vel_x, p.data.vel_y, p.data.vel_z])
         raw_rotation = np.array([p.data.quat_w, p.data.quat_i, p.data.quat_j, p.data.quat_k])
 
-        # Transform data to calibrated world frame
-        self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
-        self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
+        # If MULTILATERATION_ONLY is enabled and UWB calibration exists, prefer UWB position
+        if MULTILATERATION_ONLY and self.is_UWB_calibrated and self.triangulate_func is not None:
+            distances = self._get_uwb_distances()
+            if all(d is not None for d in distances):
+                try:
+                    abs_uwb_pos = self.triangulate_func(distances, self.anchor_positions, self.position)
+                    rel_uwb_pos = abs_uwb_pos - self.reference_UWB_position
+                    # Use multilateration result as the authoritative position in the calibrated frame
+                    self.position = rel_uwb_pos
+                    # Velocity is unknown from multilateration alone; set to zero to avoid integrating bad IMU velocities
+                    self.velocity = np.array([0.0, 0.0, 0.0])
+                except Exception as e:
+                    print(f"Multilateration error for device {self.device_id}: {e}")
+                    # Fallback to IMU-derived transform
+                    self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
+                    self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
+            else:
+                # Not enough UWB data yet: fallback to IMU
+                self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
+                self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
+        else:
+            # Default: transform IMU dead-reckoning into calibrated world frame
+            self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
+            self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
+
+        # Rotation should still be derived from the IMU quaternion
         self.rotation_quaternion = quaternion_multiply(self.inverse_reference_orientation, raw_rotation)
 
         self.rotation_euler = np.array(quat_to_euler_deg(self.rotation_quaternion), dtype=np.float64)
 
-        if p.data.UWB_distance_1: self.UWB_distance_1 = p.data.UWB_distance_1
-        if p.data.UWB_distance_2: self.UWB_distance_2 = p.data.UWB_distance_2
-        if p.data.UWB_distance_3: self.UWB_distance_3 = p.data.UWB_distance_3
-        if p.data.UWB_distance_4: self.UWB_distance_4 = p.data.UWB_distance_4
-        if p.data.UWB_distance_5: self.UWB_distance_5 = p.data.UWB_distance_5
+        # Validate resulting position; if invalid, revert to previous valid position if available
+        try:
+            if not is_reasonable_position(self.position, max_norm=50.0):
+                if self.position_history:
+                    prev = self.position_history[-1]
+                    if is_reasonable_position(prev, max_norm=50.0):
+                        print(f"Discarding invalid position for device {self.device_id}; reverting to previous.")
+                        self.position = prev.copy()
+                        self.velocity = np.array([0.0, 0.0, 0.0])
+                else:
+                    print(f"Invalid position received for device {self.device_id} and no previous position to revert to.")
+        except Exception:
+            pass
 
-    def calculate_and_send_correction(self, reader: ThreadedMultiDeviceReader, relay_id: int, device_id:int):
+        # Treat distances > MAX_UWB_DISTANCE as missing (None)
+        if p.data.UWB_distance_1 is not None:
+            if abs(p.data.UWB_distance_1) <= MAX_UWB_DISTANCE:
+                self.UWB_distance_1 = p.data.UWB_distance_1
+                self.UWB_timestamp_1 = now
+            else:
+                self.UWB_distance_1 = None
+        if p.data.UWB_distance_2 is not None:
+            if abs(p.data.UWB_distance_2) <= MAX_UWB_DISTANCE:
+                self.UWB_distance_2 = p.data.UWB_distance_2
+                self.UWB_timestamp_2 = now
+            else:
+                self.UWB_distance_2 = None
+        if p.data.UWB_distance_3 is not None:
+            if abs(p.data.UWB_distance_3) <= MAX_UWB_DISTANCE:
+                self.UWB_distance_3 = p.data.UWB_distance_3
+                self.UWB_timestamp_3 = now
+            else:
+                self.UWB_distance_3 = None
+        if p.data.UWB_distance_4 is not None:
+            if abs(p.data.UWB_distance_4) <= MAX_UWB_DISTANCE:
+                self.UWB_distance_4 = p.data.UWB_distance_4
+                self.UWB_timestamp_4 = now
+            else:
+                self.UWB_distance_4 = None
+        if p.data.UWB_distance_5 is not None:
+            if abs(p.data.UWB_distance_5) <= MAX_UWB_DISTANCE:
+                self.UWB_distance_5 = p.data.UWB_distance_5
+                self.UWB_timestamp_5 = now
+            else:
+                self.UWB_distance_5 = None
+
+    def calculate_and_send_correction(self, reader: ThreadedMultiDeviceReader, relay_id: int, device_id: int):
         distances = self._get_uwb_distances()
 
         # Only proceed if we have fresh UWB data
         if all(d is not None for d in distances):
+            # Rate-limit corrections to avoid flooding the serial link and heavy computation
+            now = time.time()
+            if (now - self.last_correction_time) * 1000.0 < CORRECTION_MIN_INTERVAL_MS:
+                return
+
             # 1. Calculate UWB ground truth in the absolute anchor frame
-            abs_uwb_pos = self.triangulate_func(distances, self.anchor_positions)
+            abs_uwb_pos = self.triangulate_func(distances, self.anchor_positions,
+                                                self.position) if self.triangulate_func else ValueError(
+                "Triangulation function not set.")
+
+            # Validate multilateration result before using it
+            if not is_reasonable_position(abs_uwb_pos, max_norm=50.0):
+                if DEBUG_LOGGING:
+                    print(f"Ignoring invalid UWB solution for glove {self.device_id}: {abs_uwb_pos}")
+                # Invalidate UWB to avoid repeated bad corrections
+                self.UWB_distance_1 = None
+                self.UWB_distance_2 = None
+                self.UWB_distance_3 = None
+                self.UWB_distance_4 = None
+                self.UWB_distance_5 = None
+                return
 
             # 2. Translate to the relative frame based on the calibration origin
             rel_uwb_pos = abs_uwb_pos - self.reference_UWB_position
@@ -590,14 +764,58 @@ class Glove:
             # 3. Calculate the correction vector (the drift)
             correction = rel_uwb_pos - self.position
 
-            # 4. Apply bounding box clamping in the normal direction
-            if self.glove_state == 2:  # Only apply bounding when box is drawn
-                normal_component = correction[self.plane_normal_axis]
-                if abs(normal_component) > BOUNDING_BOX_NORMAL_TOLERANCE:
-                    correction[self.plane_normal_axis] = np.sign(normal_component) * BOUNDING_BOX_NORMAL_TOLERANCE
+            # 4. Enforce bounding box margins so the glove stays within the active plane
+            #    - keep at least PLANE_BOUNDARY_MARGIN (0.1m) away from planar edges (u,v axes)
+            #    - keep within PLANE_SURFACE_MAX_DISTANCE (0.2m) from the plane surface (normal axis)
+            #    The active plane is assumed centered at origin with half extents stored in active_area_half_extents.
+            if self.glove_state == 2:
+                plane_axes = [i for i in range(3) if i != self.plane_normal_axis]
+                u_axis, v_axis = plane_axes[0], plane_axes[1]
+
+                # margins and limits
+                PLANE_BOUNDARY_MARGIN = 0.1  # meters from edges
+                PLANE_SURFACE_MAX_DISTANCE = 0.2  # meters from plane surface (positive side)
+
+                # Proposed new position after applying raw correction
+                proposed_pos = self.position + correction
+
+                # U/V axes (plane bounds)
+                u_half = self.active_area_half_extents[u_axis]
+                v_half = self.active_area_half_extents[v_axis]
+
+                # If extents are tiny or unset, skip planar clamping
+                if u_half > 1e-6 and v_half > 1e-6:
+                    u_min = -u_half + PLANE_BOUNDARY_MARGIN
+                    u_max = u_half - PLANE_BOUNDARY_MARGIN
+                    v_min = -v_half + PLANE_BOUNDARY_MARGIN
+                    v_max = v_half - PLANE_BOUNDARY_MARGIN
+
+                    if proposed_pos[u_axis] < u_min:
+                        correction[u_axis] += (u_min - proposed_pos[u_axis])
+                    else:
+                        if proposed_pos[u_axis] > u_max:
+                            correction[u_axis] += (u_max - proposed_pos[u_axis])
+
+                    if proposed_pos[v_axis] < v_min:
+                        correction[v_axis] += (v_min - proposed_pos[v_axis])
+                    else:
+                        if proposed_pos[v_axis] > v_max:
+                            correction[v_axis] += (v_max - proposed_pos[v_axis])
+
+                # Normal axis (keep on positive side and within max distance from plane)
+                n_axis = self.plane_normal_axis
+                proposed_n = proposed_pos[n_axis]
+                # Enforce minimum (on or above plane surface) and maximum distance
+                if proposed_n < 0.0:
+                    correction[n_axis] += (0.0 - proposed_n)
+                else:
+                    if proposed_n > PLANE_SURFACE_MAX_DISTANCE:
+                        correction[n_axis] += (PLANE_SURFACE_MAX_DISTANCE - proposed_n)
 
             # 5. Send the correction back to the ESP32
             reader.send_correction(relay_id, device_id, correction)
+            # record send time
+            self.last_correction_time = now
 
             # 6. Immediately apply the correction locally for smooth visualization
             self.position += correction
@@ -676,11 +894,11 @@ class Glove:
 
         elif self.glove_state == 0:
             if self.button_pressed:
-                self.glove_state = 1
-                self.calibrate_zero_frame()
-                self.position = np.array([0.0, 0.0, 0.0])
-                if self.visual:
-                    self.visual.box.visible = True
+                if self.calibrate_zero_frame():
+                    self.glove_state = 1
+                    self.position = np.array([0.0, 0.0, 0.0])
+                    if self.visual:
+                        self.visual.box.visible = True
 
         elif self.glove_state == 1:
             if self.visual:
@@ -754,13 +972,20 @@ class GlovePair:
     def _process_single_packet(self, packet: DevicePacket, from_queue: bool = False):
         glove = self.left_hand if packet.data.device_number % 2 != 0 else self.right_hand
         glove.update_from_packet(packet)
-        glove.calculate_and_send_correction(self.reader, self.relay_id, glove.device_id)
+        if DEBUG_LOGGING:
+            print(
+                f"{glove.UWB_distance_1}, {glove.UWB_distance_2}, {glove.UWB_distance_3}, {glove.UWB_distance_4}, {glove.UWB_distance_5}")
+        glove.get_section_from_position()
+
+        if glove.glove_state == 2:
+            glove.calculate_and_send_correction(self.reader, self.relay_id, glove.device_id)
+
         if from_queue:
             self.relay_queue.task_done()
-        glove.get_section_from_position()
-        self._update_right_roll_gesture(glove, packet)
 
         if self.left_hand.glove_state == 2 and self.right_hand.glove_state == 2:
+            self._update_right_roll_gesture(glove, packet)
+
             if self.left_hand.in_active_area and self.right_hand.in_active_area:
                 self.section_to_note()
                 self.play_note()
@@ -821,9 +1046,9 @@ class GlovePair:
         delta_roll = self._roll_delta_deg(current_roll, oldest_roll)
         roll_rate_dps = delta_roll / (dt_ms / 1000.0)
         if (
-            abs(delta_roll) >= GESTURE_ROLL_DELTA_THRESHOLD_DEG
-            and abs(roll_rate_dps) >= GESTURE_ROLL_RATE_THRESHOLD_DPS
-            and (current_t - self.last_instrument_gesture_ms) >= GESTURE_COOLDOWN_MS
+                abs(delta_roll) >= GESTURE_ROLL_DELTA_THRESHOLD_DEG
+                and abs(roll_rate_dps) >= GESTURE_ROLL_RATE_THRESHOLD_DPS
+                and (current_t - self.last_instrument_gesture_ms) >= GESTURE_COOLDOWN_MS
         ):
             direction = 1 if roll_rate_dps > 0.0 else -1
             self._cycle_instrument(direction)
@@ -1112,9 +1337,22 @@ class GloveVisual:
 class Visualizer:
     def __init__(self, glove_pairs):
         self.glove_pairs = glove_pairs
-        self.canvas = scene.SceneCanvas(keys='interactive', show=True)
+        # Create canvas sized to 75% of the screen (if available) for a larger visualization area
+        try:
+            import tkinter as _tk
+            root = _tk.Tk()
+            sw = root.winfo_screenwidth()
+            sh = root.winfo_screenheight()
+            root.destroy()
+            target_size = (int(sw * 0.75), int(sh * 0.75))
+        except Exception:
+            # Fallback to a reasonable default if tkinter or screen info isn't available
+            target_size = (int(0.75 * 1280), int(0.75 * 800))
+
+        self.canvas = scene.SceneCanvas(keys='interactive', show=True, size=target_size)
         self.grid = self.canvas.central_widget.add_grid()
         self.view_pairs = []
+        self.hand_meshes = {}
 
         for i, pair in enumerate(self.glove_pairs):
             # Left Hand View
@@ -1134,8 +1372,65 @@ class Visualizer:
             else:
                 self.view_pairs.append((lh_view, rh_view))
 
+        self._setup_hand_meshes()
+        if SHOWING_ANCHORS:
+            # Add anchor visuals (small dots) from hardcoded anchor positions.
+            # Represent anchors as small spheres/markers ~5cm visually. Use Markers for simplicity.
+            try:
+                for i, pair in enumerate(self.glove_pairs):
+                    if not pair.left_hand.anchor_positions:
+                        continue
+                    lh_view, rh_view = self.view_pairs[i]
+                    # Build ordered positions array
+                    anchor_items = sorted(pair.left_hand.anchor_positions.items())
+                    positions = np.array([pos for (_, pos) in anchor_items], dtype=np.float32) * POSITION_SCALE
+                    if positions.size == 0:
+                        continue
+                    # Create markers for left and right views so anchors are visible in both
+                    anchor_markers_l = scene.visuals.Markers(parent=lh_view.scene)
+                    anchor_markers_l.set_data(positions, face_color=(1, 0, 0, 1), size=20)
+                    anchor_markers_r = scene.visuals.Markers(parent=rh_view.scene)
+                    anchor_markers_r.set_data(positions, face_color=(1, 0, 0, 1), size=20)
+            except Exception as e:
+                print(f"Could not create anchor visuals: {e}")
+
         self.timer = Timer('auto', connect=self.update, start=True)
         self.canvas.events.close.connect(self.on_close)
+
+    def _setup_hand_meshes(self):
+        if not os.path.exists(HAND_OBJ_PATH):
+            print(f"Could not find model: {HAND_OBJ_PATH}")
+            return
+
+        vertices, faces, _normals, _texcoords = read_mesh(HAND_OBJ_PATH)
+        lh_view, rh_view = self.view_pairs[0]
+        self.hand_meshes["LEFT"] = scene.visuals.Mesh(
+            vertices=vertices,
+            faces=faces,
+            color=(0.25, 0.75, 0.95, 0.80),
+            shading="smooth",
+            parent=lh_view.scene,
+        )
+        self.hand_meshes["LEFT"].transform = MatrixTransform()
+        self.hand_meshes["RIGHT"] = scene.visuals.Mesh(
+            vertices=vertices,
+            faces=faces,
+            color=(0.95, 0.45, 0.25, 0.80),
+            shading="smooth",
+            parent=rh_view.scene,
+        )
+        self.hand_meshes["RIGHT"].transform = MatrixTransform()
+
+    def _mesh_transform_matrix(self, hand) -> np.ndarray:
+        q_current = np.asarray(hand.rotation_quaternion, dtype=np.float64)
+        rotation_matrix = quaternion_to_transform_matrix(q_current, np.array([0.0, 0.0, 0.0]))[:3, :3]
+        rotation_matrix = FRAME_MAP @ rotation_matrix @ FRAME_MAP.T
+        rotation_matrix = rotation_matrix @ MODEL_OFFSET
+
+        transform = np.eye(4, dtype=np.float32)
+        transform[:3, :3] = rotation_matrix * MODEL_SCALE
+        transform[3, :3] = np.asarray(hand.position, dtype=np.float32) * POSITION_SCALE
+        return transform
 
     def on_close(self, event):
         self.timer.stop()
@@ -1148,10 +1443,24 @@ class Visualizer:
 
     def update(self, event):
         for pair in self.glove_pairs:
-            for hand in [pair.left_hand, pair.right_hand]:
-                if hand.visual:
-                    transform_matrix = quaternion_to_transform_matrix(hand.rotation_quaternion, hand.position)
-                    hand.visual.axis.transform = scene.transforms.MatrixTransform(transform_matrix)
+            left_hand = pair.left_hand
+            right_hand = pair.right_hand
+
+            if left_hand.visual:
+                transform_matrix = quaternion_to_transform_matrix(left_hand.rotation_quaternion, left_hand.position)
+
+                if "LEFT" in self.hand_meshes:
+                    self.hand_meshes["LEFT"].transform.matrix = self._mesh_transform_matrix(left_hand)
+                else:
+                    left_hand.visual.axis.transform = scene.transforms.MatrixTransform(transform_matrix)
+
+            if right_hand.visual:
+                transform_matrix = quaternion_to_transform_matrix(right_hand.rotation_quaternion, right_hand.position)
+                if "RIGHT" in self.hand_meshes:
+                    self.hand_meshes["RIGHT"].transform.matrix = self._mesh_transform_matrix(right_hand)
+                else:
+                    right_hand.visual.axis.transform = scene.transforms.MatrixTransform(transform_matrix)
+
         self.canvas.update()
 
 
@@ -1164,10 +1473,10 @@ def perform_auto_calibration(reader: ThreadedMultiDeviceReader) -> dict[int, np.
     Waits for calibration packets from anchors and calculates their 3D positions.
     Returns a dictionary of anchor positions {anchor_id: np.ndarray([x, y, z])}.
     """
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("AUTO-CALIBRATION MODE")
     print(f"Waiting for {NUM_UWB_ANCHORS} UWB anchors to calibrate...")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     # Collect all pairwise distances from calibration packets
     distances = {}
@@ -1180,14 +1489,15 @@ def perform_auto_calibration(reader: ThreadedMultiDeviceReader) -> dict[int, np.
             key = tuple(sorted((cal_data.source_anchor, cal_data.dest_anchor)))
             if key not in distances:
                 distances[key] = cal_data.distance
-                print(f"  [{len(distances)}/{required_measurements}] Anchor {cal_data.source_anchor} -> {cal_data.dest_anchor}: {cal_data.distance:.3f}m")
+                print(
+                    f"  [{len(distances)}/{required_measurements}] Anchor {cal_data.source_anchor} -> {cal_data.dest_anchor}: {cal_data.distance:.3f}m")
         except queue.Empty:
             print("Calibration timeout! Make sure all anchors are powered on and sending data.")
             raise TimeoutError("Auto-calibration failed: timeout waiting for anchor data")
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Calibration complete! Calculating anchor positions...")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     # Calculate anchor positions from the collected distances
     anchor_positions = calculate_anchor_positions_from_distances(distances)
@@ -1195,7 +1505,7 @@ def perform_auto_calibration(reader: ThreadedMultiDeviceReader) -> dict[int, np.
     for anchor_id, pos in sorted(anchor_positions.items()):
         print(f"  Anchor {anchor_id}: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) m")
 
-    print(f"\n{'='*60}\n")
+    print(f"\n{'=' * 60}\n")
     reader.calibration_mode = False
     return anchor_positions
 
@@ -1232,19 +1542,26 @@ def main():
     # Create glove pairs with anchor positions
     glove_pairs = []
     if 1 in reader.processing_queues:
+        def single_correction(device_id: int, correction: np.ndarray, MultiReader: ThreadedMultiDeviceReader = reader,
+                              relay_id: int = 1):
+            MultiReader.send_correction(relay_id, device_id, correction)
+            print(f"Correction sent to device {device_id} on relay {relay_id}: {correction}")
+
         left_hand = LeftHand(
             device_id=1,
             active_area_x_subsections=3,
             active_area_y_subsections=12,
             anchor_positions=anchor_positions,
-            triangulate_func=multilaterate_3d_wls
+            triangulate_func=multilaterate_3d_wls,
+            single_correction_func=single_correction
         )
         right_hand = RightHand(
             device_id=2,
             active_area_x_subsections=5,
             active_area_y_subsections=8,
             anchor_positions=anchor_positions,
-            triangulate_func=multilaterate_3d_wls
+            triangulate_func=multilaterate_3d_wls,
+            single_correction_func=single_correction
         )
 
         glove_pairs.append(
@@ -1261,9 +1578,9 @@ def main():
     for pair in glove_pairs:
         pair.start()
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("SYSTEM READY")
-    print("="*60)
+    print("=" * 60)
     print("System running. Close the visualization window to stop.\n")
 
     visualizer = Visualizer(glove_pairs)
