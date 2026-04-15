@@ -13,8 +13,8 @@
 // UNCOMMENT the anchor you are flashing this code to.
 // This determines the UWB address and calibration sequence.
 
-// #define CONFIG_ANCHOR_1  // This is the RELAY (connected to PC)
-#define CONFIG_ANCHOR_2
+#define CONFIG_ANCHOR_1  // This is the RELAY (connected to PC)
+// #define CONFIG_ANCHOR_2
 // #define CONFIG_ANCHOR_3
 // #define CONFIG_ANCHOR_4
 
@@ -83,8 +83,8 @@
 #define NUM_UWB_ANCHORS 3  // Set to 3 or 4 (must match Python configuration!)
 
 // MAC addresses of the glove devices this anchor will communicate with
-uint8_t glove1_mac[6] = {0x34, 0x98, 0x7A, 0x74, 0x39, 0x14}; // Device 1
-uint8_t glove2_mac[6] = {0x34, 0x98, 0x7A, 0x73, 0x75, 0xB8}; // Device 2
+uint8_t glove1_mac[6] = {0x34, 0x98, 0x7A, 0x73, 0x93, 0x14}; // Device 1
+uint8_t glove2_mac[6] = {0x34, 0x98, 0x7A, 0x74, 0x39, 0x00}; // Device 2
 
 // ========================================
 // Data Structures
@@ -202,12 +202,12 @@ void setup() {
 #ifdef CONFIG_ANCHOR_1
   // Anchor 1 (relay) starts calibration as TAG to measure other anchors
   Serial.println("Starting calibration mode as TAG...");
-  DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY, false);
+  DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_LONGDATA_RANGE_LOWPOWER, false);
   calibration_mode = false;
 #else
   // Other anchors start as ANCHOR and wait for ranging requests
   Serial.println("Starting as ANCHOR, waiting for calibration...");
-  DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY, false);
+  DW1000Ranging.startAsAnchor(ANCHOR_ADDRESS, DW1000.MODE_LONGDATA_RANGE_LOWPOWER, false);
   calibration_mode = false;
 #endif
 
@@ -242,24 +242,44 @@ void sendCorrection(uint8_t* target_mac, uint8_t device_number, float dx, float 
 }
 
 void checkForCorrectionCommand() {
-  if (Serial.available() >= 1 + 1 + 12) {
-    if (Serial.read() == 'C') {
-      int device_id = Serial.read();
-      uint8_t *target_mac = nullptr;
-      if (device_id == 1) {
-        target_mac = glove1_mac;
-      }
-      else if (device_id == 2) {
-        target_mac = glove2_mac;
-      }
+  // Expect a packed correction_t: 1 byte header ('C'), 1 byte device_number, 3 floats
+  const size_t expected = sizeof(correction_t);
+  // If not enough bytes yet, return quickly
+  if (Serial.available() < expected) return;
 
-      float dx, dy, dz;
-      Serial.readBytes((char*)&dx, sizeof(dx));
-      Serial.readBytes((char*)&dy, sizeof(dy));
-      Serial.readBytes((char*)&dz, sizeof(dz));
+  // Look for the 'C' header at the head of the buffer. If not present, consume bytes until we find it.
+  int first = Serial.peek();
+  while (Serial.available() > 0 && first != 'C') {
+    // discard until header found
+    Serial.read();
+    if (Serial.available() == 0) return;
+    first = Serial.peek();
+  }
 
-      sendCorrection(target_mac, device_id, dx, dy, dz);
+  // Now we have 'C' as the next byte and at least expected bytes available
+  if (Serial.available() >= expected) {
+    correction_t corr;
+    Serial.readBytes((char*)&corr, expected);
+
+    // Basic validation
+    if (corr.header != 'C') return;
+
+    uint8_t device_id = corr.device_number;
+    uint8_t *target_mac = nullptr;
+    if (device_id == 1) {
+      target_mac = glove1_mac;
     }
+    else if (device_id == 2) {
+      target_mac = glove2_mac;
+    }
+
+    if (target_mac == nullptr) {
+      Serial.printf("Correction for unknown device id %d\n", device_id);
+      return;
+    }
+
+    // Send correction using the parsed device_number from the packet
+    sendCorrection(target_mac, device_id, corr.dx, corr.dy, corr.dz);
   }
 }
 
