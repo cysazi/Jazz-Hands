@@ -12,7 +12,7 @@
 #include "DW1000Ranging.h"
 
 // ESP NOW Definitions
-#define ESPNOW_WIFI_CHANNEL 6
+#define ESPNOW_WIFI_CHANNEL 11  // Match relay's channel (was 6)
 const uint8_t ESP_NOW_relayMAC[] = { 0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08 };  // The MAC address of the relay ESP-32 (device 4); constant for this device.
 
 // BNO085 definitions
@@ -106,9 +106,12 @@ void setup() {
   Serial.println("BNO085 Found!");
   setReports();
 
-  // Intialize ESP-NOW
+  // Initialize ESP-NOW
   WiFi.mode(WIFI_STA);
-  esp_now_init();
+  WiFi.setChannel(ESPNOW_WIFI_CHANNEL);  // Ensure sender uses same channel as relay
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+  }
 
   // Add relay as peer once
   esp_now_peer_info_t relay = {};
@@ -178,7 +181,8 @@ void loop() {
 
 void sendPacket(datapacket_t* data) {
   current_readings.timestamp = micros();
-  esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(&data));
+  // Send the full struct bytes (not the pointer size)
+  esp_err_t result = esp_now_send(ESP_NOW_relayMAC, (uint8_t*)data, sizeof(datapacket_t));
   data->packet_type = 0;  // Reset the packet type
   // Optional Error Handling
   if (result != ESP_OK) {
