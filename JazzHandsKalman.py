@@ -64,7 +64,7 @@ PACKET_HAS_ERROR: int = 0b10000000
 # Maximum allowed UWB distance (meters). Distances larger than this are treated as missing/invalid.
 MAX_UWB_DISTANCE: float = 10.0
 # Tolerance added to weighted least squares weights to reduce sensitivity to small UWB fluctuations
-UWB_WEIGHT_TOLERANCE: float = 0.05  # meters
+UWB_WEIGHT_TOLERANCE: float = 0.005  # meters
 
 # --- System and Physics Constants ---
 BOUNDING_BOX_NORMAL_TOLERANCE: float = 0.15  # meters, ±tolerance in normal direction
@@ -520,11 +520,25 @@ def quaternion_inverse(q):
 
 
 def rotate_vector_by_quaternion(v, q):
-    """Rotates a 3D vector by a quaternion."""
-    q_vec = np.array([0, v[0], v[1], v[2]])
+    """Rotates a 3D vector by a quaternion and maps it to the visualizer frame.
+
+    This ensures accelerations/positions rotated by quaternions in Kalman match the
+    FRAME_MAP / MODEL_OFFSET conventions used by the visualizer code.
+    """
+    # Quaternion-vector multiplication: treat v as a pure quaternion (0, vx, vy, vz)
+    q_vec = np.array([0.0, float(v[0]), float(v[1]), float(v[2])], dtype=np.float64)
     q_inv = quaternion_inverse(q)
     q_rotated = quaternion_multiply(quaternion_multiply(q, q_vec), q_inv)
-    return q_rotated[1:]
+    rotated = q_rotated[1:]
+
+    # Map into visualizer frame using FRAME_MAP and MODEL_OFFSET (same pipeline as other modules)
+    try:
+        mapped = FRAME_MAP @ rotated
+        mapped = MODEL_OFFSET @ mapped
+    except Exception:
+        # If mapping fails for any reason, return the rotated vector instead
+        mapped = rotated
+    return mapped
 
 
 def quaternion_to_transform_matrix(q, position):
@@ -627,11 +641,18 @@ class Glove:
         return all_distances[:NUM_UWB_ANCHORS]
 
     def calibrate_zero_frame(self) -> bool:
-        """Sets the current UWB position as the origin of the coordinate system."""
+        """Sets the current UWB position as the origin of the coordinate system.
+
+        After computing an absolute UWB position, store it as the reference and
+        compute a one-time correction to align the IMU-derived position with the
+        UWB reference. The correction sent to the single_correction_func will be
+        such that (IMU_position + correction) == (UWB_position - reference_UWB_position)
+        which yields zero immediately after calibration.
+        """
         distances = self._get_uwb_distances()
 
         if all(d is not None for d in distances):
-            # Use 3D multilateration to get absolute position
+            # Use 3D multilateration to get absolute position (already mapped inside the function)
             uwb_position: np.ndarray = self.triangulate_func(distances, self.anchor_positions,
                                                              self.position) if self.triangulate_func else ValueError(
                 "Triangulation function not set.")
@@ -640,14 +661,35 @@ class Glove:
                 print(f"Calibration multilateration returned invalid position for glove {self.device_id}: {uwb_position}")
                 return False
 
-            self.reference_UWB_position = uwb_position
+            # Save a copy to avoid unexpected aliasing
+            self.reference_UWB_position = np.asarray(uwb_position, dtype=np.float64).copy()
+
+            # Save current orientation as the rotational reference
             self.reference_orientation_quaternion = self.rotation_quaternion.copy()
             self.inverse_reference_orientation = quaternion_inverse(self.reference_orientation_quaternion)
+
+            # Compute IMU-derived position in the same (mapped) frame
+            imu_pos = np.asarray(self.position, dtype=np.float64).copy()
+
+            # Compute correction needed to align IMU position to UWB reference.
+            # We want: (imu_pos + correction) == (uwb_position - reference_UWB_position)
+            # Since reference_UWB_position == uwb_position at calibration time, the RHS is zero,
+            # so correction = -imu_pos. However using the general formula is clearer and
+            # robust to future changes:
+            desired_rel = np.asarray(uwb_position, dtype=np.float64) - self.reference_UWB_position
+            correction = desired_rel - imu_pos
+
+            # Mark calibrated before sending correction so downstream logic can assume calibration
             self.is_UWB_calibrated = True
-            self.single_correction_func(self.device_id,
-                                        -self.position) if self.single_correction_func else ValueError(
-                "Single correction function (only for calibration) not set."
-            )
+
+            if self.single_correction_func:
+                try:
+                    self.single_correction_func(self.device_id, correction)
+                except Exception as e:
+                    print(f"Error sending calibration correction for glove {self.device_id}: {e}")
+            else:
+                raise ValueError("Single correction function (only for calibration) not set.")
+
             print(f"Glove {self.device_id} UWB calibrated at {self.reference_UWB_position}")
             return True
         else:
