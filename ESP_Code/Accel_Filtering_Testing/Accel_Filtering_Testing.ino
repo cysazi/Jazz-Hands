@@ -19,8 +19,8 @@
 // UNCOMMENT the device you are flashing this code to.
 // This determines the DEVICE_ID in the packet and the UWB address.
 
-// #define CONFIG_GLOVE_1 
-#define CONFIG_GLOVE_2
+#define CONFIG_GLOVE_1 
+// #define CONFIG_GLOVE_2
 
 #define NUMBER_UWB_ANCHORS 4
 // =================================================================
@@ -109,12 +109,24 @@ float last_zupt_var_sum = 0.0f;
 // ========================================
 // ESP-NOW Callbacks
 // ========================================
-void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-  // Handle incoming correction packets
+void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
+  // Debug: print source MAC and length
+  Serial.print("onDataRecv from ");
+  for (int i = 0; i < 6; ++i) {
+    if (i > 0) Serial.print(":");
+    Serial.print(mac_addr[i], HEX);
+  }
+  Serial.print(" len="); Serial.println(len);
+
+  // Handle incoming correction packets (packed correction_t)
   if (len == sizeof(correction_t)) {
+    Serial.println("Receive Success: correction packet size matches");
     correction_t correction;
-    memcpy(&correction, data, sizeof(correction));
-    if (correction.header == 'C' && correction.device_id == DEVICE_ID) {
+    memcpy(&correction, incomingData, sizeof(correction));
+
+    Serial.print("Parsed correction for device_id="); Serial.println(correction.device_id);
+
+    if (correction.device_id == DEVICE_ID) {
       // Desired position = current KF position + correction vector
       float z[3];
       z[0] = kf.x[0] + correction.dx;
@@ -135,6 +147,8 @@ void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
       Serial.print(" dz="); Serial.println(correction.dz);
       Serial.print("New pos: "); Serial.print(kf.x[0]); Serial.print(", "); Serial.print(kf.x[1]); Serial.print(", "); Serial.println(kf.x[2]);
     }
+  } else {
+    Serial.println("Received unexpected packet size");
   }
 }
 
@@ -196,7 +210,8 @@ void setup() {
   DW1000Ranging.initCommunication(DW_RST, DW_CS, DW_IRQ);
 
   DW1000Ranging.attachNewRange(newRange);
-  DW1000Ranging.startAsTag(UWB_TAG_ADDRESS, DW1000.MODE_SHORTDATA_FAST_ACCURACY, false);
+
+  DW1000Ranging.startAsTag(UWB_TAG_ADDRESS, DW1000.MODE_LONGDATA_RANGE_LOWPOWER, false);
 
   current_packet.header = HEADER;
   current_packet.device_id = DEVICE_ID;
