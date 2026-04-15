@@ -31,13 +31,13 @@ import mido
 
 # region ======================= Constants and Definitions =======================
 
-# --- UWB Configuration ---
+# --- UWB Configuration ---0
 NUM_UWB_ANCHORS: int = 4  # Set to 3, 4, or 5
 UWB_OUTLIER_THRESHOLD: float = 3  # meters
 UWB_DATA_TIMEOUT_S: float = 10.0  # Seconds before UWB data is considered stale
 # Set to None for auto-calibration, or provide positions as [(x,y,z), ...] to skip calibration
 # Positions should be in meters. Example: [(0,0,0), (5,0,0), (2.5,4.33,0), (2.5,2.16,3)]
-MANUAL_ANCHOR_POSITIONS: list[tuple[float, float, float]] | None = [(0.0, 0.0, 0.0), (0.0, 2.17, 0.56),
+MANUAL_ANCHOR_POSITIONS: list[tuple[float, float, float]] | None = [(0.0, 0.0, 0.0), (00.0, 2.11, 0.510),
                                                                     (1.83, 2.7, 0.91), (2.92, 0, 0)]
 # Alternative: specify individual distances and let Python calculate positions
 # Format: {(anchor1, anchor2): distance, ...} - distances in meters
