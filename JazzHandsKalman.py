@@ -64,7 +64,7 @@ PACKET_HAS_ERROR: int = 0b10000000
 # Maximum allowed UWB distance (meters). Distances larger than this are treated as missing/invalid.
 MAX_UWB_DISTANCE: float = 10.0
 # Tolerance added to weighted least squares weights to reduce sensitivity to small UWB fluctuations
-UWB_WEIGHT_TOLERANCE: float = 0.005  # meters
+UWB_WEIGHT_TOLERANCE: float = 0.05  # meters
 
 # --- System and Physics Constants ---
 BOUNDING_BOX_NORMAL_TOLERANCE: float = 0.15  # meters, ±tolerance in normal direction
@@ -395,53 +395,68 @@ def calculate_anchor_positions_from_distances(distances: dict[tuple[int, int], f
 def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.ndarray],
                          previous_position: np.ndarray) -> np.ndarray:
     """
-    3D multilateration using Weighted Least Squares for N >= 3 anchors.
-    Includes outlier detection to reject impossible results.
-    Returns (x, y, z) position.
+    3D multilateration using Weighted Least Squares tolerant to missing anchors.
+    Accepts a distances list (one entry per anchor index starting at 1) where any
+    entry may be None. Uses any subset of >=3 available anchors to compute the
+    position. If 4+ anchors are available they are used in a weighted least
+    squares solution; if exactly 3 are available the closed-form trilateration
+    (as WLS with 2x2 solve) is equivalent.
+    Returns the mapped (visualizer-frame) (x, y, z) position.
     """
-    n = len(distances)
-    if n < 3:
-        raise ValueError("Need at least 3 distances for 3D multilateration.")
+    # Collect available anchors and their distances (anchor IDs start at 1)
+    available = [(idx + 1, float(d)) for idx, d in enumerate(distances) if d is not None]
+    m = len(available)
+    if m < 3:
+        raise ValueError("Need at least 3 valid distances for 3D multilateration.")
 
-    A = np.zeros((n - 1, 3))
-    b = np.zeros(n - 1)
-    W = np.eye(n - 1)
+    # Choose reference anchor as the last available (arbitrary but deterministic)
+    ref_id, ref_dist = available[-1]
+    ref_pos = anchor_positions.get(ref_id)
+    if ref_pos is None:
+        raise ValueError(f"Reference anchor {ref_id} position is missing from anchor_positions")
 
-    ref_pos = anchor_positions[n]
-    ref_dist = distances[n - 1]
+    # Build linear system using all other available anchors
+    A = np.zeros((m - 1, 3), dtype=np.float64)
+    b = np.zeros(m - 1, dtype=np.float64)
+    W = np.eye(m - 1, dtype=np.float64)
 
-    for i in range(n - 1):
-        anchor_id = i + 1
-        p_i = anchor_positions[anchor_id]
-        d_i = distances[i]
-        A[i, :] = 2 * (ref_pos - p_i)
-        b[i] = d_i ** 2 - ref_dist ** 2 - np.dot(p_i, p_i) + np.dot(ref_pos, ref_pos)
-        # Add tolerance so small distance fluctuations (~5cm) don't dominate the weighting
+    for i in range(m - 1):
+        anchor_id, d_i = available[i]
+        p_i = anchor_positions.get(anchor_id)
+        if p_i is None:
+            raise ValueError(f"Anchor position for id {anchor_id} missing")
+        A[i, :] = 2.0 * (ref_pos - p_i)
+        b[i] = (d_i ** 2) - (ref_dist ** 2) - np.dot(p_i, p_i) + np.dot(ref_pos, ref_pos)
         denom = max(d_i + UWB_WEIGHT_TOLERANCE, 0.05)
         W[i, i] = 1.0 / (denom ** 2)
 
+    # Solve weighted least squares: (A^T W A) x = A^T W b
     try:
         AT_W_A = A.T @ W @ A
         AT_W_b = A.T @ W @ b
         pos = np.linalg.solve(AT_W_A, AT_W_b)
     except np.linalg.LinAlgError:
-        pos, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        # fallback to least squares
+        pos, *_ = np.linalg.lstsq(A, b, rcond=None)
         pos = np.asarray(pos).flatten()
 
     # Validate solution
     if not is_reasonable_position(pos, max_norm=50.0):
         if previous_position is not None and is_reasonable_position(previous_position, max_norm=50.0):
-            print("Multilateration produced invalid position, reverting to previous_position.")
+            if DEBUG_LOGGING:
+                print("Multilateration produced invalid position, reverting to previous_position.")
             return previous_position
         else:
-            print("Multilateration produced invalid position and no previous valid position, returning zeros.")
+            if DEBUG_LOGGING:
+                print("Multilateration produced invalid position and no previous valid position, returning zeros.")
             return np.zeros(3)
 
     # Outlier detection relative to previous
     if previous_position is not None and np.all(np.isfinite(previous_position)):
         distance_from_last = np.linalg.norm(pos - previous_position)
         if distance_from_last > UWB_OUTLIER_THRESHOLD:
-            print(f"UWB outlier detected. Dist: {distance_from_last:.2f}m. Discarding.")
+            if DEBUG_LOGGING:
+                print(f"UWB outlier detected. Dist: {distance_from_last:.2f}m. Discarding.")
             return previous_position
 
     # Map multilateration result into the visualizer/IMU frame so axes match the visuals
