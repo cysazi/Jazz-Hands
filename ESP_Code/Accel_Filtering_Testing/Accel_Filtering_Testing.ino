@@ -19,8 +19,8 @@
 // UNCOMMENT the device you are flashing this code to.
 // This determines the DEVICE_ID in the packet and the UWB address.
 
-#define CONFIG_GLOVE_1 
-// #define CONFIG_GLOVE_2
+// #define CONFIG_GLOVE_1 
+#define CONFIG_GLOVE_2
 
 #define NUMBER_UWB_ANCHORS 4
 // =================================================================
