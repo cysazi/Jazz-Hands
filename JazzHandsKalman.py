@@ -444,7 +444,14 @@ def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.
             print(f"UWB outlier detected. Dist: {distance_from_last:.2f}m. Discarding.")
             return previous_position
 
-    return pos
+    # Map multilateration result into the visualizer/IMU frame so axes match the visuals
+    try:
+        mapped_pos = FRAME_MAP @ pos
+        mapped_pos = MODEL_OFFSET @ mapped_pos
+    except Exception:
+        # Fallback: if mapping fails for any reason, return raw pos
+        mapped_pos = pos
+    return mapped_pos
 
 
 def quat_to_euler(q):
@@ -978,9 +985,6 @@ class GlovePair:
     def _process_single_packet(self, packet: DevicePacket, from_queue: bool = False):
         glove = self.left_hand if packet.data.device_number % 2 != 0 else self.right_hand
         glove.update_from_packet(packet)
-        if DEBUG_LOGGING:
-            print(
-                f"{glove.UWB_distance_1}, {glove.UWB_distance_2}, {glove.UWB_distance_3}, {glove.UWB_distance_4}, {glove.UWB_distance_5}")
         glove.get_section_from_position()
 
         if glove.glove_state == 2:
@@ -1353,7 +1357,7 @@ class Visualizer:
             target_size = (int(sw * 0.75), int(sh * 0.75))
         except Exception:
             # Fallback to a reasonable default if tkinter or screen info isn't available
-            target_size = (int(0.75 * 1280), int(0.75 * 800))
+            target_size = (int(0.75 * 1920), int(0.75 * 1280))
 
         self.canvas = scene.SceneCanvas(keys='interactive', show=True, size=target_size)
         self.grid = self.canvas.central_widget.add_grid()

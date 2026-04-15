@@ -165,6 +165,23 @@ class Note(IntEnum):
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 
+# IMU -> VisPy frame mapping (kept consistent with JazzHandsKalman and visualization tests)
+FRAME_MAP = np.array([
+    [1, 0, 0],
+    [0, 0, 1],
+    [0, 1, 0],
+], dtype=np.float32)
+
+
+def rot_x(deg: float) -> np.ndarray:
+    a = np.deg2rad(deg)
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float32)
+
+
+MODEL_OFFSET = rot_x(-90.0)
+
+
 # endregion
 
 # TODO: determine if these are necessary
@@ -544,31 +561,26 @@ def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
 
 
 def rotate_vector(quaternion: np.ndarray, local_vector: np.ndarray) -> np.ndarray:
-    """Rotates a vector using unrolled multiplication (fastest)"""
-    qw, qx, qy, qz = quaternion[0], quaternion[1], quaternion[2], quaternion[3]
-    vx, vy, vz = local_vector[0], local_vector[1], local_vector[2]
+    """
+    Rotates a vector by a quaternion and maps it into the VisPy/visualizer frame.
+    Uses the same FRAME_MAP and MODEL_OFFSET as the visualizer to ensure axes match.
+    """
+    # Build rotation matrix from quaternion
+    w, x, y, z = quaternion
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    R = np.array([
+        [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+        [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+        [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+    ], dtype=np.float64)
 
-    # Pre-calculate repeated multiplications
-    qx2 = qx * 2.0
-    qy2 = qy * 2.0
-    qz2 = qz * 2.0
+    # Apply the same frame mapping used in the visualizer
+    R = FRAME_MAP @ R @ FRAME_MAP.T
+    R = R @ MODEL_OFFSET
 
-    # Cross product of q_vector and v
-    cx = qy * vz - qz * vy
-    cy = qz * vx - qx * vz
-    cz = qx * vy - qy * vx
-
-    # q_vector cross (q_vector cross v + qw * v)
-    tx = cx + qw * vx
-    ty = cy + qw * vy
-    tz = cz + qw * vz
-
-    # Final rotation
-    return np.array([
-        vx + qy2 * tz - qz2 * ty,
-        vy + qz2 * tx - qx2 * tz,
-        vz + qx2 * ty - qy2 * tx
-    ])
+    return R @ np.asarray(local_vector, dtype=np.float64)
 
 
 def quat_to_axis_angle(q):
