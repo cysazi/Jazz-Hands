@@ -8,7 +8,6 @@ import queue
 import time
 
 import JazzHandsKalman as jhk
-from JazzHandsKalman import DawInterface
 
 CURRENT_FILEPATH = os.path.dirname(os.path.abspath(__file__))
 HAND_OBJ_PATH = os.path.join(CURRENT_FILEPATH, "Visualization_Tests", "hand.obj")
@@ -34,11 +33,23 @@ VELOCITY_STEP_MAX = 5.0
 ANGULAR_STEP_DELTA = 0.1
 ANGULAR_STEP_MIN = 0.1
 ANGULAR_STEP_MAX = 10.0
+DEBUG_UWB_ORIGIN = np.array([0.45, 0.35, 0.25], dtype=np.float64)
 
 
 class _NullReader:
     def send_correction(self, relay_id, device_id, correction):
         return
+
+
+class _NullDawInterface:
+    def __init__(self):
+        self.previous_note = jhk.NoteData.blank_note()
+
+    def play_note(self, note):
+        self.previous_note = note
+
+    def stop_notes(self):
+        self.previous_note = jhk.NoteData.blank_note()
 
 
 class DebugVisualizer(jhk.Visualizer):
@@ -105,8 +116,17 @@ class DebugVisualizer(jhk.Visualizer):
     def _build_debug_packet(self, hand, device_number: int) -> jhk.DevicePacket:
         is_controlled_hand = (self.controlled_hand_label == "LEFT" and hand is self.left_hand) or \
                              (self.controlled_hand_label == "RIGHT" and hand is self.right_hand)
-        current_button_state = self.keys_down.get('SPACE', False) if is_controlled_hand else False
-        should_seed_uwb = hand.glove_state == 0 and current_button_state
+        button_pressed = self.keys_down.get('SPACE', False) if is_controlled_hand else False
+        should_seed_uwb = hand.glove_state == 0 and button_pressed
+        uwb_distances = self._debug_uwb_distances(hand) if should_seed_uwb else [None] * 5
+        packet_flags = 0
+        if should_seed_uwb:
+            packet_flags = (
+                jhk.PACKET_HAS_UWB_1
+                | jhk.PACKET_HAS_UWB_2
+                | jhk.PACKET_HAS_UWB_3
+                | jhk.PACKET_HAS_UWB_4
+            )
 
         raw_position = jhk.rotate_vector_by_quaternion(
             np.asarray(hand.position, dtype=np.float64),
@@ -123,19 +143,19 @@ class DebugVisualizer(jhk.Visualizer):
         p = jhk.PacketData(
             device_number=device_number,
             timestamp=int(time.time() * 1000),
-            packet_flags=0,
-            button_state=current_button_state,
+            packet_flags=packet_flags,
+            button_state=not button_pressed,
             pos_x=float(raw_position[0]),
             pos_y=float(raw_position[1]),
             pos_z=float(raw_position[2]),
             vel_x=float(raw_velocity[0]),
             vel_y=float(raw_velocity[1]),
             vel_z=float(raw_velocity[2]),
-            UWB_distance_1=1.0 if should_seed_uwb else None,
-            UWB_distance_2=1.0 if should_seed_uwb else None,
-            UWB_distance_3=1.0 if should_seed_uwb else None,
-            UWB_distance_4=1.0 if should_seed_uwb else None,
-            UWB_distance_5=1.0 if should_seed_uwb else None,
+            UWB_distance_1=uwb_distances[0],
+            UWB_distance_2=uwb_distances[1],
+            UWB_distance_3=uwb_distances[2],
+            UWB_distance_4=uwb_distances[3],
+            UWB_distance_5=uwb_distances[4],
             quat_w=float(raw_quaternion[0]),
             quat_i=float(raw_quaternion[1]),
             quat_j=float(raw_quaternion[2]),
@@ -143,6 +163,15 @@ class DebugVisualizer(jhk.Visualizer):
             error_handler=None,
         )
         return jhk.DevicePacket(relay_id=self.glove_pair.relay_id, data=p)
+
+    @staticmethod
+    def _debug_uwb_distances(hand) -> list[float | None]:
+        distances: list[float | None] = [None] * 5
+        for anchor_id, anchor_position in sorted(hand.anchor_positions.items()):
+            if anchor_id < 1 or anchor_id > 5:
+                continue
+            distances[anchor_id - 1] = float(np.linalg.norm(DEBUG_UWB_ORIGIN - np.asarray(anchor_position)))
+        return distances
 
     def on_key_press(self, event):
         if not event.key: return
@@ -289,9 +318,13 @@ class DebugVisualizer(jhk.Visualizer):
         app.quit()
 
 def main():
+    jhk.MULTILATERATION_ONLY = False
+    jhk.DEBUG_LOGGING = False
+    jhk.MIDI_DEBUG_LOGGING = False
+
     mock_reader = _NullReader()
     mock_queue = queue.Queue() # Still needed for class initialization
-    daw_interface = DawInterface(None)
+    daw_interface = _NullDawInterface()
 
     mock_anchor_positions = {
         1: np.array([0.0, 0.0, 0.0]), 2: np.array([1.0, 0.0, 0.0]),
@@ -302,10 +335,14 @@ def main():
     glove_pair = jhk.GlovePair(
         left_hand=jhk.LeftHand(
             device_id=1, active_area_x_subsections=3, active_area_y_subsections=12,
-            anchor_positions=mock_anchor_positions, triangulate_func=jhk.multilaterate_3d_wls),
+            anchor_positions=mock_anchor_positions,
+            triangulate_func=jhk.multilaterate_3d_wls,
+            single_correction_func=lambda _device_id, _correction: None),
         right_hand=jhk.RightHand(
             device_id=2, active_area_x_subsections=5, active_area_y_subsections=8,
-            anchor_positions=mock_anchor_positions, triangulate_func=jhk.multilaterate_3d_wls),
+            anchor_positions=mock_anchor_positions,
+            triangulate_func=jhk.multilaterate_3d_wls,
+            single_correction_func=lambda _device_id, _correction: None),
         relay_id=1, reader=mock_reader, relay_queue=mock_queue, daw_interface=daw_interface)
 
     # Do not start the glove_pair thread in debug mode

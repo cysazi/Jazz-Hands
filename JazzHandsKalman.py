@@ -1,4 +1,6 @@
 # region ======================= Imports =======================
+from __future__ import annotations
+
 import math
 import os
 # Limit BLAS/OpenMP threads to 1 to avoid periodic thread contention and latency spikes in real-time.
@@ -25,7 +27,30 @@ from vispy.app import Timer
 from vispy.io import read_mesh
 from vispy.visuals.transforms import MatrixTransform
 
-import mido
+try:
+    import mido
+except ModuleNotFoundError:
+    class _MissingMidoMessage:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("mido is not installed; MIDI output is unavailable.")
+
+    class _MissingMido:
+        class backends:
+            class rtmidi:
+                class Output:
+                    pass
+
+        Message = _MissingMidoMessage
+
+        @staticmethod
+        def get_output_names():
+            return []
+
+        @staticmethod
+        def open_output(_name):
+            raise RuntimeError("mido is not installed; MIDI output is unavailable.")
+
+    mido = _MissingMido()
 
 # endregion
 
@@ -466,7 +491,8 @@ def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.
     except Exception:
         # Fallback: if mapping fails for any reason, return raw pos
         mapped_pos = pos
-    print(mapped_pos)
+    if DEBUG_LOGGING:
+        print(mapped_pos)
     return mapped_pos
 
 
@@ -1283,6 +1309,8 @@ class DawInterface:
         return inst_channel
 
     def stop_notes(self):
+        if self.port is None or self.previous_note.note is None:
+            return
         self.port.send(mido.Message(
             'note_off',
             note=self.previous_note.note,
