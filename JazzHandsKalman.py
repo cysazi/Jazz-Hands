@@ -34,7 +34,7 @@ import mido
 # --- UWB Configuration ---
 NUM_UWB_ANCHORS: int = 4  # Set to 3, 4, or 5
 UWB_OUTLIER_THRESHOLD: float = 3  # meters
-UWB_DATA_TIMEOUT_S: float = 1.0  # Seconds before UWB data is considered stale
+UWB_DATA_TIMEOUT_S: float = 10.0  # Seconds before UWB data is considered stale
 # Set to None for auto-calibration, or provide positions as [(x,y,z), ...] to skip calibration
 # Positions should be in meters. Example: [(0,0,0), (5,0,0), (2.5,4.33,0), (2.5,2.16,3)]
 MANUAL_ANCHOR_POSITIONS: list[tuple[float, float, float]] | None = [(0.0, 0.0, 0.0), (0.0, 2.17, 0.56),
@@ -63,6 +63,8 @@ PACKET_HAS_UWB_5: int = 0b01000000
 PACKET_HAS_ERROR: int = 0b10000000
 # Maximum allowed UWB distance (meters). Distances larger than this are treated as missing/invalid.
 MAX_UWB_DISTANCE: float = 10.0
+# Tolerance added to weighted least squares weights to reduce sensitivity to small UWB fluctuations
+UWB_WEIGHT_TOLERANCE: float = 0.05  # meters
 
 # --- System and Physics Constants ---
 BOUNDING_BOX_NORMAL_TOLERANCE: float = 0.15  # meters, ±tolerance in normal direction
@@ -414,7 +416,9 @@ def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.
         d_i = distances[i]
         A[i, :] = 2 * (ref_pos - p_i)
         b[i] = d_i ** 2 - ref_dist ** 2 - np.dot(p_i, p_i) + np.dot(ref_pos, ref_pos)
-        W[i, i] = 1.0 / max(d_i, 0.1) ** 2
+        # Add tolerance so small distance fluctuations (~5cm) don't dominate the weighting
+        denom = max(d_i + UWB_WEIGHT_TOLERANCE, 0.05)
+        W[i, i] = 1.0 / (denom ** 2)
 
     try:
         AT_W_A = A.T @ W @ A
@@ -611,6 +615,8 @@ class Glove:
             self.UWB_distance_4 if now - self.UWB_timestamp_4 < UWB_DATA_TIMEOUT_S else None,
             self.UWB_distance_5 if now - self.UWB_timestamp_5 < UWB_DATA_TIMEOUT_S else None,
         ]
+        if DEBUG_LOGGING:
+            print(all_distances)
         return all_distances[:NUM_UWB_ANCHORS]
 
     def calibrate_zero_frame(self) -> bool:
