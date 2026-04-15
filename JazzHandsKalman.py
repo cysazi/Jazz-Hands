@@ -75,7 +75,7 @@ PERFORMANCE_MODE: bool = False  # for mirroring the L and R hands
 MULTILATERATION_ONLY: bool = True
 # Reduce console logging for real-time performance
 DEBUG_LOGGING: bool = True
-SHOWING_ANCHORS:bool = True
+SHOWING_ANCHORS:bool = False
 # Minimum interval between sending corrections for a glove (ms)
 CORRECTION_MIN_INTERVAL_MS: int = 100
 
@@ -466,6 +466,7 @@ def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.
     except Exception:
         # Fallback: if mapping fails for any reason, return raw pos
         mapped_pos = pos
+    print(mapped_pos)
     return mapped_pos
 
 
@@ -1223,7 +1224,9 @@ class DawInterface:
     port: mido.backends.rtmidi.Output
     previous_note: NoteData = field(init=False)
 
+
     def __post_init__(self):
+        self.previous_note = NoteData.blank_note()
         if MIDI_DEBUG_LOGGING:
             print(f"[MIDI DEBUG] DawInterface init: port={self.port}")
         if self.port is None or "":

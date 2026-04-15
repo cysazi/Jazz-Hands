@@ -83,8 +83,8 @@
 #define NUM_UWB_ANCHORS 3  // Set to 3 or 4 (must match Python configuration!)
 
 // MAC addresses of the glove devices this anchor will communicate with
-uint8_t glove1_mac[6] = {0x34, 0x98, 0x7A, 0x73, 0x93, 0x14}; // Device 1
-uint8_t glove2_mac[6] = {0x34, 0x98, 0x7A, 0x74, 0x39, 0x00}; // Device 2
+uint8_t glove1_mac[6] = {0x34, 0x98, 0x7A, 0x74, 0x39, 0x00}; // Device 1
+uint8_t glove2_mac[6] = {0x34, 0x98, 0x7A, 0x73, 0x93, 0x14}; // Device 3
 
 // ========================================
 // Data Structures
@@ -119,13 +119,13 @@ typedef struct __attribute__((__packed__)) {
 // Global Variables
 // ========================================
 struct GlovePeerInfo {
-  uint8_t mac[6];
+  uint8_t *mac;
   bool paired;
 };
 
 GlovePeerInfo glove_peers[2] = {
-  {{0x34, 0x98, 0x7A, 0x74, 0x39, 0x14}, false}, // glove1_mac
-  {{0x34, 0x98, 0x7A, 0x73, 0x75, 0xB8}, false}  // glove2_mac
+  {glove1_mac, false}, // glove1_mac
+  {glove2_mac, false}  // glove2_mac
 };
 
 // Calibration state
