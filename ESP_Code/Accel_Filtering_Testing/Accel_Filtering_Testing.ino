@@ -109,12 +109,12 @@ float last_zupt_var_sum = 0.0f;
 // ========================================
 // ESP-NOW Callbacks
 // ========================================
-void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
+void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   // Debug: print source MAC and length
   Serial.print("onDataRecv from ");
   for (int i = 0; i < 6; ++i) {
     if (i > 0) Serial.print(":");
-    Serial.print(mac_addr[i], HEX);
+    Serial.print(info->src_addr[i], HEX);
   }
   Serial.print(" len="); Serial.println(len);
 
@@ -122,7 +122,7 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
   if (len == sizeof(correction_t)) {
     Serial.println("Receive Success: correction packet size matches");
     correction_t correction;
-    memcpy(&correction, incomingData, sizeof(correction));
+    memcpy(&correction, data, sizeof(correction));
 
     Serial.print("Parsed correction for device_id="); Serial.println(correction.device_id);
 
