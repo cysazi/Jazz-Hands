@@ -272,9 +272,14 @@ class DebugVisualizer(jhk.Visualizer):
         try:
             packet = self._build_debug_packet(controlled_hand, device_number=controlled_hand.device_id)
             # Override the packet's velocity fields with the velocity requested by the keypress
+            # and ensure the packet position reflects the current visual position.
             packet.data.vel_x = float(vel[0])
             packet.data.vel_y = float(vel[1])
             packet.data.vel_z = float(vel[2])
+            packet.data.pos_x = float(controlled_hand.position[0])
+            packet.data.pos_y = float(controlled_hand.position[1])
+            packet.data.pos_z = float(controlled_hand.position[2])
+
 
             # Non-blocking enqueue so the UI thread doesn't stall
             try:
