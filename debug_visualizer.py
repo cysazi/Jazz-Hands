@@ -253,8 +253,9 @@ class DebugVisualizer(jhk.Visualizer):
         if self.keys_down.get('E', False): vel[2] += self.velocity_step
         controlled_hand = self._controlled_hand()
         other_hand = self.right_hand if controlled_hand is self.left_hand else self.left_hand
-        controlled_hand.velocity = vel
-        other_hand.velocity = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        # Do NOT assign velocities directly to the Glove objects here. Instead, construct a
+        # debug PacketData that contains the requested velocity and feed it to the packet processor
+        # so all state updates go through the same code path.
 
         ang_vel = np.array([0.0, 0.0, 0.0], dtype=np.float64)
         if self.keys_down.get('I', False): ang_vel[1] += self.rotation_step
@@ -270,11 +271,16 @@ class DebugVisualizer(jhk.Visualizer):
         # Build a debug packet immediately on key changes and feed it to the packet processor
         try:
             packet = self._build_debug_packet(controlled_hand, device_number=controlled_hand.device_id)
+            # Override the packet's velocity fields with the velocity requested by the keypress
+            packet.data.vel_x = float(vel[0])
+            packet.data.vel_y = float(vel[1])
+            packet.data.vel_z = float(vel[2])
+
             # Non-blocking enqueue so the UI thread doesn't stall
             try:
                 self.glove_pair.relay_queue.put_nowait(packet)
             except Exception:
-                # If no queue/queue full, fall back to synchronous processing (safe but may be heavier)
+                # If no queue/queue full, fall back to synchronous processing
                 try:
                     self.glove_pair._packet_processor(packet)
                 except Exception:
