@@ -58,8 +58,12 @@ except ModuleNotFoundError:
 
 # --- UWB Configuration ---0
 NUM_UWB_ANCHORS: int = 4  # Set to 3, 4, or 5
-UWB_OUTLIER_THRESHOLD: float = 3  # meters
-UWB_DATA_TIMEOUT_S: float = 10.0  # Seconds before UWB data is considered stale
+UWB_OUTLIER_THRESHOLD: float = 1.25  # meters
+UWB_DATA_TIMEOUT_S: float = 1.0  # Seconds before UWB data is considered stale
+UWB_SYNC_WINDOW_S: float = 0.5  # Maximum timestamp spread across anchors for one solve
+UWB_POSITION_AVERAGE_WINDOW: int = 20
+UWB_POSITION_SMOOTHING_ALPHA: float = 0.12
+UWB_MAX_POSITION_STEP_M: float = 0.35
 # Set to None for auto-calibration, or provide positions as [(x,y,z), ...] to skip calibration
 # Positions should be in meters. Example: [(0,0,0), (5,0,0), (2.5,4.33,0), (2.5,2.16,3)]
 MANUAL_ANCHOR_POSITIONS: list[tuple[float, float, float]] | None = [(0.0, 0.0, 0.0), (00.0, 2.11, 0.510),
@@ -93,16 +97,17 @@ UWB_WEIGHT_TOLERANCE: float = 0.05  # meters
 
 # --- System and Physics Constants ---
 BOUNDING_BOX_NORMAL_TOLERANCE: float = 0.15  # meters, ±tolerance in normal direction
-MIDI_DEBUG_LOGGING: bool = True
+MIDI_DEBUG_LOGGING: bool = False
 PERFORMANCE_MODE: bool = False  # for mirroring the L and R hands
 # Debug mode: when True, ignore IMU dead-reckoning and use multilateration-only
 # after the glove has been UWB-calibrated (useful for testing/validation).
 MULTILATERATION_ONLY: bool = True
 # Reduce console logging for real-time performance
-DEBUG_LOGGING: bool = True
+DEBUG_LOGGING: bool = False
 SHOWING_ANCHORS:bool = False
 # Minimum interval between sending corrections for a glove (ms)
 CORRECTION_MIN_INTERVAL_MS: int = 100
+SEND_ESP_POSITION_CORRECTIONS: bool = False
 
 INSTRUMENT_CYCLE: tuple[str, ...] = (
     "Synth",
@@ -418,7 +423,7 @@ def calculate_anchor_positions_from_distances(distances: dict[tuple[int, int], f
 
 
 def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.ndarray],
-                         previous_position: np.ndarray) -> np.ndarray:
+                         previous_position: np.ndarray | None) -> np.ndarray:
     """
     3D multilateration using Weighted Least Squares tolerant to missing anchors.
     Accepts a distances list (one entry per anchor index starting at 1) where any
@@ -476,14 +481,6 @@ def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.
                 print("Multilateration produced invalid position and no previous valid position, returning zeros.")
             return np.zeros(3)
 
-    # Outlier detection relative to previous
-    if previous_position is not None and np.all(np.isfinite(previous_position)):
-        distance_from_last = np.linalg.norm(pos - previous_position)
-        if distance_from_last > UWB_OUTLIER_THRESHOLD:
-            if DEBUG_LOGGING:
-                print(f"UWB outlier detected. Dist: {distance_from_last:.2f}m. Discarding.")
-            return previous_position
-
     # Map multilateration result into the visualizer/IMU frame so axes match the visuals
     try:
         mapped_pos = FRAME_MAP @ pos
@@ -491,6 +488,24 @@ def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.
     except Exception:
         # Fallback: if mapping fails for any reason, return raw pos
         mapped_pos = pos
+
+    if not is_reasonable_position(mapped_pos, max_norm=50.0):
+        if previous_position is not None and is_reasonable_position(previous_position, max_norm=50.0):
+            if DEBUG_LOGGING:
+                print("Mapped multilateration result was invalid, reverting to previous_position.")
+            return previous_position
+        if DEBUG_LOGGING:
+            print("Mapped multilateration result was invalid and no previous valid position was available.")
+        return np.zeros(3)
+
+    # Outlier detection relative to the previous mapped absolute UWB solution.
+    if previous_position is not None and np.all(np.isfinite(previous_position)):
+        distance_from_last = np.linalg.norm(mapped_pos - previous_position)
+        if distance_from_last > UWB_OUTLIER_THRESHOLD:
+            if DEBUG_LOGGING:
+                print(f"UWB outlier detected. Dist: {distance_from_last:.2f}m. Discarding.")
+            return previous_position
+
     if DEBUG_LOGGING:
         print(mapped_pos)
     return mapped_pos
@@ -667,37 +682,127 @@ class Glove:
     euler_history: deque = field(default_factory=lambda: deque(maxlen=10))
     # Timestamp of last sent correction (seconds since epoch)
     last_correction_time: float = 0.0
+    last_absolute_UWB_position: np.ndarray | None = None
+    relative_UWB_position_history: deque = field(
+        default_factory=lambda: deque(maxlen=UWB_POSITION_AVERAGE_WINDOW)
+    )
 
-    def _get_uwb_distances(self) -> list[float | None]:
-        """Returns a list of UWB distances, filtering out stale data."""
+    def _clear_uwb_distances(self):
+        self.UWB_distance_1 = None
+        self.UWB_distance_2 = None
+        self.UWB_distance_3 = None
+        self.UWB_distance_4 = None
+        self.UWB_distance_5 = None
+        self.UWB_timestamp_1 = 0.0
+        self.UWB_timestamp_2 = 0.0
+        self.UWB_timestamp_3 = 0.0
+        self.UWB_timestamp_4 = 0.0
+        self.UWB_timestamp_5 = 0.0
+
+    @staticmethod
+    def _valid_uwb_distance(distance: float | None) -> bool:
+        if distance is None:
+            return False
+        try:
+            distance = float(distance)
+        except (TypeError, ValueError):
+            return False
+        return 0.0 < distance <= MAX_UWB_DISTANCE and math.isfinite(distance)
+
+    def _store_uwb_distance(self, anchor_index: int, distance: float | None, timestamp: float):
+        if distance is None:
+            return
+        value = float(distance) if self._valid_uwb_distance(distance) else None
+        setattr(self, f"UWB_distance_{anchor_index}", value)
+        setattr(self, f"UWB_timestamp_{anchor_index}", timestamp if value is not None else 0.0)
+
+    def _update_uwb_from_packet(self, p: DevicePacket, timestamp: float):
+        self._store_uwb_distance(1, p.data.UWB_distance_1, timestamp)
+        self._store_uwb_distance(2, p.data.UWB_distance_2, timestamp)
+        self._store_uwb_distance(3, p.data.UWB_distance_3, timestamp)
+        self._store_uwb_distance(4, p.data.UWB_distance_4, timestamp)
+        self._store_uwb_distance(5, p.data.UWB_distance_5, timestamp)
+
+    def _get_uwb_distances(self, require_synced: bool = True) -> list[float | None]:
+        """Returns fresh UWB distances and rejects mixed-time anchor sets."""
         now = time.time()
-        all_distances = [
-            self.UWB_distance_1 if now - self.UWB_timestamp_1 < UWB_DATA_TIMEOUT_S else None,
-            self.UWB_distance_2 if now - self.UWB_timestamp_2 < UWB_DATA_TIMEOUT_S else None,
-            self.UWB_distance_3 if now - self.UWB_timestamp_3 < UWB_DATA_TIMEOUT_S else None,
-            self.UWB_distance_4 if now - self.UWB_timestamp_4 < UWB_DATA_TIMEOUT_S else None,
-            self.UWB_distance_5 if now - self.UWB_timestamp_5 < UWB_DATA_TIMEOUT_S else None,
+        distances = [
+            self.UWB_distance_1,
+            self.UWB_distance_2,
+            self.UWB_distance_3,
+            self.UWB_distance_4,
+            self.UWB_distance_5,
+        ][:NUM_UWB_ANCHORS]
+        timestamps = [
+            self.UWB_timestamp_1,
+            self.UWB_timestamp_2,
+            self.UWB_timestamp_3,
+            self.UWB_timestamp_4,
+            self.UWB_timestamp_5,
+        ][:NUM_UWB_ANCHORS]
+        fresh_distances = [
+            distance if self._valid_uwb_distance(distance) and now - timestamp <= UWB_DATA_TIMEOUT_S else None
+            for distance, timestamp in zip(distances, timestamps)
         ]
+
+        if require_synced and all(distance is not None for distance in fresh_distances):
+            timestamp_spread = max(timestamps) - min(timestamps)
+            if timestamp_spread > UWB_SYNC_WINDOW_S:
+                if DEBUG_LOGGING:
+                    print(f"Discarding unsynchronized UWB set with {timestamp_spread:.3f}s spread.")
+                return [None] * NUM_UWB_ANCHORS
+
         if DEBUG_LOGGING:
-            print(all_distances)
-        return all_distances[:NUM_UWB_ANCHORS]
+            print(fresh_distances)
+        return fresh_distances
+
+    def _ensure_uwb_position_filter(self):
+        if not hasattr(self, "relative_UWB_position_history"):
+            self.relative_UWB_position_history = deque(maxlen=UWB_POSITION_AVERAGE_WINDOW)
+
+    def _reset_uwb_position_filter(self, seed_position: np.ndarray | None = None):
+        self._ensure_uwb_position_filter()
+        self.relative_UWB_position_history.clear()
+        if seed_position is not None and is_reasonable_position(seed_position, max_norm=50.0):
+            self.relative_UWB_position_history.append(np.asarray(seed_position, dtype=np.float64).copy())
+
+    def _filter_uwb_position(self, target_position: np.ndarray) -> np.ndarray:
+        self._ensure_uwb_position_filter()
+        target = np.asarray(target_position, dtype=np.float64)
+        if not is_reasonable_position(target, max_norm=50.0):
+            return self.position.copy()
+
+        current = np.asarray(self.position, dtype=np.float64)
+        delta = target - current
+        delta_norm = float(np.linalg.norm(delta))
+        if delta_norm > UWB_MAX_POSITION_STEP_M:
+            target = current + delta * (UWB_MAX_POSITION_STEP_M / delta_norm)
+
+        self.relative_UWB_position_history.append(target.copy())
+        averaged_position = np.mean(np.asarray(self.relative_UWB_position_history), axis=0)
+        alpha = max(0.0, min(1.0, UWB_POSITION_SMOOTHING_ALPHA))
+        return current + alpha * (averaged_position - current)
 
     def calibrate_zero_frame(self) -> bool:
-        """Sets the current UWB position as the origin of the coordinate system.
-
-        After computing an absolute UWB position, store it as the reference and
-        compute a one-time correction to align the IMU-derived position with the
-        UWB reference. The correction sent to the single_correction_func will be
-        such that (IMU_position + correction) == (UWB_position - reference_UWB_position)
-        which yields zero immediately after calibration.
-        """
+        """Sets the current synchronized UWB position as the origin."""
         distances = self._get_uwb_distances()
 
         if all(d is not None for d in distances):
+            if self.triangulate_func is None:
+                print(f"Glove {self.device_id}: UWB calibration failed. Triangulation function not set.")
+                return False
+
             # Use 3D multilateration to get absolute position (already mapped inside the function)
-            uwb_position: np.ndarray = self.triangulate_func(distances, self.anchor_positions,
-                                                             self.position) if self.triangulate_func else ValueError(
-                "Triangulation function not set.")
+            try:
+                uwb_position = self.triangulate_func(
+                    distances,
+                    self.anchor_positions,
+                    self.last_absolute_UWB_position,
+                )
+            except Exception as e:
+                print(f"Calibration multilateration failed for glove {self.device_id}: {e}")
+                return False
+
             # Validate
             if not is_reasonable_position(uwb_position, max_norm=50.0):
                 print(f"Calibration multilateration returned invalid position for glove {self.device_id}: {uwb_position}")
@@ -705,32 +810,25 @@ class Glove:
 
             # Save a copy to avoid unexpected aliasing
             self.reference_UWB_position = np.asarray(uwb_position, dtype=np.float64).copy()
+            self.last_absolute_UWB_position = self.reference_UWB_position.copy()
 
             # Save current orientation as the rotational reference
             self.reference_orientation_quaternion = self.rotation_quaternion.copy()
             self.inverse_reference_orientation = quaternion_inverse(self.reference_orientation_quaternion)
 
-            # Compute IMU-derived position in the same (mapped) frame
-            imu_pos = np.asarray(self.position, dtype=np.float64).copy()
-
-            # Compute correction needed to align IMU position to UWB reference.
-            # We want: (imu_pos + correction) == (uwb_position - reference_UWB_position)
-            # Since reference_UWB_position == uwb_position at calibration time, the RHS is zero,
-            # so correction = -imu_pos. However using the general formula is clearer and
-            # robust to future changes:
-            desired_rel = np.asarray(uwb_position, dtype=np.float64) - self.reference_UWB_position
-            correction = desired_rel - imu_pos
-
             # Mark calibrated before sending correction so downstream logic can assume calibration
+            imu_pos = np.asarray(self.position, dtype=np.float64).copy()
             self.is_UWB_calibrated = True
+            self.position = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+            self.velocity = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+            self._reset_uwb_position_filter(self.position)
 
-            if self.single_correction_func:
+            if SEND_ESP_POSITION_CORRECTIONS and self.single_correction_func:
                 try:
+                    correction = -imu_pos
                     self.single_correction_func(self.device_id, correction)
                 except Exception as e:
                     print(f"Error sending calibration correction for glove {self.device_id}: {e}")
-            else:
-                raise ValueError("Single correction function (only for calibration) not set.")
 
             print(f"Glove {self.device_id} UWB calibrated at {self.reference_UWB_position}")
             return True
@@ -742,45 +840,58 @@ class Glove:
         """Updates the glove's state from an incoming ESP32 packet."""
         self.button_pressed = not p.data.button_state
         now = time.time()
+        previous_position = self.position.copy()
 
         # Remember previous states
-        self.position_history.append(self.position)
-        self.velocity_history.append(self.velocity)
-        self.euler_history.append(self.rotation_euler)
-        # Raw data from packet
-        raw_position = np.array([p.data.pos_x, p.data.pos_y, p.data.pos_z])
-        raw_velocity = np.array([p.data.vel_x, p.data.vel_y, p.data.vel_z])
-        raw_rotation = np.array([p.data.quat_w, p.data.quat_i, p.data.quat_j, p.data.quat_k])
+        self.position_history.append(previous_position)
+        self.velocity_history.append(self.velocity.copy())
+        self.quat_history.append(self.rotation_quaternion.copy())
+        self.euler_history.append(self.rotation_euler.copy())
+        self._update_uwb_from_packet(p, now)
 
-        # If MULTILATERATION_ONLY is enabled and UWB calibration exists, prefer UWB position
-        if MULTILATERATION_ONLY and self.is_UWB_calibrated and self.triangulate_func is not None:
+        if MULTILATERATION_ONLY:
+            # In multilateration-only mode, do not use IMU position, velocity, or rotation.
+            self.velocity = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+            self.rotation_quaternion = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            self.rotation_euler = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+
+            if not self.is_UWB_calibrated or self.triangulate_func is None:
+                self.position = previous_position
+                return
+
             distances = self._get_uwb_distances()
             if all(d is not None for d in distances):
                 try:
-                    abs_uwb_pos = self.triangulate_func(distances, self.anchor_positions, self.position)
+                    abs_uwb_pos = self.triangulate_func(
+                        distances,
+                        self.anchor_positions,
+                        self.last_absolute_UWB_position,
+                    )
+                    if not is_reasonable_position(abs_uwb_pos, max_norm=50.0):
+                        self.position = previous_position
+                        return
+
+                    self.last_absolute_UWB_position = np.asarray(abs_uwb_pos, dtype=np.float64).copy()
                     rel_uwb_pos = abs_uwb_pos - self.reference_UWB_position
-                    # Use multilateration result as the authoritative position in the calibrated frame
-                    self.position = rel_uwb_pos
-                    # Velocity is unknown from multilateration alone; set to zero to avoid integrating bad IMU velocities
-                    self.velocity = np.array([0.0, 0.0, 0.0])
+                    self.position = self._filter_uwb_position(rel_uwb_pos)
                 except Exception as e:
                     print(f"Multilateration error for device {self.device_id}: {e}")
-                    # Fallback to IMU-derived transform
-                    self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
-                    self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
+                    self.position = previous_position
             else:
-                # Not enough UWB data yet: fallback to IMU
-                self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
-                self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
+                self.position = previous_position
         else:
+            # Raw data from packet
+            raw_position = np.array([p.data.pos_x, p.data.pos_y, p.data.pos_z], dtype=np.float64)
+            raw_velocity = np.array([p.data.vel_x, p.data.vel_y, p.data.vel_z], dtype=np.float64)
+            raw_rotation = np.array([p.data.quat_w, p.data.quat_i, p.data.quat_j, p.data.quat_k], dtype=np.float64)
+
             # Default: transform IMU dead-reckoning into calibrated world frame
             self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
             self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
 
-        # Rotation should still be derived from the IMU quaternion
-        self.rotation_quaternion = quaternion_multiply(self.inverse_reference_orientation, raw_rotation)
-
-        self.rotation_euler = np.array(quat_to_euler_deg(self.rotation_quaternion), dtype=np.float64)
+            # Rotation should still be derived from the IMU quaternion
+            self.rotation_quaternion = quaternion_multiply(self.inverse_reference_orientation, raw_rotation)
+            self.rotation_euler = np.array(quat_to_euler_deg(self.rotation_quaternion), dtype=np.float64)
 
         # Validate resulting position; if invalid, revert to previous valid position if available
         try:
@@ -796,64 +907,33 @@ class Glove:
         except Exception:
             pass
 
-        # Treat distances > MAX_UWB_DISTANCE as missing (None)
-        if p.data.UWB_distance_1 is not None:
-            if abs(p.data.UWB_distance_1) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_1 = p.data.UWB_distance_1
-                self.UWB_timestamp_1 = now
-            else:
-                self.UWB_distance_1 = None
-        if p.data.UWB_distance_2 is not None:
-            if abs(p.data.UWB_distance_2) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_2 = p.data.UWB_distance_2
-                self.UWB_timestamp_2 = now
-            else:
-                self.UWB_distance_2 = None
-        if p.data.UWB_distance_3 is not None:
-            if abs(p.data.UWB_distance_3) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_3 = p.data.UWB_distance_3
-                self.UWB_timestamp_3 = now
-            else:
-                self.UWB_distance_3 = None
-        if p.data.UWB_distance_4 is not None:
-            if abs(p.data.UWB_distance_4) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_4 = p.data.UWB_distance_4
-                self.UWB_timestamp_4 = now
-            else:
-                self.UWB_distance_4 = None
-        if p.data.UWB_distance_5 is not None:
-            if abs(p.data.UWB_distance_5) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_5 = p.data.UWB_distance_5
-                self.UWB_timestamp_5 = now
-            else:
-                self.UWB_distance_5 = None
-
     def calculate_and_send_correction(self, reader: ThreadedMultiDeviceReader, relay_id: int, device_id: int):
+        if not SEND_ESP_POSITION_CORRECTIONS:
+            return
+
         distances = self._get_uwb_distances()
 
         # Only proceed if we have fresh UWB data
         if all(d is not None for d in distances):
+            if self.triangulate_func is None:
+                return
+
             # Rate-limit corrections to avoid flooding the serial link and heavy computation
             now = time.time()
             if (now - self.last_correction_time) * 1000.0 < CORRECTION_MIN_INTERVAL_MS:
                 return
 
             # 1. Calculate UWB ground truth in the absolute anchor frame
-            abs_uwb_pos = self.triangulate_func(distances, self.anchor_positions,
-                                                self.position) if self.triangulate_func else ValueError(
-                "Triangulation function not set.")
+            abs_uwb_pos = self.triangulate_func(distances, self.anchor_positions, self.last_absolute_UWB_position)
 
             # Validate multilateration result before using it
             if not is_reasonable_position(abs_uwb_pos, max_norm=50.0):
                 if DEBUG_LOGGING:
                     print(f"Ignoring invalid UWB solution for glove {self.device_id}: {abs_uwb_pos}")
                 # Invalidate UWB to avoid repeated bad corrections
-                self.UWB_distance_1 = None
-                self.UWB_distance_2 = None
-                self.UWB_distance_3 = None
-                self.UWB_distance_4 = None
-                self.UWB_distance_5 = None
+                self._clear_uwb_distances()
                 return
+            self.last_absolute_UWB_position = np.asarray(abs_uwb_pos, dtype=np.float64).copy()
 
             # 2. Translate to the relative frame based on the calibration origin
             rel_uwb_pos = abs_uwb_pos - self.reference_UWB_position
@@ -918,11 +998,7 @@ class Glove:
             self.position += correction
 
             # 7. Invalidate UWB data after use to prevent re-sending the same correction
-            self.UWB_distance_1 = None
-            self.UWB_distance_2 = None
-            self.UWB_distance_3 = None
-            self.UWB_distance_4 = None
-            self.UWB_distance_5 = None
+            self._clear_uwb_distances()
 
     @staticmethod
     def _get_section_index(pos_val: float, num_sections: int, area_half_length: float) -> int:
@@ -993,7 +1069,8 @@ class Glove:
             if self.button_pressed:
                 if self.calibrate_zero_frame():
                     self.glove_state = 1
-                    self.position = np.array([0.0, 0.0, 0.0])
+                    self.position = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+                    self._reset_uwb_position_filter(self.position)
                     if self.visual:
                         self.visual.box.visible = True
 

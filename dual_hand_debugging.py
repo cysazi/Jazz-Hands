@@ -958,31 +958,10 @@ class DualHandDebugVisualizer:
         app.quit()
 
 def main():
-    """Initializes a mock GlovePair and runs the dual-hand debug visualizer."""
-    mock_reader = None
-    mock_queue = None
+    """Run the current-architecture manual music debugger."""
+    from dual_hand_music_debugger import main as run_current_architecture_debugger
 
-    glove_pair = jhk.GlovePair(
-        device_ids=(1, 2),
-        relay_id=1,
-        reader=mock_reader,
-        relay_queue=mock_queue
-    )
-
-    print("Starting Dual-Hand Debug Visualizer...")
-    print("Controls:")
-    print("  - LEFT hand move: WASDQE")
-    print("  - RIGHT hand move: TFGHRY")
-    print("  - Settings hand select: Left/Right arrows")
-    print("  - Selected-hand controls: IJKLUO rotate, SPACE draw, C clear, V calibrate, 1-0 channel")
-    print("  - MIDI Octave: Up/Down arrows to shift octave.")
-    print("  - Chords: Z toggles chord mode, X cycles chord type.")
-    
-    visualizer = DualHandDebugVisualizer(glove_pair)
-    
-    app.run()
-
-    print("Dual-Hand Debug Visualizer closed.")
+    run_current_architecture_debugger()
 
 if __name__ == "__main__":
     main()
