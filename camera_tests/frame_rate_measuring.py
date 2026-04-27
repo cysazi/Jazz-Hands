@@ -53,7 +53,7 @@ def process_frame(frame):
     edges = cv2.Canny(blur, 50, 100)
 
     # Threshold bright regions
-    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY)
 
     return gray, blur, edges, thresh
 
