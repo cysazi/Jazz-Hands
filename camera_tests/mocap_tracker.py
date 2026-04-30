@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import platform
 import time
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -38,31 +37,45 @@ except ImportError:  # Keep --help and py_compile usable without OpenCV installe
     cv2 = None
 
 
-DEFAULT_CAMERA_IDS = [1, 2, 3, 4]
+# Default to the three physical mocap cameras currently used for testing.
+DEFAULT_CAMERA_IDS = [1, 2, 3]
+FOUR_CAMERA_IDS = [1, 2, 3, 4]
 DEFAULT_FRAME_WIDTH = 1280
 DEFAULT_FRAME_HEIGHT = 800
 DEFAULT_FPS = 60
 DEFAULT_FOCAL_LENGTH_PX = 850.0
-DEFAULT_ROOM_BOUNDS = ((-3.0, 3.0), (-3.0, 3.0), (0.0, 3.0))
+DEFAULT_ROOM_BOUNDS = ((-5.0, 5.0), (-5.0, 5.0), (-5.0, 5.0))
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().with_name("mocap_calibration.json")
+DEFAULT_TRACK_MEMORY_PIXEL_DISTANCE = 90.0
+DEFAULT_MAX_MISSING_FRAMES = 120
+DEFAULT_THRESHOLD = 205
+DEFAULT_EXPOSURE = -8
+DEFAULT_GAIN = 0.0
+DEFAULT_AUTOFOCUS = 0.0
+CONTROLS_WINDOW = "Mocap Controls"
+DEFAULT_AUTO_EXPOSURE_BY_CAMERA = {
+    1: 0.25,
+    2: 0.0,
+    3: 0.0,
+}
 
 
 @dataclass(slots=True)
 class DetectionSettings:
     threshold: int | None = None
     threshold_percentile: float = 99.75
-    min_threshold: int = 170
-    min_area: float = 8.0
-    max_area: float = 2500.0
-    min_radius_px: float = 2.0
-    max_radius_px: float = 45.0
-    min_circularity: float = 0.55
-    min_fill_ratio: float = 0.40
-    max_aspect_ratio: float = 1.8
+    min_threshold: int = 150
+    min_area: float = 5.0
+    max_area: float = 4500.0
+    min_radius_px: float = 1.5
+    max_radius_px: float = 80.0
+    min_circularity: float = 0.30
+    min_fill_ratio: float = 0.20
+    max_aspect_ratio: float = 3.0
     min_brightness: float = 0.0
     blur_kernel: int = 3
     morphology_kernel: int = 3
-    max_markers_per_camera: int = 8
+    max_markers_per_camera: int = 12
 
 
 @dataclass(slots=True)
@@ -325,7 +338,7 @@ class MarkerTracker:
         self,
         max_match_distance_m: float = 0.35,
         smoothing: float = 0.65,
-        max_missing_frames: int = 15,
+        max_missing_frames: int = DEFAULT_MAX_MISSING_FRAMES,
     ):
         self.max_match_distance_m = max_match_distance_m
         self.smoothing = float(np.clip(smoothing, 0.0, 1.0))
@@ -360,7 +373,6 @@ class MarkerTracker:
                 continue
             track.missing_frames += 1
             track.confidence *= 0.85
-            track.observations = []
 
         for measurement_index, measurement in enumerate(measurements):
             if measurement_index in used_measurements:
@@ -409,21 +421,20 @@ class CameraSource:
         height: int,
         fps: int,
         exposure: float | None,
+        auto_exposure: float | None,
+        gain: float | None,
     ):
         self.camera_id = camera_id
         self.width = width
         self.height = height
         self.fps = fps
         self.exposure = exposure
+        self.auto_exposure = auto_exposure
+        self.gain = gain
         self.capture = None
 
     def open(self) -> bool:
-        backend = cv2.CAP_DSHOW if platform.system() == "Windows" else 0
-        capture = cv2.VideoCapture(self.camera_id, backend)
-        if not capture.isOpened():
-            capture.release()
-            capture = cv2.VideoCapture(self.camera_id)
-
+        capture = cv2.VideoCapture(self.camera_id)
         if not capture.isOpened():
             capture.release()
             return False
@@ -457,14 +468,14 @@ class CameraSource:
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.capture.set(cv2.CAP_PROP_FPS, self.fps)
+        self.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
 
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        self.capture.set(cv2.CAP_PROP_FOURCC, fourcc)
-
+        if self.auto_exposure is not None:
+            self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(self.auto_exposure))
         if self.exposure is not None:
-            # On many UVC cameras/OpenCV backends, 0.25 means manual exposure.
-            self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
             self.capture.set(cv2.CAP_PROP_EXPOSURE, float(self.exposure))
+        if self.gain is not None:
+            self.capture.set(cv2.CAP_PROP_GAIN, float(self.gain))
 
 
 def triangulate_two_views(
@@ -720,10 +731,25 @@ def open_available_cameras(
     height: int,
     fps: int,
     exposure: float | None,
+    auto_exposure: float | None,
+    gain: float | None,
 ) -> list[CameraSource]:
     sources: list[CameraSource] = []
     for camera_id in camera_ids:
-        source = CameraSource(camera_id, width, height, fps, exposure)
+        manual_auto_exposure = (
+            float(auto_exposure)
+            if auto_exposure is not None
+            else DEFAULT_AUTO_EXPOSURE_BY_CAMERA.get(camera_id, 0.0)
+        )
+        source = CameraSource(
+            camera_id,
+            width,
+            height,
+            fps,
+            exposure,
+            manual_auto_exposure,
+            gain,
+        )
         if source.open():
             sources.append(source)
             print(f"[mocap] camera {camera_id} opened")
@@ -732,46 +758,248 @@ def open_available_cameras(
     return sources
 
 
+def lock_observations_to_existing_tracks(
+    frames: dict[int, np.ndarray],
+    observations_by_camera: dict[int, list[MarkerObservation]],
+    tracks: list[MarkerTrack],
+    settings: DetectionSettings,
+    box_radius_px: float,
+    timestamp: float,
+) -> None:
+    used_observation_ids_by_camera: dict[int, set[int]] = {
+        camera_id: set() for camera_id in frames
+    }
+
+    for track in tracks:
+        if not track.observations:
+            continue
+
+        for previous_observation in list(track.observations):
+            camera_id = previous_observation.camera_id
+            frame = frames.get(camera_id)
+            if frame is None:
+                continue
+
+            used_ids = used_observation_ids_by_camera.setdefault(camera_id, set())
+            camera_observations = observations_by_camera.setdefault(camera_id, [])
+            observation = nearest_observation(
+                previous_observation.pixel,
+                camera_observations,
+                used_ids,
+                box_radius_px,
+            )
+
+            if observation is None:
+                observation = detect_blob_inside_box(
+                    frame,
+                    previous_observation,
+                    settings,
+                    box_radius_px,
+                    timestamp,
+                )
+                if observation is not None:
+                    camera_observations.insert(0, observation)
+
+            if observation is None:
+                continue
+
+            used_ids.add(id(observation))
+            remember_track_observation(track, camera_id, observation)
+
+
+def detect_blob_inside_box(
+    frame: np.ndarray,
+    previous_observation: MarkerObservation,
+    settings: DetectionSettings,
+    box_radius_px: float,
+    timestamp: float,
+) -> MarkerObservation | None:
+    gray = frame if len(frame.shape) == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    processed = preprocess_gray(gray, settings.blur_kernel)
+    threshold = choose_threshold(processed, settings)
+    _ok, mask = cv2.threshold(processed, threshold, 255, cv2.THRESH_BINARY)
+
+    x_center, y_center = previous_observation.pixel
+    height, width = mask.shape[:2]
+    x_min = max(0, int(round(x_center - box_radius_px)))
+    x_max = min(width, int(round(x_center + box_radius_px)))
+    y_min = max(0, int(round(y_center - box_radius_px)))
+    y_max = min(height, int(round(y_center + box_radius_px)))
+    if x_max <= x_min or y_max <= y_min:
+        return None
+
+    roi_mask = mask[y_min:y_max, x_min:x_max]
+    contours, _hierarchy = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_observation: MarkerObservation | None = None
+    best_score = float("inf")
+
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < 1.0 or area > settings.max_area * 4.0:
+            continue
+
+        (x, y), radius = cv2.minEnclosingCircle(contour)
+        if radius <= 0.0 or radius > settings.max_radius_px * 2.0:
+            continue
+
+        moments = cv2.moments(contour)
+        if abs(moments["m00"]) <= 1e-6:
+            pixel = np.array([x + x_min, y + y_min], dtype=np.float64)
+        else:
+            pixel = np.array(
+                [
+                    moments["m10"] / moments["m00"] + x_min,
+                    moments["m01"] / moments["m00"] + y_min,
+                ],
+                dtype=np.float64,
+            )
+
+        distance = float(np.linalg.norm(pixel - previous_observation.pixel))
+        if distance > box_radius_px:
+            continue
+
+        contour_mask = np.zeros(roi_mask.shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        roi_gray = gray[y_min:y_max, x_min:x_max]
+        brightness = float(cv2.mean(roi_gray, mask=contour_mask)[0])
+        score = distance - 0.01 * brightness
+
+        if score < best_score:
+            best_score = score
+            best_observation = MarkerObservation(
+                camera_id=previous_observation.camera_id,
+                pixel=pixel,
+                radius_px=float(radius),
+                area_px=area,
+                circularity=previous_observation.circularity,
+                brightness=brightness,
+                score=float(brightness * max(area, 1.0)),
+                timestamp=timestamp,
+            )
+
+    return best_observation
+
+
+def preprocess_gray(gray: np.ndarray, blur_kernel: int) -> np.ndarray:
+    if blur_kernel <= 1:
+        return gray
+    blur_kernel = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
+    return cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+
+
+def choose_threshold(gray: np.ndarray, settings: DetectionSettings) -> int:
+    if settings.threshold is not None:
+        return int(np.clip(settings.threshold, 0, 255))
+    percentile_value = float(np.percentile(gray, settings.threshold_percentile))
+    threshold = max(settings.min_threshold, int(percentile_value))
+    return int(np.clip(threshold, 0, 255))
+
+
+def threshold_mask(frame: np.ndarray, settings: DetectionSettings) -> np.ndarray:
+    gray = frame if len(frame.shape) == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    processed = preprocess_gray(gray, settings.blur_kernel)
+    threshold = choose_threshold(processed, settings)
+    _ok, mask = cv2.threshold(processed, threshold, 255, cv2.THRESH_BINARY)
+
+    kernel_size = settings.morphology_kernel
+    if kernel_size > 1:
+        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    return mask
+
+
+def setup_mocap_controls(args: argparse.Namespace) -> None:
+    cv2.namedWindow(CONTROLS_WINDOW)
+    threshold = args.threshold if args.threshold is not None else DEFAULT_THRESHOLD
+    exposure = args.exposure if args.exposure is not None else DEFAULT_EXPOSURE
+    gain = args.gain if args.gain is not None else DEFAULT_GAIN
+
+    cv2.createTrackbar("threshold", CONTROLS_WINDOW, int(threshold), 255, lambda _value: None)
+    cv2.createTrackbar("exposure -x", CONTROLS_WINDOW, abs(int(exposure)), 20, lambda _value: None)
+    cv2.createTrackbar("gain", CONTROLS_WINDOW, int(gain), 100, lambda _value: None)
+
+
+def apply_mocap_controls(
+    sources: list[CameraSource],
+    settings: DetectionSettings,
+    last_applied: dict[int, tuple[float, float, float]],
+) -> None:
+    settings.threshold = cv2.getTrackbarPos("threshold", CONTROLS_WINDOW)
+    exposure = -max(1, cv2.getTrackbarPos("exposure -x", CONTROLS_WINDOW))
+    gain = cv2.getTrackbarPos("gain", CONTROLS_WINDOW)
+
+    for source in sources:
+        if source.capture is None:
+            continue
+
+        auto_exposure = (
+            float(source.auto_exposure)
+            if source.auto_exposure is not None
+            else DEFAULT_AUTO_EXPOSURE_BY_CAMERA.get(source.camera_id, 0.0)
+        )
+        current = (auto_exposure, float(exposure), float(gain))
+        if last_applied.get(source.camera_id) == current:
+            continue
+
+        source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, auto_exposure)
+        source.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
+        source.capture.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
+        source.capture.set(cv2.CAP_PROP_GAIN, float(gain))
+        source.exposure = float(exposure)
+        source.gain = float(gain)
+        last_applied[source.camera_id] = current
+        print(
+            f"[mocap] camera {source.camera_id} settings | "
+            f"threshold={settings.threshold} "
+            f"auto_exposure={source.capture.get(cv2.CAP_PROP_AUTO_EXPOSURE):.2f} "
+            f"autofocus={source.capture.get(cv2.CAP_PROP_AUTOFOCUS):.2f} "
+            f"exposure={source.capture.get(cv2.CAP_PROP_EXPOSURE):.2f} "
+            f"gain={source.capture.get(cv2.CAP_PROP_GAIN):.2f}"
+        )
+
+
 def draw_preview(
     frame: np.ndarray,
     observations: list[MarkerObservation],
     tracks: list[MarkerTrack],
     camera_id: int,
+    track_memory_distance_px: float,
 ) -> np.ndarray:
     preview = frame.copy()
     used_observation_ids: set[int] = set()
 
     for track in tracks:
-        if track.missing_frames != 0:
+        observation = observation_for_track(
+            track,
+            observations,
+            camera_id,
+            used_observation_ids,
+            track_memory_distance_px,
+        )
+        if observation is None:
             continue
-        for observation in track.observations:
-            if observation.camera_id != camera_id:
-                continue
-            used_observation_ids.add(id(observation))
-            center = tuple(int(round(value)) for value in observation.pixel)
-            radius = max(3, int(round(observation.radius_px)))
-            cv2.circle(preview, center, radius, (0, 255, 0), 2)
-            cv2.putText(
-                preview,
-                f"id {track.track_id}",
-                (center[0] + 8, center[1] - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
 
-    for observation in observations:
-        if id(observation) in used_observation_ids:
-            continue
+        used_observation_ids.add(id(observation))
         center = tuple(int(round(value)) for value in observation.pixel)
         radius = max(3, int(round(observation.radius_px)))
-        cv2.circle(preview, center, radius, (0, 200, 255), 1)
+        cv2.circle(preview, center, radius, (0, 255, 0), 2)
+        cv2.putText(
+            preview,
+            f"id {track.track_id}",
+            (center[0] + 8, center[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
 
     cv2.putText(
         preview,
-        f"camera {camera_id} | blobs {len(observations)}",
+        f"camera {camera_id} | tracked blobs only",
         (12, 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -782,10 +1010,76 @@ def draw_preview(
     return preview
 
 
+def observation_for_track(
+    track: MarkerTrack,
+    observations: list[MarkerObservation],
+    camera_id: int,
+    used_observation_ids: set[int],
+    track_memory_distance_px: float,
+) -> MarkerObservation | None:
+    current_track_observation = next(
+        (
+            observation
+            for observation in track.observations
+            if observation.camera_id == camera_id and id(observation) not in used_observation_ids
+        ),
+        None,
+    )
+    if track.missing_frames == 0 or current_track_observation is None:
+        return current_track_observation
+
+    nearest = nearest_observation(
+        current_track_observation.pixel,
+        observations,
+        used_observation_ids,
+        track_memory_distance_px,
+    )
+    if nearest is None:
+        return None
+
+    remember_track_observation(track, camera_id, nearest)
+    return nearest
+
+
+def nearest_observation(
+    pixel: np.ndarray,
+    observations: list[MarkerObservation],
+    used_observation_ids: set[int],
+    max_distance_px: float,
+) -> MarkerObservation | None:
+    best_observation: MarkerObservation | None = None
+    best_distance = float("inf")
+
+    for observation in observations:
+        if id(observation) in used_observation_ids:
+            continue
+        distance = float(np.linalg.norm(observation.pixel - pixel))
+        if distance < best_distance:
+            best_observation = observation
+            best_distance = distance
+
+    if best_distance <= max_distance_px:
+        return best_observation
+    return None
+
+
+def remember_track_observation(
+    track: MarkerTrack,
+    camera_id: int,
+    observation: MarkerObservation,
+) -> None:
+    for index, existing in enumerate(track.observations):
+        if existing.camera_id == camera_id:
+            track.observations[index] = observation
+            return
+    track.observations.append(observation)
+
+
 def print_status(
     tracks: list[MarkerTrack],
     observations_by_camera: dict[int, list[MarkerObservation]],
     calibrated_camera_count: int,
+    triangulator: MultiCameraTriangulator,
 ) -> None:
     blob_counts = ", ".join(
         f"cam {camera_id}: {len(observations)}"
@@ -796,6 +1090,14 @@ def print_status(
 
     if not live_tracks:
         print("[mocap] no 3D tracks yet")
+        diagnostics = triangulation_diagnostics(
+            observations_by_camera,
+            triangulator.calibrations,
+            triangulator.room_bounds,
+            triangulator.max_pair_error_px,
+        )
+        for line in diagnostics:
+            print(line)
         return
 
     for track in live_tracks:
@@ -808,6 +1110,51 @@ def print_status(
             f"cams={cameras} err={track.reprojection_error_px:.1f}px "
             f"conf={track.confidence:.2f}"
         )
+
+
+def triangulation_diagnostics(
+    observations_by_camera: dict[int, list[MarkerObservation]],
+    calibrations: dict[int, CameraCalibration],
+    room_bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
+    max_pair_error_px: float,
+) -> list[str]:
+    calibrated_camera_ids = [
+        camera_id
+        for camera_id, observations in sorted(observations_by_camera.items())
+        if observations and camera_id in calibrations
+    ]
+    if len(calibrated_camera_ids) < 2:
+        return ["[mocap] triangulation: need blobs in at least two calibrated cameras"]
+
+    lines: list[str] = []
+    for camera_a, camera_b in combinations(calibrated_camera_ids, 2):
+        obs_a = observations_by_camera[camera_a][0]
+        obs_b = observations_by_camera[camera_b][0]
+        point = triangulate_two_views(
+            obs_a,
+            obs_b,
+            calibrations[camera_a],
+            calibrations[camera_b],
+        )
+        if point is None:
+            lines.append(f"[mocap] pair {camera_a}-{camera_b}: triangulation failed")
+            continue
+
+        in_bounds = point_is_inside_bounds(point, room_bounds)
+        error = mean_reprojection_error(point, [obs_a, obs_b], calibrations)
+        x, y, z = point
+        reason = "accepted"
+        if not in_bounds:
+            reason = "rejected by room bounds"
+        elif error > max_pair_error_px:
+            reason = f"rejected by reprojection error > {max_pair_error_px:.1f}px"
+
+        lines.append(
+            "[mocap] "
+            f"pair {camera_a}-{camera_b}: {reason}; "
+            f"point=({x:+.3f},{y:+.3f},{z:+.3f})m err={error:.1f}px"
+        )
+    return lines[:3]
 
 
 def parse_camera_ids(text: str) -> list[int]:
@@ -834,7 +1181,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--cameras",
         type=parse_camera_ids,
         default=DEFAULT_CAMERA_IDS,
-        help="Comma-separated OpenCV camera indexes to try. Default: 1,2,3,4",
+        help=(
+            "Comma-separated OpenCV camera indexes to try. Default: 1,2,3. "
+            "Use 1,2,3,4 for the full rig."
+        ),
     )
     parser.add_argument("--width", type=int, default=DEFAULT_FRAME_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_FRAME_HEIGHT)
@@ -842,9 +1192,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--exposure",
         type=float,
-        default=None,
+        default=DEFAULT_EXPOSURE,
         help="Optional manual camera exposure value. Backend-specific.",
     )
+    parser.add_argument(
+        "--auto-exposure",
+        type=float,
+        default=None,
+        help=(
+            "Override auto-exposure value for every camera. Default uses per-camera "
+            "manual values: camera 1 -> 0.25, camera 2 -> 0.0, camera 3 -> 0.0."
+        ),
+    )
+    parser.add_argument("--gain", type=float, default=DEFAULT_GAIN)
     parser.add_argument(
         "--calibration",
         default=str(DEFAULT_CALIBRATION_PATH),
@@ -858,21 +1218,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--room-bounds",
         type=parse_room_bounds,
         default=DEFAULT_ROOM_BOUNDS,
-        help="xmin,xmax,ymin,ymax,zmin,zmax in meters. Default: -3,3,-3,3,0,3",
+        help="xmin,xmax,ymin,ymax,zmin,zmax in meters. Default: -5,5,-5,5,-5,5",
     )
     parser.add_argument("--threshold", type=int, default=None)
-    parser.add_argument("--min-area", type=float, default=8.0)
-    parser.add_argument("--max-area", type=float, default=2500.0)
-    parser.add_argument("--min-radius", type=float, default=2.0)
-    parser.add_argument("--max-radius", type=float, default=45.0)
-    parser.add_argument("--min-circularity", type=float, default=0.55)
-    parser.add_argument("--min-fill-ratio", type=float, default=0.40)
-    parser.add_argument("--max-aspect-ratio", type=float, default=1.8)
+    parser.add_argument("--min-area", type=float, default=5.0)
+    parser.add_argument("--max-area", type=float, default=4500.0)
+    parser.add_argument("--min-radius", type=float, default=1.5)
+    parser.add_argument("--max-radius", type=float, default=80.0)
+    parser.add_argument("--min-circularity", type=float, default=0.30)
+    parser.add_argument("--min-fill-ratio", type=float, default=0.20)
+    parser.add_argument("--max-aspect-ratio", type=float, default=3.0)
     parser.add_argument("--min-brightness", type=float, default=0.0)
-    parser.add_argument("--max-markers-per-camera", type=int, default=8)
-    parser.add_argument("--max-reprojection-error", type=float, default=14.0)
-    parser.add_argument("--cluster-distance", type=float, default=0.20)
-    parser.add_argument("--track-distance", type=float, default=0.35)
+    parser.add_argument("--max-markers-per-camera", type=int, default=12)
+    parser.add_argument("--max-reprojection-error", type=float, default=45.0)
+    parser.add_argument("--cluster-distance", type=float, default=0.45)
+    parser.add_argument("--track-distance", type=float, default=0.75)
+    parser.add_argument(
+        "--max-missing-frames",
+        type=int,
+        default=DEFAULT_MAX_MISSING_FRAMES,
+        help="How long to keep a locked track alive without a fresh 3D triangulation.",
+    )
+    parser.add_argument(
+        "--track-memory-pixels",
+        type=float,
+        default=DEFAULT_TRACK_MEMORY_PIXEL_DISTANCE,
+        help=(
+            "If a 3D track briefly disappears, draw a nearby 2D blob in the same "
+            "camera as that same green tracked blob."
+        ),
+    )
     parser.add_argument("--print-interval", type=float, default=0.25)
     parser.add_argument("--no-preview", action="store_true")
     return parser
@@ -928,6 +1303,8 @@ def main() -> int:
         args.height,
         args.fps,
         args.exposure,
+        args.auto_exposure,
+        args.gain,
     )
     if not sources:
         print("[mocap] no cameras opened")
@@ -948,9 +1325,15 @@ def main() -> int:
         cluster_distance_m=args.cluster_distance,
         room_bounds=args.room_bounds,
     )
-    tracker = MarkerTracker(max_match_distance_m=args.track_distance)
+    tracker = MarkerTracker(
+        max_match_distance_m=args.track_distance,
+        max_missing_frames=args.max_missing_frames,
+    )
 
     show_preview = not args.no_preview
+    last_applied_camera_settings: dict[int, tuple[float, float, float]] = {}
+    if show_preview:
+        setup_mocap_controls(args)
     last_print_time = 0.0
 
     try:
@@ -958,6 +1341,8 @@ def main() -> int:
             timestamp = time.time()
             frames: dict[int, np.ndarray] = {}
             observations_by_camera: dict[int, list[MarkerObservation]] = {}
+            if show_preview:
+                apply_mocap_controls(sources, settings, last_applied_camera_settings)
 
             for source in sources:
                 ok, frame = source.read()
@@ -972,6 +1357,14 @@ def main() -> int:
                     timestamp,
                 )
 
+            lock_observations_to_existing_tracks(
+                frames,
+                observations_by_camera,
+                tracker.tracks,
+                settings,
+                args.track_memory_pixels,
+                timestamp,
+            )
             measurements = triangulator.triangulate(observations_by_camera)
             tracks = tracker.update(measurements, timestamp)
 
@@ -981,6 +1374,7 @@ def main() -> int:
                     tracks,
                     observations_by_camera,
                     calibrated_camera_count=len(calibrated_connected_ids),
+                    triangulator=triangulator,
                 )
 
             if show_preview:
@@ -990,8 +1384,10 @@ def main() -> int:
                         observations_by_camera.get(camera_id, []),
                         tracks,
                         camera_id,
+                        args.track_memory_pixels,
                     )
                     cv2.imshow(f"mocap camera {camera_id}", preview)
+                    cv2.imshow(f"mocap binary camera {camera_id}", threshold_mask(frame, settings))
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):

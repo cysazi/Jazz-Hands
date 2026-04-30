@@ -4,6 +4,7 @@ import cv2
 # Use 0, 1, or 2 to find the correct device node
 camera_index = 1
 cap = cv2.VideoCapture(camera_index)
+cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
 
 # On some macOS versions, explicitly set the backend
 # cap = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)

@@ -9,6 +9,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 800)
 cap.set(cv2.CAP_PROP_FPS, 120)
 cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
+cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
 cap.set(cv2.CAP_PROP_EXPOSURE, -10)
 cap.set(cv2.CAP_PROP_GAIN, 0)
 

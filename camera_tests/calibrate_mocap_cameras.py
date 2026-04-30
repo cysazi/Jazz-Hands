@@ -38,11 +38,21 @@ import mocap_tracker as mocap
 cv2 = mocap.cv2
 
 CM_TO_M = 0.01
-DEFAULT_CAMERA_IDS = mocap.DEFAULT_CAMERA_IDS
+# Default to the three physical mocap cameras currently used for testing.
+DEFAULT_CAMERA_IDS = [1, 2, 3]
+FOUR_CAMERA_IDS = [1, 2, 3, 4]
 DEFAULT_FRAME_WIDTH = 1280
 DEFAULT_FRAME_HEIGHT = 800
 DEFAULT_FPS = 120
 DEFAULT_OUTPUT_PATH = str(Path(__file__).resolve().with_name("mocap_calibration.json"))
+PREVIEW_SCALE = 0.5
+CONTROLS_WINDOW = "Calibration Controls"
+POSE_SOLVE_INTERVAL_SECONDS = 0.20
+DEFAULT_AUTO_EXPOSURE_BY_CAMERA = {
+    1: 0.25,
+    2: 0.0,
+    3: 0.0,
+}
 
 CARBON_RADIUS_CM = 2.2 / 2.0
 SMALL_ATOM_RADIUS_CM = 1.6 / 2.0
@@ -75,6 +85,7 @@ class PoseEstimate:
     rotation: np.ndarray
     position: np.ndarray
     assignment: dict[str, mocap.MarkerObservation]
+    marker_count: int
     reprojection_error_px: float
     size_error: float
     score: float
@@ -118,8 +129,11 @@ def solve_camera_pose(
     dist_coeffs: np.ndarray,
     max_reprojection_error_px: float,
     size_weight: float,
+    min_pose_markers: int,
+    max_pose_candidates: int,
 ) -> PoseEstimate | None:
-    if len(observations) < 4:
+    min_pose_markers = int(np.clip(min_pose_markers, 3, 4))
+    if len(observations) < min_pose_markers:
         return None
 
     object_points_by_label = {
@@ -128,43 +142,53 @@ def solve_camera_pose(
     }
     best: PoseEstimate | None = None
 
-    candidate_observations = observations[: min(len(observations), 8)]
-    for observation_group in combinations(candidate_observations, 4):
-        for ordered_observations in permutations(observation_group, 4):
-            assignment = {
-                label: observation
-                for label, observation in zip(TARGET_POINT_LABELS, ordered_observations)
-            }
-            object_points = np.asarray(
-                [object_points_by_label[label] for label in TARGET_POINT_LABELS],
-                dtype=np.float64,
-            )
-            image_points = np.asarray(
-                [assignment[label].pixel for label in TARGET_POINT_LABELS],
-                dtype=np.float64,
-            )
+    max_pose_candidates = max(min_pose_markers, max_pose_candidates)
+    candidate_observations = observations[: min(len(observations), max_pose_candidates)]
+    marker_counts = [4, 3] if min_pose_markers <= 3 else [4]
+    for marker_count in marker_counts:
+        if len(candidate_observations) < marker_count:
+            continue
+        for target_labels in combinations(TARGET_POINT_LABELS, marker_count):
+            for observation_group in combinations(candidate_observations, marker_count):
+                for ordered_observations in permutations(observation_group, marker_count):
+                    assignment = {
+                        label: observation
+                        for label, observation in zip(target_labels, ordered_observations)
+                    }
+                    object_points = np.asarray(
+                        [object_points_by_label[label] for label in target_labels],
+                        dtype=np.float64,
+                    )
+                    image_points = np.asarray(
+                        [assignment[label].pixel for label in target_labels],
+                        dtype=np.float64,
+                    )
 
-            estimate = solve_pnp_candidate(
-                camera_id,
-                object_points,
-                image_points,
-                assignment,
-                intrinsic,
-                dist_coeffs,
-                size_weight,
-            )
-            if estimate is None:
-                continue
-            if estimate.reprojection_error_px > max_reprojection_error_px:
-                continue
-            if best is None or estimate.score < best.score:
-                best = estimate
+                    estimate = solve_pnp_candidate(
+                        camera_id,
+                        list(target_labels),
+                        object_points,
+                        image_points,
+                        assignment,
+                        intrinsic,
+                        dist_coeffs,
+                        size_weight,
+                    )
+                    if estimate is None:
+                        continue
+                    if estimate.reprojection_error_px > max_reprojection_error_px:
+                        continue
+
+                    estimate.score += 2.0 * (4 - marker_count)
+                    if best is None or estimate.score < best.score:
+                        best = estimate
 
     return best
 
 
 def solve_pnp_candidate(
     camera_id: int,
+    labels: list[str],
     object_points: np.ndarray,
     image_points: np.ndarray,
     assignment: dict[str, mocap.MarkerObservation],
@@ -173,31 +197,35 @@ def solve_pnp_candidate(
     size_weight: float,
 ) -> PoseEstimate | None:
     pnp_flag = getattr(cv2, "SOLVEPNP_SQPNP", cv2.SOLVEPNP_EPNP)
-    ok, rvec, tvec = cv2.solvePnP(
-        object_points,
-        image_points,
-        intrinsic,
-        dist_coeffs,
-        flags=pnp_flag,
-    )
-    if not ok:
-        return None
-
     try:
-        ok_refined, rvec_refined, tvec_refined = cv2.solvePnP(
+        ok, rvec, tvec = cv2.solvePnP(
             object_points,
             image_points,
             intrinsic,
             dist_coeffs,
-            rvec=rvec,
-            tvec=tvec,
-            useExtrinsicGuess=True,
-            flags=cv2.SOLVEPNP_ITERATIVE,
+            flags=pnp_flag,
         )
-        if ok_refined:
-            rvec, tvec = rvec_refined, tvec_refined
     except cv2.error:
-        pass
+        return None
+    if not ok:
+        return None
+
+    if len(object_points) >= 4:
+        try:
+            ok_refined, rvec_refined, tvec_refined = cv2.solvePnP(
+                object_points,
+                image_points,
+                intrinsic,
+                dist_coeffs,
+                rvec=rvec,
+                tvec=tvec,
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if ok_refined:
+                rvec, tvec = rvec_refined, tvec_refined
+        except cv2.error:
+            pass
 
     rotation, _jacobian = cv2.Rodrigues(rvec)
     camera_points = (rotation @ object_points.T).T + tvec.reshape(1, 3)
@@ -216,7 +244,7 @@ def solve_pnp_candidate(
         np.mean(np.linalg.norm(projected_points - image_points, axis=1))
     )
 
-    size_error = estimate_marker_size_error(assignment, camera_points)
+    size_error = estimate_marker_size_error(labels, assignment, camera_points)
     position = (-rotation.T @ tvec.reshape(3)).astype(np.float64)
     score = reprojection_error + size_weight * size_error
 
@@ -227,6 +255,7 @@ def solve_pnp_candidate(
         rotation=rotation.astype(np.float64),
         position=position,
         assignment=assignment,
+        marker_count=len(labels),
         reprojection_error_px=reprojection_error,
         size_error=size_error,
         score=float(score),
@@ -234,17 +263,18 @@ def solve_pnp_candidate(
 
 
 def estimate_marker_size_error(
+    labels: list[str],
     assignment: dict[str, mocap.MarkerObservation],
     camera_points: np.ndarray,
 ) -> float:
     observed = np.asarray(
-        [assignment[label].radius_px for label in TARGET_POINT_LABELS],
+        [assignment[label].radius_px for label in labels],
         dtype=np.float64,
     )
     expected = np.asarray(
         [
             TARGET_MARKER_RADII_M[label] / max(float(camera_points[index, 2]), 1e-6)
-            for index, label in enumerate(TARGET_POINT_LABELS)
+            for index, label in enumerate(labels)
         ],
         dtype=np.float64,
     )
@@ -266,6 +296,7 @@ def draw_estimate_overlay(
     target_points: dict[str, np.ndarray],
     intrinsic: np.ndarray,
     dist_coeffs: np.ndarray,
+    detector_settings: mocap.DetectionSettings,
     captured: bool,
 ) -> np.ndarray:
     preview = frame.copy()
@@ -276,8 +307,11 @@ def draw_estimate_overlay(
         cv2.circle(preview, center, radius, (0, 200, 255), 1)
 
     if estimate is not None:
+        estimate_labels = [
+            label for label in TARGET_POINT_LABELS if label in estimate.assignment
+        ]
         object_points = np.asarray(
-            [target_points[label] for label in TARGET_POINT_LABELS],
+            [target_points[label] for label in estimate_labels],
             dtype=np.float64,
         )
         projected, _jacobian = cv2.projectPoints(
@@ -289,7 +323,7 @@ def draw_estimate_overlay(
         )
         projected_points = projected.reshape(-1, 2)
 
-        for index, label in enumerate(TARGET_POINT_LABELS):
+        for index, label in enumerate(estimate_labels):
             observation = estimate.assignment[label]
             observed_center = tuple(int(round(value)) for value in observation.pixel)
             projected_center = tuple(int(round(value)) for value in projected_points[index])
@@ -317,7 +351,11 @@ def draw_estimate_overlay(
         )
 
     status_color = (0, 255, 0) if estimate is not None else (0, 0, 255)
-    status = "valid pose" if estimate is not None else "need 4 clean blobs"
+    status = (
+        f"valid pose ({estimate.marker_count} markers)"
+        if estimate is not None
+        else "need 3-4 clean blobs"
+    )
     if captured:
         status += " | captured"
     cv2.putText(
@@ -341,7 +379,76 @@ def draw_estimate_overlay(
             1,
             cv2.LINE_AA,
         )
+
+    threshold_preview = build_threshold_preview(frame, observations, detector_settings)
+    return cv2.hconcat([resize_preview(preview), resize_preview(threshold_preview)])
+
+
+def resize_preview(frame: np.ndarray) -> np.ndarray:
+    return cv2.resize(
+        frame,
+        None,
+        fx=PREVIEW_SCALE,
+        fy=PREVIEW_SCALE,
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def build_threshold_preview(
+    frame: np.ndarray,
+    observations: list[mocap.MarkerObservation],
+    settings: mocap.DetectionSettings,
+) -> np.ndarray:
+    mask = threshold_mask(frame, settings)
+    preview = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    for index, observation in enumerate(observations, start=1):
+        center = tuple(int(round(value)) for value in observation.pixel)
+        radius = max(3, int(round(observation.radius_px)))
+        cv2.circle(preview, center, radius, (0, 255, 0), 2)
+        cv2.putText(
+            preview,
+            f"{index}",
+            (center[0] + 8, center[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.putText(
+        preview,
+        f"threshold {settings.threshold}",
+        (12, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
     return preview
+
+
+def threshold_mask(frame: np.ndarray, settings: mocap.DetectionSettings) -> np.ndarray:
+    gray = frame if len(frame.shape) == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    kernel_size = settings.blur_kernel
+    if kernel_size > 1:
+        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+        gray = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+
+    threshold = settings.threshold
+    if threshold is None:
+        threshold = max(settings.min_threshold, int(np.percentile(gray, settings.threshold_percentile)))
+    _ok, mask = cv2.threshold(gray, int(np.clip(threshold, 0, 255)), 255, cv2.THRESH_BINARY)
+
+    kernel_size = settings.morphology_kernel
+    if kernel_size > 1:
+        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    return mask
 
 
 def write_calibration_json(
@@ -375,6 +482,12 @@ def write_calibration_json(
 
     for camera_id in sorted(captured_estimates):
         estimate = captured_estimates[camera_id]
+        used_labels = [
+            label for label in TARGET_POINT_LABELS if label in estimate.assignment
+        ]
+        missing_labels = [
+            label for label in TARGET_POINT_LABELS if label not in estimate.assignment
+        ]
         output["cameras"].append(
             {
                 "id": camera_id,
@@ -387,11 +500,14 @@ def write_calibration_json(
                 "tvec": estimate.tvec.reshape(3).tolist(),
                 "position": estimate.position.reshape(3).tolist(),
                 "euler_xyz_deg": rotation_matrix_to_euler_xyz_deg(estimate.rotation),
+                "marker_count": estimate.marker_count,
+                "used_target_labels": used_labels,
+                "missing_target_labels": missing_labels,
                 "reprojection_error_px": estimate.reprojection_error_px,
                 "size_error": estimate.size_error,
                 "assigned_pixels": {
                     label: estimate.assignment[label].pixel.reshape(2).tolist()
-                    for label in TARGET_POINT_LABELS
+                    for label in used_labels
                 },
             }
         )
@@ -435,12 +551,67 @@ def apply_extra_camera_settings(
     for source in sources:
         if source.capture is None:
             continue
-        if auto_exposure is not None:
-            source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(auto_exposure))
+        manual_auto_exposure = (
+            float(auto_exposure)
+            if auto_exposure is not None
+            else DEFAULT_AUTO_EXPOSURE_BY_CAMERA.get(source.camera_id, 0.0)
+        )
+        source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, manual_auto_exposure)
+        source.capture.set(cv2.CAP_PROP_AUTOFOCUS, mocap.DEFAULT_AUTOFOCUS)
         if exposure is not None:
             source.capture.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
         if gain is not None:
             source.capture.set(cv2.CAP_PROP_GAIN, float(gain))
+
+
+def setup_detection_controls(args: argparse.Namespace) -> None:
+    cv2.namedWindow(CONTROLS_WINDOW)
+    cv2.createTrackbar("threshold", CONTROLS_WINDOW, int(args.threshold), 255, lambda _value: None)
+    cv2.createTrackbar("min area", CONTROLS_WINDOW, int(args.min_area), 1000, lambda _value: None)
+    cv2.createTrackbar("max area", CONTROLS_WINDOW, int(args.max_area), 20000, lambda _value: None)
+    cv2.createTrackbar("min radius", CONTROLS_WINDOW, int(args.min_radius), 80, lambda _value: None)
+    cv2.createTrackbar("max radius", CONTROLS_WINDOW, int(args.max_radius), 180, lambda _value: None)
+    cv2.createTrackbar(
+        "min circularity %",
+        CONTROLS_WINDOW,
+        int(args.min_circularity * 100),
+        100,
+        lambda _value: None,
+    )
+    cv2.createTrackbar(
+        "min fill %",
+        CONTROLS_WINDOW,
+        int(args.min_fill_ratio * 100),
+        100,
+        lambda _value: None,
+    )
+    cv2.createTrackbar(
+        "max aspect x10",
+        CONTROLS_WINDOW,
+        int(args.max_aspect_ratio * 10),
+        60,
+        lambda _value: None,
+    )
+
+
+def update_settings_from_controls(settings: mocap.DetectionSettings) -> None:
+    settings.threshold = cv2.getTrackbarPos("threshold", CONTROLS_WINDOW)
+    settings.min_area = max(1.0, float(cv2.getTrackbarPos("min area", CONTROLS_WINDOW)))
+    settings.max_area = max(
+        settings.min_area + 1.0,
+        float(cv2.getTrackbarPos("max area", CONTROLS_WINDOW)),
+    )
+    settings.min_radius_px = max(0.0, float(cv2.getTrackbarPos("min radius", CONTROLS_WINDOW)))
+    settings.max_radius_px = max(
+        settings.min_radius_px + 1.0,
+        float(cv2.getTrackbarPos("max radius", CONTROLS_WINDOW)),
+    )
+    settings.min_circularity = cv2.getTrackbarPos("min circularity %", CONTROLS_WINDOW) / 100.0
+    settings.min_fill_ratio = cv2.getTrackbarPos("min fill %", CONTROLS_WINDOW) / 100.0
+    settings.max_aspect_ratio = max(
+        1.0,
+        cv2.getTrackbarPos("max aspect x10", CONTROLS_WINDOW) / 10.0,
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -451,14 +622,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--cameras",
         type=parse_camera_ids,
         default=DEFAULT_CAMERA_IDS,
-        help="Comma-separated OpenCV camera indexes to try. Default: 1,2,3,4",
+        help=(
+            "Comma-separated OpenCV camera indexes to try. Default: 1,2,3. "
+            "Use 1,2,3,4 for the full rig."
+        ),
     )
     parser.add_argument("--width", type=int, default=DEFAULT_FRAME_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_FRAME_HEIGHT)
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
     parser.add_argument("--focal-length-px", type=float, default=mocap.DEFAULT_FOCAL_LENGTH_PX)
-    parser.add_argument("--exposure", type=float, default=-10.0)
-    parser.add_argument("--auto-exposure", type=float, default=0.0)
+    parser.add_argument("--exposure", type=float, default=-13.0)
+    parser.add_argument(
+        "--auto-exposure",
+        type=float,
+        default=None,
+        help=(
+            "Override auto-exposure value for every camera. Default uses per-camera "
+            "manual values: camera 1 -> 0.25, camera 2 -> 0.0, camera 3 -> 0.0."
+        ),
+    )
     parser.add_argument("--gain", type=float, default=0.0)
     parser.add_argument("--threshold", type=int, default=200)
     parser.add_argument("--min-area", type=float, default=8.0)
@@ -470,6 +652,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-aspect-ratio", type=float, default=2.0)
     parser.add_argument("--min-brightness", type=float, default=0.0)
     parser.add_argument("--max-reprojection-error", type=float, default=8.0)
+    parser.add_argument(
+        "--min-pose-markers",
+        type=int,
+        default=3,
+        help="Use 3 for fallback calibration when one tetrahedron marker is hidden; 4 is stricter.",
+    )
+    parser.add_argument(
+        "--max-pose-candidates",
+        type=int,
+        default=5,
+        help="Only try this many brightest blobs for pose matching. Lower is faster.",
+    )
+    parser.add_argument(
+        "--pose-solve-interval",
+        type=float,
+        default=POSE_SOLVE_INTERVAL_SECONDS,
+        help="Seconds between expensive pose solves per camera. Preview still updates every frame.",
+    )
     parser.add_argument(
         "--size-weight",
         type=float,
@@ -513,7 +713,7 @@ def main() -> int:
         min_fill_ratio=args.min_fill_ratio,
         max_aspect_ratio=args.max_aspect_ratio,
         min_brightness=args.min_brightness,
-        max_markers_per_camera=8,
+        max_markers_per_camera=max(args.max_pose_candidates, 4),
     )
     detector = mocap.ReflectiveMarkerDetector(settings)
 
@@ -524,6 +724,8 @@ def main() -> int:
         args.height,
         args.fps,
         args.exposure,
+        args.auto_exposure,
+        args.gain,
     )
     apply_extra_camera_settings(sources, args.auto_exposure, args.exposure, args.gain)
 
@@ -535,16 +737,23 @@ def main() -> int:
     print("[calibration] press c to capture valid camera poses, s to save, q/Esc to quit")
 
     show_preview = not args.no_preview
+    if show_preview:
+        setup_detection_controls(args)
+
     captured_estimates: dict[int, PoseEstimate] = {}
     latest_estimates: dict[int, PoseEstimate] = {}
+    next_pose_solve_time_by_camera: dict[int, float] = {
+        source.camera_id: 0.0 for source in sources
+    }
     last_print_time = 0.0
 
     try:
         while True:
             timestamp = time.time()
-            latest_estimates = {}
             latest_observations: dict[int, list[mocap.MarkerObservation]] = {}
             latest_frames: dict[int, np.ndarray] = {}
+            if show_preview:
+                update_settings_from_controls(settings)
 
             for source in sources:
                 ok, frame = source.read()
@@ -555,17 +764,25 @@ def main() -> int:
                 latest_frames[source.camera_id] = frame
                 observations = detector.detect(frame, source.camera_id, timestamp)
                 latest_observations[source.camera_id] = observations
-                estimate = solve_camera_pose(
-                    source.camera_id,
-                    observations,
-                    target_points,
-                    intrinsic,
-                    dist_coeffs,
-                    args.max_reprojection_error,
-                    args.size_weight,
-                )
-                if estimate is not None:
-                    latest_estimates[source.camera_id] = estimate
+                if timestamp >= next_pose_solve_time_by_camera[source.camera_id]:
+                    next_pose_solve_time_by_camera[source.camera_id] = (
+                        timestamp + max(args.pose_solve_interval, 0.05)
+                    )
+                    estimate = solve_camera_pose(
+                        source.camera_id,
+                        observations,
+                        target_points,
+                        intrinsic,
+                        dist_coeffs,
+                        args.max_reprojection_error,
+                        args.size_weight,
+                        args.min_pose_markers,
+                        args.max_pose_candidates,
+                    )
+                    if estimate is not None:
+                        latest_estimates[source.camera_id] = estimate
+                    else:
+                        latest_estimates.pop(source.camera_id, None)
 
             if timestamp - last_print_time > 0.5:
                 last_print_time = timestamp
@@ -595,6 +812,7 @@ def main() -> int:
                         target_points,
                         intrinsic,
                         dist_coeffs,
+                        settings,
                         camera_id in captured_estimates,
                     )
                     cv2.imshow(f"calibration camera {camera_id}", preview)
@@ -674,7 +892,7 @@ def print_pose_status(
         else:
             x, y, z = estimate.position
             parts.append(
-                f"cam {camera_id}: {blob_count} blobs, "
+                f"cam {camera_id}: {blob_count} blobs, {estimate.marker_count} marker pose, "
                 f"err={estimate.reprojection_error_px:.2f}px, "
                 f"pos=({x:+.2f},{y:+.2f},{z:+.2f})m{captured}"
             )
