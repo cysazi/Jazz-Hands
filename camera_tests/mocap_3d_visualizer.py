@@ -157,19 +157,14 @@ class MocapTrailVisualizer:
         self.args = args
         self.sources = sources
         self.calibrations = calibrations
-        self.settings = mocap.DetectionSettings(
-            threshold=args.threshold,
-            min_area=args.min_area,
-            max_area=args.max_area,
-            min_radius_px=args.min_radius,
-            max_radius_px=args.max_radius,
-            min_circularity=args.min_circularity,
-            min_fill_ratio=args.min_fill_ratio,
-            max_aspect_ratio=args.max_aspect_ratio,
-            min_brightness=args.min_brightness,
-            max_markers_per_camera=args.max_markers_per_camera,
-        )
-        self.detector = mocap.ReflectiveMarkerDetector(self.settings)
+        self.settings_by_camera = {
+            source.camera_id: mocap.build_detection_settings(args, source.camera_id)
+            for source in sources
+        }
+        self.detectors = {
+            camera_id: mocap.ReflectiveMarkerDetector(settings)
+            for camera_id, settings in self.settings_by_camera.items()
+        }
         self.triangulator = mocap.MultiCameraTriangulator(
             calibrations=calibrations,
             max_pair_error_px=args.max_reprojection_error,
@@ -313,9 +308,10 @@ class MocapTrailVisualizer:
         observations_by_camera: dict[int, list[mocap.MarkerObservation]] = {}
 
         if not self.args.no_controls:
+            first_settings = next(iter(self.settings_by_camera.values()))
             mocap.apply_mocap_controls(
                 self.sources,
-                self.settings,
+                first_settings,
                 self.last_applied_camera_settings,
             )
 
@@ -325,7 +321,7 @@ class MocapTrailVisualizer:
                 observations_by_camera[source.camera_id] = []
                 continue
             frames[source.camera_id] = frame
-            observations_by_camera[source.camera_id] = self.detector.detect(
+            observations_by_camera[source.camera_id] = self.detectors[source.camera_id].detect(
                 frame,
                 source.camera_id,
                 timestamp,
@@ -335,7 +331,7 @@ class MocapTrailVisualizer:
             frames,
             observations_by_camera,
             self.tracker.tracks,
-            self.settings,
+            self.settings_by_camera,
             self.args.track_memory_pixels,
             timestamp,
         )
@@ -343,7 +339,7 @@ class MocapTrailVisualizer:
         tracks = self.tracker.update(measurements, timestamp)
 
         for track in tracks:
-            if track.missing_frames == 0:
+            if track.confirmed and track.missing_frames == 0:
                 self._ensure_trail(track.track_id).points.append(
                     (timestamp, track.position.copy())
                 )
@@ -444,7 +440,10 @@ class MocapTrailVisualizer:
                 self.args.track_memory_pixels,
             )
             mocap.cv2.imshow(f"mocap camera {camera_id}", preview)
-            mocap.cv2.imshow(f"mocap binary camera {camera_id}", mocap.threshold_mask(frame, self.settings))
+            mocap.cv2.imshow(
+                f"mocap binary camera {camera_id}",
+                mocap.threshold_mask(frame, self.settings_by_camera[camera_id]),
+            )
 
     def close(self, _event=None) -> None:
         if self.is_closed:

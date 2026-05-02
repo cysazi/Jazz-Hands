@@ -1,19 +1,23 @@
 import cv2
 import time
-from collections import deque
-
 
 # Change these if Windows assigns the cameras different indexes.
-CAMERA_INDEXES = [2]
+CAMERA_INDEXES = [1]
+
+# CAMERA_ROLES = {
+#     "vertical_1": "Vertical_plane_camera_1",
+#     "vertical_2": "Vertical_plane_camera_2",
+# }
+
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 800
 FPS = 120
 THRESHOLD = 230
 AUTOFOCUS = 0
 BLUR_KERNEL_BY_CAMERA = {
-    1: 15,
-    2: 1,
-    3: 1,
+    1: 5,
+    2: 5,
+    3: 15,
 }
 AUTO_EXPOSURE_BY_CAMERA = {
     1: 0,
@@ -30,6 +34,23 @@ GAIN_BY_CAMERA = {
     2: 0,
     3: 0,
 }
+
+
+class DeliveredFpsCounter:
+    def __init__(self):
+        self.window_start = time.perf_counter()
+        self.frames_this_window = 0
+        self.fps = 0.0
+
+    def mark_frame(self):
+        self.frames_this_window += 1
+        now = time.perf_counter()
+        elapsed = now - self.window_start
+        if elapsed >= 1.0:
+            self.fps = self.frames_this_window / elapsed
+            self.frames_this_window = 0
+            self.window_start = now
+        return self.fps
 
 
 def configure_camera(camera_index):
@@ -54,7 +75,7 @@ def apply_manual_exposure(cap, camera_index):
 def draw_fps(frame, fps):
     cv2.putText(
         frame,
-        f"FPS: {fps:.1f}",
+        f"Delivered FPS: {fps:.1f}",
         (20, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         1,
@@ -75,7 +96,7 @@ def process_frame(frame, camera_index):
 
 
 captures = {}
-frame_times = {}
+fps_counters = {}
 
 for camera_index in CAMERA_INDEXES:
     cap = configure_camera(camera_index)
@@ -85,7 +106,7 @@ for camera_index in CAMERA_INDEXES:
         continue
 
     captures[camera_index] = cap
-    frame_times[camera_index] = deque(maxlen=60)
+    fps_counters[camera_index] = DeliveredFpsCounter()
     apply_manual_exposure(cap, camera_index)
     print(
         f"Opened camera {camera_index} | "
@@ -100,23 +121,13 @@ if not captures:
     exit()
 
 while True:
-    current_time = time.time()
-
     for camera_index, cap in captures.items():
         ret, frame = cap.read()
         if not ret:
             print(f"Error: Could not read frame from camera {camera_index}")
             continue
 
-        frame_times[camera_index].append(current_time)
-        if len(frame_times[camera_index]) > 1:
-            fps = (
-                (len(frame_times[camera_index]) - 1)
-                / (frame_times[camera_index][-1] - frame_times[camera_index][0])
-            )
-        else:
-            fps = 0
-
+        fps = fps_counters[camera_index].mark_frame()
         thresh = process_frame(frame, camera_index)
         frame = draw_fps(frame, fps)
         cv2.imshow(f"Camera {camera_index} Raw", frame)

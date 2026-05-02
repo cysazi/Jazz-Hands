@@ -36,27 +36,52 @@ try:
 except ImportError:  # Keep --help and py_compile usable without OpenCV installed.
     cv2 = None
 
-
-# Default to the three physical mocap cameras currently used for testing.
-DEFAULT_CAMERA_IDS = [1, 2, 3]
+# Change this to [1, 2, 3, 4] when running the full camera rig.
+CAMERA_IDS = [1, 2]
+DEFAULT_CAMERA_IDS = CAMERA_IDS
 FOUR_CAMERA_IDS = [1, 2, 3, 4]
 DEFAULT_FRAME_WIDTH = 1280
 DEFAULT_FRAME_HEIGHT = 800
-DEFAULT_FPS = 60
+DEFAULT_FPS = 120
 DEFAULT_FOCAL_LENGTH_PX = 850.0
 DEFAULT_ROOM_BOUNDS = ((-5.0, 5.0), (-5.0, 5.0), (-5.0, 5.0))
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().with_name("mocap_calibration.json")
 DEFAULT_TRACK_MEMORY_PIXEL_DISTANCE = 90.0
 DEFAULT_MAX_MISSING_FRAMES = 120
-DEFAULT_THRESHOLD = 205
+DEFAULT_TRACK_CONFIRMATION_HITS = 3
+DEFAULT_TENTATIVE_MAX_MISSING_FRAMES = 8
+DEFAULT_DUPLICATE_TRACK_DISTANCE_M = 0.10
+DEFAULT_VELOCITY_DAMPING = 0.25
+DEFAULT_MISSING_VELOCITY_DECAY = 0.80
+DEFAULT_STATIONARY_DISTANCE_M = 0.03
+DEFAULT_MAX_PREDICTION_DT = 0.10
+DEFAULT_THRESHOLD = 230
 DEFAULT_EXPOSURE = -8
 DEFAULT_GAIN = 0.0
-DEFAULT_AUTOFOCUS = 0.0
-CONTROLS_WINDOW = "Mocap Controls"
+DEFAULT_AUTOFOCUS = 0
+BLUR_KERNEL_BY_CAMERA = {
+    1: 5,
+    2: 5,
+    3: 15,
+    4: 15,
+}
 DEFAULT_AUTO_EXPOSURE_BY_CAMERA = {
-    1: 0.25,
-    2: 0.0,
-    3: 0.0,
+    1: 0,
+    2: 0,
+    3: 0.25,
+    4: 0,
+}
+DEFAULT_EXPOSURE_BY_CAMERA = {
+    1: -8,
+    2: -8,
+    3: -8,
+    4: -8,
+}
+DEFAULT_GAIN_BY_CAMERA = {
+    1: 0,
+    2: 0,
+    3: 0,
+    4: 0,
 }
 
 
@@ -74,7 +99,7 @@ class DetectionSettings:
     max_aspect_ratio: float = 3.0
     min_brightness: float = 0.0
     blur_kernel: int = 3
-    morphology_kernel: int = 3
+    morphology_kernel: int = 1
     max_markers_per_camera: int = 12
 
 
@@ -130,6 +155,9 @@ class MarkerTrack:
     age_frames: int = 1
     missing_frames: int = 0
     confidence: float = 1.0
+    confirmed: bool = True
+    total_hits: int = 1
+    hit_streak: int = 1
 
 
 class ReflectiveMarkerDetector:
@@ -339,29 +367,43 @@ class MarkerTracker:
         max_match_distance_m: float = 0.35,
         smoothing: float = 0.65,
         max_missing_frames: int = DEFAULT_MAX_MISSING_FRAMES,
+        min_confirmed_hits: int = DEFAULT_TRACK_CONFIRMATION_HITS,
+        max_tentative_missing_frames: int = DEFAULT_TENTATIVE_MAX_MISSING_FRAMES,
+        duplicate_track_distance_m: float = DEFAULT_DUPLICATE_TRACK_DISTANCE_M,
+        velocity_damping: float = DEFAULT_VELOCITY_DAMPING,
+        missing_velocity_decay: float = DEFAULT_MISSING_VELOCITY_DECAY,
+        stationary_distance_m: float = DEFAULT_STATIONARY_DISTANCE_M,
+        max_prediction_dt: float = DEFAULT_MAX_PREDICTION_DT,
     ):
         self.max_match_distance_m = max_match_distance_m
         self.smoothing = float(np.clip(smoothing, 0.0, 1.0))
         self.max_missing_frames = max_missing_frames
+        self.min_confirmed_hits = max(1, min_confirmed_hits)
+        self.max_tentative_missing_frames = max(0, max_tentative_missing_frames)
+        self.duplicate_track_distance_m = max(0.0, duplicate_track_distance_m)
+        self.velocity_damping = float(np.clip(velocity_damping, 0.0, 1.0))
+        self.missing_velocity_decay = float(np.clip(missing_velocity_decay, 0.0, 1.0))
+        self.stationary_distance_m = max(0.0, stationary_distance_m)
+        self.max_prediction_dt = max(0.0, max_prediction_dt)
         self.tracks: list[MarkerTrack] = []
         self._next_track_id = 1
 
     def update(self, measurements: list[MarkerMeasurement], timestamp: float) -> list[MarkerTrack]:
-        possible_matches: list[tuple[float, int, int]] = []
+        possible_matches: list[tuple[float, float, int, int]] = []
 
         for track_index, track in enumerate(self.tracks):
-            dt = max(timestamp - track.last_update, 1e-3)
-            predicted = track.position + track.velocity * dt
+            predicted = self._predicted_position(track, timestamp)
             for measurement_index, measurement in enumerate(measurements):
                 distance = float(np.linalg.norm(measurement.position - predicted))
                 if distance <= self.max_match_distance_m:
-                    possible_matches.append((distance, track_index, measurement_index))
+                    match_score = distance * (0.90 if track.confirmed else 1.0)
+                    possible_matches.append((match_score, distance, track_index, measurement_index))
 
-        possible_matches.sort(key=lambda item: item[0])
+        possible_matches.sort(key=lambda item: (item[0], item[1]))
         used_tracks: set[int] = set()
         used_measurements: set[int] = set()
 
-        for _distance, track_index, measurement_index in possible_matches:
+        for _score, _distance, track_index, measurement_index in possible_matches:
             if track_index in used_tracks or measurement_index in used_measurements:
                 continue
             self._update_track(self.tracks[track_index], measurements[measurement_index], timestamp)
@@ -372,17 +414,19 @@ class MarkerTracker:
             if track_index in used_tracks:
                 continue
             track.missing_frames += 1
-            track.confidence *= 0.85
+            track.hit_streak = 0
+            track.confidence *= 0.85 if track.confirmed else 0.50
+            track.velocity *= self.missing_velocity_decay
 
         for measurement_index, measurement in enumerate(measurements):
             if measurement_index in used_measurements:
                 continue
+            if self._is_duplicate_measurement(measurement, timestamp):
+                continue
             self._add_track(measurement, timestamp)
 
-        self.tracks = [
-            track for track in self.tracks if track.missing_frames <= self.max_missing_frames
-        ]
-        self.tracks.sort(key=lambda track: track.track_id)
+        self.tracks = [track for track in self.tracks if self._should_keep_track(track)]
+        self.tracks.sort(key=self._track_sort_key)
         return self.tracks
 
     def _update_track(self, track: MarkerTrack, measurement: MarkerMeasurement, timestamp: float) -> None:
@@ -391,26 +435,83 @@ class MarkerTracker:
         smoothed_position = (
             (1.0 - self.smoothing) * track.position + self.smoothing * measurement.position
         )
+        measured_step = float(np.linalg.norm(measurement.position - old_position))
+        observed_velocity = (smoothed_position - old_position) / dt
+        if measured_step <= self.stationary_distance_m:
+            observed_velocity = np.zeros(3, dtype=np.float64)
+
         track.position = smoothed_position
-        track.velocity = (smoothed_position - old_position) / dt
+        track.velocity = (
+            (1.0 - self.velocity_damping) * track.velocity
+            + self.velocity_damping * observed_velocity
+        )
         track.observations = measurement.observations
         track.reprojection_error_px = measurement.reprojection_error_px
         track.last_update = timestamp
         track.age_frames += 1
         track.missing_frames = 0
-        track.confidence = min(1.0, track.confidence + 0.08)
+        track.total_hits += 1
+        track.hit_streak += 1
+        track.confidence = min(1.0, track.confidence + (0.08 if track.confirmed else 0.18))
+        self._maybe_confirm_track(track)
 
     def _add_track(self, measurement: MarkerMeasurement, timestamp: float) -> None:
+        confirmed = self.min_confirmed_hits <= 1
         track = MarkerTrack(
-            track_id=self._next_track_id,
+            track_id=self._allocate_track_id() if confirmed else 0,
             position=measurement.position,
             velocity=np.zeros(3, dtype=np.float64),
             observations=measurement.observations,
             reprojection_error_px=measurement.reprojection_error_px,
             last_update=timestamp,
+            confidence=1.0 if confirmed else 0.25,
+            confirmed=confirmed,
         )
-        self._next_track_id += 1
         self.tracks.append(track)
+
+    def _allocate_track_id(self) -> int:
+        track_id = self._next_track_id
+        self._next_track_id += 1
+        return track_id
+
+    def _maybe_confirm_track(self, track: MarkerTrack) -> None:
+        if track.confirmed:
+            return
+        if track.hit_streak < self.min_confirmed_hits:
+            return
+        track.track_id = self._allocate_track_id()
+        track.confirmed = True
+        track.confidence = max(track.confidence, 0.70)
+
+    def _predicted_position(self, track: MarkerTrack, timestamp: float) -> np.ndarray:
+        dt = max(timestamp - track.last_update, 0.0)
+        prediction_dt = min(dt, self.max_prediction_dt)
+        return track.position + track.velocity * prediction_dt
+
+    def _is_duplicate_measurement(
+        self,
+        measurement: MarkerMeasurement,
+        timestamp: float,
+    ) -> bool:
+        if self.duplicate_track_distance_m <= 0.0:
+            return False
+
+        for track in self.tracks:
+            predicted = self._predicted_position(track, timestamp)
+            distance = float(np.linalg.norm(measurement.position - predicted))
+            if distance <= self.duplicate_track_distance_m:
+                return True
+        return False
+
+    def _should_keep_track(self, track: MarkerTrack) -> bool:
+        if track.confirmed:
+            return track.missing_frames <= self.max_missing_frames
+        return track.missing_frames <= self.max_tentative_missing_frames
+
+    def _track_sort_key(self, track: MarkerTrack) -> tuple[bool, int, int]:
+        if track.confirmed:
+            return (False, track.track_id, -track.total_hits)
+        return (True, 0, -track.total_hits)
 
 
 class CameraSource:
@@ -423,6 +524,7 @@ class CameraSource:
         exposure: float | None,
         auto_exposure: float | None,
         gain: float | None,
+        configure_capture: bool = True,
     ):
         self.camera_id = camera_id
         self.width = width
@@ -431,7 +533,9 @@ class CameraSource:
         self.exposure = exposure
         self.auto_exposure = auto_exposure
         self.gain = gain
+        self.configure_capture = configure_capture
         self.capture = None
+        self._last_read_error_print_time = 0.0
 
     def open(self) -> bool:
         capture = cv2.VideoCapture(self.camera_id)
@@ -440,10 +544,11 @@ class CameraSource:
             return False
 
         self.capture = capture
-        self._configure_capture()
+        if self.configure_capture:
+            self._configure_capture()
 
         for _ in range(5):
-            ok, frame = self.capture.read()
+            ok, frame = self.read()
             if ok and frame is not None:
                 return True
             time.sleep(0.03)
@@ -454,7 +559,15 @@ class CameraSource:
     def read(self) -> tuple[bool, np.ndarray | None]:
         if self.capture is None:
             return False, None
-        return self.capture.read()
+        try:
+            return self.capture.read()
+        except cv2.error as error:
+            now = time.time()
+            if now - self._last_read_error_print_time >= 1.0:
+                self._last_read_error_print_time = now
+                first_line = str(error).splitlines()[0]
+                print(f"[camera {self.camera_id}] OpenCV read error skipped: {first_line}")
+            return False, None
 
     def close(self) -> None:
         if self.capture is not None:
@@ -465,17 +578,21 @@ class CameraSource:
         if self.capture is None:
             return
 
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.capture.set(cv2.CAP_PROP_FPS, self.fps)
-        self.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
+        # Camera parameters are managed by external camera software.
+        # self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        # self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        # self.capture.set(cv2.CAP_PROP_FPS, self.fps)
+        # self.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
 
         if self.auto_exposure is not None:
-            self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(self.auto_exposure))
+            # self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(self.auto_exposure))
+            pass
         if self.exposure is not None:
-            self.capture.set(cv2.CAP_PROP_EXPOSURE, float(self.exposure))
+            # self.capture.set(cv2.CAP_PROP_EXPOSURE, float(self.exposure))
+            pass
         if self.gain is not None:
-            self.capture.set(cv2.CAP_PROP_GAIN, float(self.gain))
+            # self.capture.set(cv2.CAP_PROP_GAIN, float(self.gain))
+            pass
 
 
 def triangulate_two_views(
@@ -736,33 +853,98 @@ def open_available_cameras(
 ) -> list[CameraSource]:
     sources: list[CameraSource] = []
     for camera_id in camera_ids:
-        manual_auto_exposure = (
-            float(auto_exposure)
-            if auto_exposure is not None
-            else DEFAULT_AUTO_EXPOSURE_BY_CAMERA.get(camera_id, 0.0)
-        )
         source = CameraSource(
             camera_id,
             width,
             height,
             fps,
-            exposure,
-            manual_auto_exposure,
-            gain,
+            None,
+            None,
+            None,
+            configure_capture=False,
         )
         if source.open():
+            # Camera parameters are managed by external camera software.
+            # Do not call apply_camera_settings() here.
             sources.append(source)
-            print(f"[mocap] camera {camera_id} opened")
+            print_camera_settings(source)
         else:
             print(f"[mocap] camera {camera_id} not available; continuing")
     return sources
+
+
+def camera_setting(
+    camera_id: int,
+    values_by_camera: dict[int, float],
+    override: float | None,
+    fallback: float,
+) -> float:
+    if override is not None:
+        return float(override)
+    return float(values_by_camera.get(camera_id, fallback))
+
+
+def camera_auto_exposure(camera_id: int, override: float | None) -> float:
+    return camera_setting(camera_id, DEFAULT_AUTO_EXPOSURE_BY_CAMERA, override, 0.0)
+
+
+def camera_exposure(camera_id: int, override: float | None) -> float:
+    return camera_setting(camera_id, DEFAULT_EXPOSURE_BY_CAMERA, override, DEFAULT_EXPOSURE)
+
+
+def camera_gain(camera_id: int, override: float | None) -> float:
+    return camera_setting(camera_id, DEFAULT_GAIN_BY_CAMERA, override, DEFAULT_GAIN)
+
+
+def apply_camera_settings(
+    source: CameraSource,
+    auto_exposure: float | None,
+    exposure: float | None,
+    gain: float | None,
+) -> None:
+    _ = source, auto_exposure, exposure, gain
+    # Camera parameters are managed by external camera software.
+    # source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, source.auto_exposure)
+    # source.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
+    # source.capture.set(cv2.CAP_PROP_EXPOSURE, source.exposure)
+    # source.capture.set(cv2.CAP_PROP_GAIN, source.gain)
+    return
+
+
+def print_camera_settings(source: CameraSource) -> None:
+    if source.capture is None:
+        return
+
+    print(
+        f"[mocap] opened camera {source.camera_id} | "
+        f"auto_exposure={source.capture.get(cv2.CAP_PROP_AUTO_EXPOSURE):.2f} "
+        f"autofocus={source.capture.get(cv2.CAP_PROP_AUTOFOCUS):.2f} "
+        f"exposure={source.capture.get(cv2.CAP_PROP_EXPOSURE):.2f} "
+        f"gain={source.capture.get(cv2.CAP_PROP_GAIN):.2f}"
+    )
+
+
+def build_detection_settings(args: argparse.Namespace, camera_id: int) -> DetectionSettings:
+    return DetectionSettings(
+        threshold=args.threshold,
+        min_area=args.min_area,
+        max_area=args.max_area,
+        min_radius_px=args.min_radius,
+        max_radius_px=args.max_radius,
+        min_circularity=args.min_circularity,
+        min_fill_ratio=args.min_fill_ratio,
+        max_aspect_ratio=args.max_aspect_ratio,
+        min_brightness=args.min_brightness,
+        blur_kernel=BLUR_KERNEL_BY_CAMERA.get(camera_id, 1),
+        max_markers_per_camera=args.max_markers_per_camera,
+    )
 
 
 def lock_observations_to_existing_tracks(
     frames: dict[int, np.ndarray],
     observations_by_camera: dict[int, list[MarkerObservation]],
     tracks: list[MarkerTrack],
-    settings: DetectionSettings,
+    settings: DetectionSettings | dict[int, DetectionSettings],
     box_radius_px: float,
     timestamp: float,
 ) -> None:
@@ -793,7 +975,7 @@ def lock_observations_to_existing_tracks(
                 observation = detect_blob_inside_box(
                     frame,
                     previous_observation,
-                    settings,
+                    settings_for_camera(settings, camera_id),
                     box_radius_px,
                     timestamp,
                 )
@@ -805,6 +987,18 @@ def lock_observations_to_existing_tracks(
 
             used_ids.add(id(observation))
             remember_track_observation(track, camera_id, observation)
+
+
+def settings_for_camera(
+    settings: DetectionSettings | dict[int, DetectionSettings],
+    camera_id: int,
+) -> DetectionSettings:
+    if isinstance(settings, dict):
+        camera_settings = settings.get(camera_id)
+        if camera_settings is not None:
+            return camera_settings
+        return next(iter(settings.values()))
+    return settings
 
 
 def detect_blob_inside_box(
@@ -912,14 +1106,8 @@ def threshold_mask(frame: np.ndarray, settings: DetectionSettings) -> np.ndarray
 
 
 def setup_mocap_controls(args: argparse.Namespace) -> None:
-    cv2.namedWindow(CONTROLS_WINDOW)
-    threshold = args.threshold if args.threshold is not None else DEFAULT_THRESHOLD
-    exposure = args.exposure if args.exposure is not None else DEFAULT_EXPOSURE
-    gain = args.gain if args.gain is not None else DEFAULT_GAIN
-
-    cv2.createTrackbar("threshold", CONTROLS_WINDOW, int(threshold), 255, lambda _value: None)
-    cv2.createTrackbar("exposure -x", CONTROLS_WINDOW, abs(int(exposure)), 20, lambda _value: None)
-    cv2.createTrackbar("gain", CONTROLS_WINDOW, int(gain), 100, lambda _value: None)
+    _ = args
+    return
 
 
 def apply_mocap_controls(
@@ -927,38 +1115,8 @@ def apply_mocap_controls(
     settings: DetectionSettings,
     last_applied: dict[int, tuple[float, float, float]],
 ) -> None:
-    settings.threshold = cv2.getTrackbarPos("threshold", CONTROLS_WINDOW)
-    exposure = -max(1, cv2.getTrackbarPos("exposure -x", CONTROLS_WINDOW))
-    gain = cv2.getTrackbarPos("gain", CONTROLS_WINDOW)
-
-    for source in sources:
-        if source.capture is None:
-            continue
-
-        auto_exposure = (
-            float(source.auto_exposure)
-            if source.auto_exposure is not None
-            else DEFAULT_AUTO_EXPOSURE_BY_CAMERA.get(source.camera_id, 0.0)
-        )
-        current = (auto_exposure, float(exposure), float(gain))
-        if last_applied.get(source.camera_id) == current:
-            continue
-
-        source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, auto_exposure)
-        source.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
-        source.capture.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
-        source.capture.set(cv2.CAP_PROP_GAIN, float(gain))
-        source.exposure = float(exposure)
-        source.gain = float(gain)
-        last_applied[source.camera_id] = current
-        print(
-            f"[mocap] camera {source.camera_id} settings | "
-            f"threshold={settings.threshold} "
-            f"auto_exposure={source.capture.get(cv2.CAP_PROP_AUTO_EXPOSURE):.2f} "
-            f"autofocus={source.capture.get(cv2.CAP_PROP_AUTOFOCUS):.2f} "
-            f"exposure={source.capture.get(cv2.CAP_PROP_EXPOSURE):.2f} "
-            f"gain={source.capture.get(cv2.CAP_PROP_GAIN):.2f}"
-        )
+    _ = sources, settings, last_applied
+    return
 
 
 def draw_preview(
@@ -972,6 +1130,8 @@ def draw_preview(
     used_observation_ids: set[int] = set()
 
     for track in tracks:
+        if not track.confirmed:
+            continue
         observation = observation_for_track(
             track,
             observations,
@@ -1085,8 +1245,16 @@ def print_status(
         f"cam {camera_id}: {len(observations)}"
         for camera_id, observations in sorted(observations_by_camera.items())
     )
-    live_tracks = [track for track in tracks if track.missing_frames == 0]
-    print(f"[mocap] calibrated cams: {calibrated_camera_count} | blobs: {blob_counts}")
+    live_tracks = [
+        track for track in tracks if track.confirmed and track.missing_frames == 0
+    ]
+    tentative_tracks = [
+        track for track in tracks if not track.confirmed and track.missing_frames == 0
+    ]
+    print(
+        f"[mocap] calibrated cams: {calibrated_camera_count} | blobs: {blob_counts} | "
+        f"live ids: {len(live_tracks)} tentative: {len(tentative_tracks)}"
+    )
 
     if not live_tracks:
         print("[mocap] no 3D tracks yet")
@@ -1182,8 +1350,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=parse_camera_ids,
         default=DEFAULT_CAMERA_IDS,
         help=(
-            "Comma-separated OpenCV camera indexes to try. Default: 1,2,3. "
-            "Use 1,2,3,4 for the full rig."
+            "Comma-separated OpenCV camera indexes to try. "
+            "Default uses CAMERA_IDS near the top of this file."
         ),
     )
     parser.add_argument("--width", type=int, default=DEFAULT_FRAME_WIDTH)
@@ -1192,8 +1360,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--exposure",
         type=float,
-        default=DEFAULT_EXPOSURE,
-        help="Optional manual camera exposure value. Backend-specific.",
+        default=None,
+        help="Override manual exposure for every camera. Default uses the camera-test values.",
     )
     parser.add_argument(
         "--auto-exposure",
@@ -1201,10 +1369,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Override auto-exposure value for every camera. Default uses per-camera "
-            "manual values: camera 1 -> 0.25, camera 2 -> 0.0, camera 3 -> 0.0."
+            "camera-test values: camera 1 -> 0.0, camera 2 -> 0.0, camera 3 -> 0.25."
         ),
     )
-    parser.add_argument("--gain", type=float, default=DEFAULT_GAIN)
+    parser.add_argument(
+        "--gain",
+        type=float,
+        default=None,
+        help="Override gain for every camera. Default uses the camera-test values.",
+    )
     parser.add_argument(
         "--calibration",
         default=str(DEFAULT_CALIBRATION_PATH),
@@ -1220,7 +1393,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ROOM_BOUNDS,
         help="xmin,xmax,ymin,ymax,zmin,zmax in meters. Default: -5,5,-5,5,-5,5",
     )
-    parser.add_argument("--threshold", type=int, default=None)
+    parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
     parser.add_argument("--min-area", type=float, default=5.0)
     parser.add_argument("--max-area", type=float, default=4500.0)
     parser.add_argument("--min-radius", type=float, default=1.5)
@@ -1233,6 +1406,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-reprojection-error", type=float, default=45.0)
     parser.add_argument("--cluster-distance", type=float, default=0.45)
     parser.add_argument("--track-distance", type=float, default=0.75)
+    parser.add_argument(
+        "--track-confirmation-hits",
+        type=int,
+        default=DEFAULT_TRACK_CONFIRMATION_HITS,
+        help="How many consecutive 3D hits a new marker needs before receiving a visible ID.",
+    )
+    parser.add_argument(
+        "--tentative-max-missing-frames",
+        type=int,
+        default=DEFAULT_TENTATIVE_MAX_MISSING_FRAMES,
+        help="How long to keep an unconfirmed candidate if it stops matching.",
+    )
+    parser.add_argument(
+        "--duplicate-track-distance",
+        type=float,
+        default=DEFAULT_DUPLICATE_TRACK_DISTANCE_M,
+        help="Suppress new candidate tracks this close to an existing predicted track.",
+    )
+    parser.add_argument(
+        "--velocity-damping",
+        type=float,
+        default=DEFAULT_VELOCITY_DAMPING,
+        help="How strongly each new measurement updates track velocity. Lower is steadier.",
+    )
+    parser.add_argument(
+        "--stationary-distance",
+        type=float,
+        default=DEFAULT_STATIONARY_DISTANCE_M,
+        help="Ignore per-frame 3D movement smaller than this when estimating velocity.",
+    )
+    parser.add_argument(
+        "--max-prediction-dt",
+        type=float,
+        default=DEFAULT_MAX_PREDICTION_DT,
+        help="Cap velocity prediction time so missing tracks do not coast too far.",
+    )
     parser.add_argument(
         "--max-missing-frames",
         type=int,
@@ -1260,19 +1469,6 @@ def main() -> int:
     if cv2 is None:
         print("OpenCV is required for camera mocap. Install it with: python -m pip install opencv-python")
         return 1
-
-    settings = DetectionSettings(
-        threshold=args.threshold,
-        min_area=args.min_area,
-        max_area=args.max_area,
-        min_radius_px=args.min_radius,
-        max_radius_px=args.max_radius,
-        min_circularity=args.min_circularity,
-        min_fill_ratio=args.min_fill_ratio,
-        max_aspect_ratio=args.max_aspect_ratio,
-        min_brightness=args.min_brightness,
-        max_markers_per_camera=args.max_markers_per_camera,
-    )
 
     calibration_path = Path(args.calibration).expanduser() if args.calibration else None
     if calibration_path is not None and calibration_path.exists():
@@ -1318,7 +1514,14 @@ def main() -> int:
             "2D blobs will show, but 3D tracks need at least two calibrated views."
         )
 
-    detector = ReflectiveMarkerDetector(settings)
+    settings_by_camera = {
+        source.camera_id: build_detection_settings(args, source.camera_id)
+        for source in sources
+    }
+    detectors = {
+        camera_id: ReflectiveMarkerDetector(settings)
+        for camera_id, settings in settings_by_camera.items()
+    }
     triangulator = MultiCameraTriangulator(
         calibrations=calibrations,
         max_pair_error_px=args.max_reprojection_error,
@@ -1328,12 +1531,15 @@ def main() -> int:
     tracker = MarkerTracker(
         max_match_distance_m=args.track_distance,
         max_missing_frames=args.max_missing_frames,
+        min_confirmed_hits=args.track_confirmation_hits,
+        max_tentative_missing_frames=args.tentative_max_missing_frames,
+        duplicate_track_distance_m=args.duplicate_track_distance,
+        velocity_damping=args.velocity_damping,
+        stationary_distance_m=args.stationary_distance,
+        max_prediction_dt=args.max_prediction_dt,
     )
 
     show_preview = not args.no_preview
-    last_applied_camera_settings: dict[int, tuple[float, float, float]] = {}
-    if show_preview:
-        setup_mocap_controls(args)
     last_print_time = 0.0
 
     try:
@@ -1341,8 +1547,6 @@ def main() -> int:
             timestamp = time.time()
             frames: dict[int, np.ndarray] = {}
             observations_by_camera: dict[int, list[MarkerObservation]] = {}
-            if show_preview:
-                apply_mocap_controls(sources, settings, last_applied_camera_settings)
 
             for source in sources:
                 ok, frame = source.read()
@@ -1351,7 +1555,7 @@ def main() -> int:
                     continue
 
                 frames[source.camera_id] = frame
-                observations_by_camera[source.camera_id] = detector.detect(
+                observations_by_camera[source.camera_id] = detectors[source.camera_id].detect(
                     frame,
                     source.camera_id,
                     timestamp,
@@ -1361,7 +1565,7 @@ def main() -> int:
                 frames,
                 observations_by_camera,
                 tracker.tracks,
-                settings,
+                settings_by_camera,
                 args.track_memory_pixels,
                 timestamp,
             )
@@ -1387,7 +1591,10 @@ def main() -> int:
                         args.track_memory_pixels,
                     )
                     cv2.imshow(f"mocap camera {camera_id}", preview)
-                    cv2.imshow(f"mocap binary camera {camera_id}", threshold_mask(frame, settings))
+                    cv2.imshow(
+                        f"mocap binary camera {camera_id}",
+                        threshold_mask(frame, settings_by_camera[camera_id]),
+                    )
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):

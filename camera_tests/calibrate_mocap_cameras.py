@@ -38,27 +38,61 @@ import mocap_tracker as mocap
 cv2 = mocap.cv2
 
 CM_TO_M = 0.01
-# Default to the three physical mocap cameras currently used for testing.
-DEFAULT_CAMERA_IDS = [1, 2, 3]
+# Change this to [1, 2, 3, 4] when calibrating the full camera rig.
+CAMERA_IDS = [1, 2]
+DEFAULT_CAMERA_IDS = CAMERA_IDS
 FOUR_CAMERA_IDS = [1, 2, 3, 4]
 DEFAULT_FRAME_WIDTH = 1280
 DEFAULT_FRAME_HEIGHT = 800
 DEFAULT_FPS = 120
+DEFAULT_THRESHOLD = 230
 DEFAULT_OUTPUT_PATH = str(Path(__file__).resolve().with_name("mocap_calibration.json"))
-PREVIEW_SCALE = 0.5
-CONTROLS_WINDOW = "Calibration Controls"
+PREVIEW_SCALE = 0.75
+PREVIEW_WINDOW_WIDTH = 1600
+PREVIEW_WINDOW_HEIGHT = 600
 POSE_SOLVE_INTERVAL_SECONDS = 0.20
+TOP_MARKER_LABEL: str | None = None
+TOP_MARKER_MARGIN_PX = 8.0
+DEFAULT_ASSIGNMENT_STABILITY_PIXELS = 35.0
+DEFAULT_STABLE_POSE_FRAMES = 4
+DEFAULT_ASSIGNMENT_MEMORY_WEIGHT = 0.04
+DEFAULT_ASSIGNMENT_SWITCH_MARGIN = 2.0
+DEFAULT_AUTOFOCUS = 0
+BLUR_KERNEL_BY_CAMERA = {
+    1: 15,
+    2: 15,
+    3: 15,
+    4: 15,
+}
 DEFAULT_AUTO_EXPOSURE_BY_CAMERA = {
-    1: 0.25,
-    2: 0.0,
-    3: 0.0,
+    1: 0,
+    2: 0,
+    3: 0.25,
+    4: 0,
+}
+DEFAULT_EXPOSURE_BY_CAMERA = {
+    1: -8,
+    2: -8,
+    3: -8,
+    4: -8,
+}
+DEFAULT_GAIN_BY_CAMERA = {
+    1: 0,
+    2: 0,
+    3: 0,
+    4: 0,
 }
 
 CARBON_RADIUS_CM = 2.2 / 2.0
 SMALL_ATOM_RADIUS_CM = 1.6 / 2.0
 LARGE_ATOM_RADIUS_CM = 2.2 / 2.0
-SHORT_BOND_CM = 1.8
-LONG_BOND_CM = 3.2
+TARGET_SURFACE_GAP_CM = {
+    # Measured surface of center carbon to surface of outer atom.
+    "short_small": 8.9,
+    "short_large": 7.5,
+    "long_small": 13.9,
+    "long_large": 11.3,
+}
 
 TARGET_DIRECTIONS = {
     "short_small": np.array([1.0, 1.0, 1.0], dtype=np.float64),
@@ -91,18 +125,40 @@ class PoseEstimate:
     score: float
 
 
+@dataclass(slots=True)
+class PoseStabilityState:
+    estimate: PoseEstimate | None = None
+    stable_frames: int = 0
+
+
 def build_default_target_points() -> dict[str, np.ndarray]:
-    lengths_cm = {
-        "short_small": CARBON_RADIUS_CM + SHORT_BOND_CM + SMALL_ATOM_RADIUS_CM,
-        "short_large": CARBON_RADIUS_CM + SHORT_BOND_CM + LARGE_ATOM_RADIUS_CM,
-        "long_small": CARBON_RADIUS_CM + LONG_BOND_CM + SMALL_ATOM_RADIUS_CM,
-        "long_large": CARBON_RADIUS_CM + LONG_BOND_CM + LARGE_ATOM_RADIUS_CM,
+    center_to_center_cm = {
+        "short_small": (
+            CARBON_RADIUS_CM
+            + TARGET_SURFACE_GAP_CM["short_small"]
+            + SMALL_ATOM_RADIUS_CM
+        ),
+        "short_large": (
+            CARBON_RADIUS_CM
+            + TARGET_SURFACE_GAP_CM["short_large"]
+            + LARGE_ATOM_RADIUS_CM
+        ),
+        "long_small": (
+            CARBON_RADIUS_CM
+            + TARGET_SURFACE_GAP_CM["long_small"]
+            + SMALL_ATOM_RADIUS_CM
+        ),
+        "long_large": (
+            CARBON_RADIUS_CM
+            + TARGET_SURFACE_GAP_CM["long_large"]
+            + LARGE_ATOM_RADIUS_CM
+        ),
     }
 
     points: dict[str, np.ndarray] = {}
     for label, direction in TARGET_DIRECTIONS.items():
         unit_direction = direction / float(np.linalg.norm(direction))
-        points[label] = unit_direction * lengths_cm[label] * CM_TO_M
+        points[label] = unit_direction * center_to_center_cm[label] * CM_TO_M
     return points
 
 
@@ -131,6 +187,12 @@ def solve_camera_pose(
     size_weight: float,
     min_pose_markers: int,
     max_pose_candidates: int,
+    top_marker_label: str | None,
+    top_marker_margin_px: float,
+    previous_estimate: PoseEstimate | None,
+    assignment_memory_weight: float,
+    assignment_switch_margin: float,
+    assignment_stability_pixels: float,
 ) -> PoseEstimate | None:
     min_pose_markers = int(np.clip(min_pose_markers, 3, 4))
     if len(observations) < min_pose_markers:
@@ -141,6 +203,7 @@ def solve_camera_pose(
         for label in TARGET_POINT_LABELS
     }
     best: PoseEstimate | None = None
+    best_previous_like: PoseEstimate | None = None
 
     max_pose_candidates = max(min_pose_markers, max_pose_candidates)
     candidate_observations = observations[: min(len(observations), max_pose_candidates)]
@@ -155,6 +218,12 @@ def solve_camera_pose(
                         label: observation
                         for label, observation in zip(target_labels, ordered_observations)
                     }
+                    if not assignment_matches_top_marker(
+                        assignment,
+                        top_marker_label,
+                        top_marker_margin_px,
+                    ):
+                        continue
                     object_points = np.asarray(
                         [object_points_by_label[label] for label in target_labels],
                         dtype=np.float64,
@@ -180,10 +249,90 @@ def solve_camera_pose(
                         continue
 
                     estimate.score += 2.0 * (4 - marker_count)
+                    if previous_estimate is not None:
+                        continuity_error = assignment_distance_px(
+                            estimate.assignment,
+                            previous_estimate.assignment,
+                        )
+                        if math.isfinite(continuity_error):
+                            estimate.score += assignment_memory_weight * continuity_error
+                            if continuity_error <= assignment_stability_pixels:
+                                if (
+                                    best_previous_like is None
+                                    or estimate.score < best_previous_like.score
+                                ):
+                                    best_previous_like = estimate
+
                     if best is None or estimate.score < best.score:
                         best = estimate
 
+    if best is None:
+        return None
+
+    if (
+        best_previous_like is not None
+        and best is not best_previous_like
+        and best.score > best_previous_like.score - assignment_switch_margin
+    ):
+        return best_previous_like
+
     return best
+
+
+def assignment_distance_px(
+    assignment: dict[str, mocap.MarkerObservation],
+    reference: dict[str, mocap.MarkerObservation],
+) -> float:
+    distances = [
+        float(np.linalg.norm(assignment[label].pixel - reference[label].pixel))
+        for label in TARGET_POINT_LABELS
+        if label in assignment and label in reference
+    ]
+    if not distances:
+        return float("inf")
+    return float(np.mean(distances))
+
+
+def update_pose_stability(
+    state: PoseStabilityState,
+    estimate: PoseEstimate | None,
+    assignment_stability_pixels: float,
+    stable_pose_frames: int,
+) -> PoseEstimate | None:
+    required_frames = max(1, stable_pose_frames)
+    if estimate is None:
+        state.estimate = None
+        state.stable_frames = 0
+        return None
+
+    if state.estimate is not None:
+        distance = assignment_distance_px(estimate.assignment, state.estimate.assignment)
+        if distance <= assignment_stability_pixels:
+            state.stable_frames += 1
+        else:
+            state.stable_frames = 1
+    else:
+        state.stable_frames = 1
+
+    state.estimate = estimate
+    if state.stable_frames >= required_frames:
+        return estimate
+    return None
+
+
+def assignment_matches_top_marker(
+    assignment: dict[str, mocap.MarkerObservation],
+    top_marker_label: str | None,
+    top_marker_margin_px: float,
+) -> bool:
+    if top_marker_label is None:
+        return True
+    top_observation = assignment.get(top_marker_label)
+    if top_observation is None:
+        return False
+
+    min_y = min(float(observation.pixel[1]) for observation in assignment.values())
+    return float(top_observation.pixel[1]) <= min_y + max(0.0, top_marker_margin_px)
 
 
 def solve_pnp_candidate(
@@ -451,6 +600,17 @@ def threshold_mask(frame: np.ndarray, settings: mocap.DetectionSettings) -> np.n
     return mask
 
 
+def calibration_window_name(camera_id: int) -> str:
+    return f"calibration camera {camera_id}"
+
+
+def create_preview_windows(sources: list[mocap.CameraSource]) -> None:
+    for source in sources:
+        window_name = calibration_window_name(source.camera_id)
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, PREVIEW_WINDOW_WIDTH, PREVIEW_WINDOW_HEIGHT)
+
+
 def write_calibration_json(
     output_path: str,
     captured_estimates: dict[int, PoseEstimate],
@@ -471,6 +631,7 @@ def write_calibration_json(
         "target": {
             "name": "tetrahedral_ochem_reflective_target",
             "origin": "center carbon",
+            "surface_gap_cm": TARGET_SURFACE_GAP_CM,
             "points_m": {
                 label: target_points[label].reshape(3).tolist()
                 for label in TARGET_POINT_LABELS
@@ -542,75 +703,104 @@ def parse_camera_ids(text: str) -> list[int]:
     return [int(value) for value in values]
 
 
-def apply_extra_camera_settings(
-    sources: list[mocap.CameraSource],
+def camera_setting(
+    camera_id: int,
+    values_by_camera: dict[int, float],
+    override: float | None,
+    fallback: float,
+) -> float:
+    if override is not None:
+        return float(override)
+    return float(values_by_camera.get(camera_id, fallback))
+
+
+def camera_auto_exposure(camera_id: int, override: float | None) -> float:
+    return camera_setting(camera_id, DEFAULT_AUTO_EXPOSURE_BY_CAMERA, override, 0.0)
+
+
+def camera_exposure(camera_id: int, override: float | None) -> float:
+    return camera_setting(camera_id, DEFAULT_EXPOSURE_BY_CAMERA, override, -8.0)
+
+
+def camera_gain(camera_id: int, override: float | None) -> float:
+    return camera_setting(camera_id, DEFAULT_GAIN_BY_CAMERA, override, 0.0)
+
+
+def open_calibration_cameras(
+    camera_ids: list[int],
+    width: int,
+    height: int,
+    fps: int,
+    auto_exposure: float | None,
+    exposure: float | None,
+    gain: float | None,
+) -> list[mocap.CameraSource]:
+    sources: list[mocap.CameraSource] = []
+    for camera_id in camera_ids:
+        source = mocap.CameraSource(
+            camera_id,
+            width,
+            height,
+            fps,
+            None,
+            None,
+            None,
+            configure_capture=False,
+        )
+        if source.open():
+            # Camera parameters are managed by external camera software.
+            # Do not call apply_camera_settings() here.
+            sources.append(source)
+            print_camera_settings(source)
+        else:
+            print(f"[calibration] camera {camera_id} not available; continuing")
+    return sources
+
+
+def apply_camera_settings(
+    source: mocap.CameraSource,
     auto_exposure: float | None,
     exposure: float | None,
     gain: float | None,
 ) -> None:
-    for source in sources:
-        if source.capture is None:
-            continue
-        manual_auto_exposure = (
-            float(auto_exposure)
-            if auto_exposure is not None
-            else DEFAULT_AUTO_EXPOSURE_BY_CAMERA.get(source.camera_id, 0.0)
-        )
-        source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, manual_auto_exposure)
-        source.capture.set(cv2.CAP_PROP_AUTOFOCUS, mocap.DEFAULT_AUTOFOCUS)
-        if exposure is not None:
-            source.capture.set(cv2.CAP_PROP_EXPOSURE, float(exposure))
-        if gain is not None:
-            source.capture.set(cv2.CAP_PROP_GAIN, float(gain))
+    _ = source, auto_exposure, exposure, gain
+    # Camera parameters are managed by external camera software.
+    # source.capture.set(cv2.CAP_PROP_FRAME_WIDTH, source.width)
+    # source.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, source.height)
+    # source.capture.set(cv2.CAP_PROP_FPS, source.fps)
+    # source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, source.auto_exposure)
+    # source.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
+    # source.capture.set(cv2.CAP_PROP_EXPOSURE, source.exposure)
+    # source.capture.set(cv2.CAP_PROP_GAIN, source.gain)
+    return
 
 
-def setup_detection_controls(args: argparse.Namespace) -> None:
-    cv2.namedWindow(CONTROLS_WINDOW)
-    cv2.createTrackbar("threshold", CONTROLS_WINDOW, int(args.threshold), 255, lambda _value: None)
-    cv2.createTrackbar("min area", CONTROLS_WINDOW, int(args.min_area), 1000, lambda _value: None)
-    cv2.createTrackbar("max area", CONTROLS_WINDOW, int(args.max_area), 20000, lambda _value: None)
-    cv2.createTrackbar("min radius", CONTROLS_WINDOW, int(args.min_radius), 80, lambda _value: None)
-    cv2.createTrackbar("max radius", CONTROLS_WINDOW, int(args.max_radius), 180, lambda _value: None)
-    cv2.createTrackbar(
-        "min circularity %",
-        CONTROLS_WINDOW,
-        int(args.min_circularity * 100),
-        100,
-        lambda _value: None,
-    )
-    cv2.createTrackbar(
-        "min fill %",
-        CONTROLS_WINDOW,
-        int(args.min_fill_ratio * 100),
-        100,
-        lambda _value: None,
-    )
-    cv2.createTrackbar(
-        "max aspect x10",
-        CONTROLS_WINDOW,
-        int(args.max_aspect_ratio * 10),
-        60,
-        lambda _value: None,
+def print_camera_settings(source: mocap.CameraSource) -> None:
+    if source.capture is None:
+        return
+
+    print(
+        f"[calibration] opened camera {source.camera_id} | "
+        f"auto_exposure={source.capture.get(cv2.CAP_PROP_AUTO_EXPOSURE):.2f} "
+        f"autofocus={source.capture.get(cv2.CAP_PROP_AUTOFOCUS):.2f} "
+        f"exposure={source.capture.get(cv2.CAP_PROP_EXPOSURE):.2f} "
+        f"gain={source.capture.get(cv2.CAP_PROP_GAIN):.2f}"
     )
 
 
-def update_settings_from_controls(settings: mocap.DetectionSettings) -> None:
-    settings.threshold = cv2.getTrackbarPos("threshold", CONTROLS_WINDOW)
-    settings.min_area = max(1.0, float(cv2.getTrackbarPos("min area", CONTROLS_WINDOW)))
-    settings.max_area = max(
-        settings.min_area + 1.0,
-        float(cv2.getTrackbarPos("max area", CONTROLS_WINDOW)),
-    )
-    settings.min_radius_px = max(0.0, float(cv2.getTrackbarPos("min radius", CONTROLS_WINDOW)))
-    settings.max_radius_px = max(
-        settings.min_radius_px + 1.0,
-        float(cv2.getTrackbarPos("max radius", CONTROLS_WINDOW)),
-    )
-    settings.min_circularity = cv2.getTrackbarPos("min circularity %", CONTROLS_WINDOW) / 100.0
-    settings.min_fill_ratio = cv2.getTrackbarPos("min fill %", CONTROLS_WINDOW) / 100.0
-    settings.max_aspect_ratio = max(
-        1.0,
-        cv2.getTrackbarPos("max aspect x10", CONTROLS_WINDOW) / 10.0,
+def build_detection_settings(args: argparse.Namespace, camera_id: int) -> mocap.DetectionSettings:
+    return mocap.DetectionSettings(
+        threshold=args.threshold,
+        min_area=args.min_area,
+        max_area=args.max_area,
+        min_radius_px=args.min_radius,
+        max_radius_px=args.max_radius,
+        min_circularity=args.min_circularity,
+        min_fill_ratio=args.min_fill_ratio,
+        max_aspect_ratio=args.max_aspect_ratio,
+        min_brightness=args.min_brightness,
+        blur_kernel=BLUR_KERNEL_BY_CAMERA.get(camera_id, 1),
+        max_markers_per_camera=max(args.max_pose_candidates, 4),
     )
 
 
@@ -623,26 +813,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=parse_camera_ids,
         default=DEFAULT_CAMERA_IDS,
         help=(
-            "Comma-separated OpenCV camera indexes to try. Default: 1,2,3. "
-            "Use 1,2,3,4 for the full rig."
+            "Comma-separated OpenCV camera indexes to try. "
+            "Default uses CAMERA_IDS near the top of this file."
         ),
     )
     parser.add_argument("--width", type=int, default=DEFAULT_FRAME_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_FRAME_HEIGHT)
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
     parser.add_argument("--focal-length-px", type=float, default=mocap.DEFAULT_FOCAL_LENGTH_PX)
-    parser.add_argument("--exposure", type=float, default=-13.0)
+    parser.add_argument(
+        "--exposure",
+        type=float,
+        default=None,
+        help="Override manual exposure for every camera. Default uses the camera-test values.",
+    )
     parser.add_argument(
         "--auto-exposure",
         type=float,
         default=None,
         help=(
             "Override auto-exposure value for every camera. Default uses per-camera "
-            "manual values: camera 1 -> 0.25, camera 2 -> 0.0, camera 3 -> 0.0."
+            "camera-test values: camera 1 -> 0.0, camera 2 -> 0.0, camera 3 -> 0.25."
         ),
     )
-    parser.add_argument("--gain", type=float, default=0.0)
-    parser.add_argument("--threshold", type=int, default=200)
+    parser.add_argument(
+        "--gain",
+        type=float,
+        default=None,
+        help="Override gain for every camera. Default uses the camera-test values.",
+    )
+    parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
     parser.add_argument("--min-area", type=float, default=8.0)
     parser.add_argument("--max-area", type=float, default=3500.0)
     parser.add_argument("--min-radius", type=float, default=2.0)
@@ -655,8 +855,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-pose-markers",
         type=int,
-        default=3,
-        help="Use 3 for fallback calibration when one tetrahedron marker is hidden; 4 is stricter.",
+        default=4,
+        help="Use 4 for the full tetrahedron. Use 3 only if one marker is hidden.",
     )
     parser.add_argument(
         "--max-pose-candidates",
@@ -675,6 +875,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=12.0,
         help="How strongly marker size helps disambiguate labels. Use 0 if tape sizes are unreliable.",
+    )
+    parser.add_argument(
+        "--top-marker-label",
+        choices=TARGET_POINT_LABELS,
+        default=TOP_MARKER_LABEL,
+        help=(
+            "Optional hard constraint for known target orientation. If set, this "
+            "target label must be the topmost detected marker in the image."
+        ),
+    )
+    parser.add_argument(
+        "--top-marker-margin-px",
+        type=float,
+        default=TOP_MARKER_MARGIN_PX,
+        help="Pixel tolerance for the top-marker constraint.",
+    )
+    parser.add_argument(
+        "--assignment-stability-pixels",
+        type=float,
+        default=DEFAULT_ASSIGNMENT_STABILITY_PIXELS,
+        help="How far a label can move in pixels and still count as the same stable assignment.",
+    )
+    parser.add_argument(
+        "--stable-pose-frames",
+        type=int,
+        default=DEFAULT_STABLE_POSE_FRAMES,
+        help="Number of consecutive solve cycles required before a pose can be captured.",
+    )
+    parser.add_argument(
+        "--assignment-memory-weight",
+        type=float,
+        default=DEFAULT_ASSIGNMENT_MEMORY_WEIGHT,
+        help="Penalty weight for label assignments that jump away from the previous stable candidate.",
+    )
+    parser.add_argument(
+        "--assignment-switch-margin",
+        type=float,
+        default=DEFAULT_ASSIGNMENT_SWITCH_MARGIN,
+        help="New label assignment must beat the previous-like assignment by this score margin.",
     )
     parser.add_argument(
         "--target-config",
@@ -703,45 +942,48 @@ def main() -> int:
     intrinsic = mocap.default_intrinsic(args.width, args.height, args.focal_length_px)
     dist_coeffs = np.zeros(5, dtype=np.float64)
 
-    settings = mocap.DetectionSettings(
-        threshold=args.threshold,
-        min_area=args.min_area,
-        max_area=args.max_area,
-        min_radius_px=args.min_radius,
-        max_radius_px=args.max_radius,
-        min_circularity=args.min_circularity,
-        min_fill_ratio=args.min_fill_ratio,
-        max_aspect_ratio=args.max_aspect_ratio,
-        min_brightness=args.min_brightness,
-        max_markers_per_camera=max(args.max_pose_candidates, 4),
-    )
-    detector = mocap.ReflectiveMarkerDetector(settings)
-
     print_target_geometry(target_points)
-    sources = mocap.open_available_cameras(
+    if args.top_marker_label is not None:
+        print(
+            "[calibration] top-marker constraint: "
+            f"{args.top_marker_label} must have the smallest image y value "
+            f"(within {args.top_marker_margin_px:.1f}px)"
+        )
+    sources = open_calibration_cameras(
         args.cameras,
         args.width,
         args.height,
         args.fps,
-        args.exposure,
         args.auto_exposure,
+        args.exposure,
         args.gain,
     )
-    apply_extra_camera_settings(sources, args.auto_exposure, args.exposure, args.gain)
 
     if not sources:
         print("[calibration] no cameras opened")
         return 1
+
+    settings_by_camera = {
+        source.camera_id: build_detection_settings(args, source.camera_id)
+        for source in sources
+    }
+    detectors = {
+        camera_id: mocap.ReflectiveMarkerDetector(settings)
+        for camera_id, settings in settings_by_camera.items()
+    }
 
     print("[calibration] hold the tetrahedral target still at the intended origin")
     print("[calibration] press c to capture valid camera poses, s to save, q/Esc to quit")
 
     show_preview = not args.no_preview
     if show_preview:
-        setup_detection_controls(args)
+        create_preview_windows(sources)
 
     captured_estimates: dict[int, PoseEstimate] = {}
     latest_estimates: dict[int, PoseEstimate] = {}
+    pose_stability_by_camera: dict[int, PoseStabilityState] = {
+        source.camera_id: PoseStabilityState() for source in sources
+    }
     next_pose_solve_time_by_camera: dict[int, float] = {
         source.camera_id: 0.0 for source in sources
     }
@@ -752,8 +994,6 @@ def main() -> int:
             timestamp = time.time()
             latest_observations: dict[int, list[mocap.MarkerObservation]] = {}
             latest_frames: dict[int, np.ndarray] = {}
-            if show_preview:
-                update_settings_from_controls(settings)
 
             for source in sources:
                 ok, frame = source.read()
@@ -762,12 +1002,17 @@ def main() -> int:
                     continue
 
                 latest_frames[source.camera_id] = frame
-                observations = detector.detect(frame, source.camera_id, timestamp)
+                observations = detectors[source.camera_id].detect(
+                    frame,
+                    source.camera_id,
+                    timestamp,
+                )
                 latest_observations[source.camera_id] = observations
                 if timestamp >= next_pose_solve_time_by_camera[source.camera_id]:
                     next_pose_solve_time_by_camera[source.camera_id] = (
                         timestamp + max(args.pose_solve_interval, 0.05)
                     )
+                    stability_state = pose_stability_by_camera[source.camera_id]
                     estimate = solve_camera_pose(
                         source.camera_id,
                         observations,
@@ -778,15 +1023,34 @@ def main() -> int:
                         args.size_weight,
                         args.min_pose_markers,
                         args.max_pose_candidates,
+                        args.top_marker_label,
+                        args.top_marker_margin_px,
+                        stability_state.estimate,
+                        args.assignment_memory_weight,
+                        args.assignment_switch_margin,
+                        args.assignment_stability_pixels,
                     )
-                    if estimate is not None:
-                        latest_estimates[source.camera_id] = estimate
+                    stable_estimate = update_pose_stability(
+                        stability_state,
+                        estimate,
+                        args.assignment_stability_pixels,
+                        args.stable_pose_frames,
+                    )
+                    if stable_estimate is not None:
+                        latest_estimates[source.camera_id] = stable_estimate
                     else:
                         latest_estimates.pop(source.camera_id, None)
 
             if timestamp - last_print_time > 0.5:
                 last_print_time = timestamp
-                print_pose_status(sources, latest_observations, latest_estimates, captured_estimates)
+                print_pose_status(
+                    sources,
+                    latest_observations,
+                    latest_estimates,
+                    captured_estimates,
+                    pose_stability_by_camera,
+                    args.stable_pose_frames,
+                )
 
             if args.auto_save and len(latest_estimates) == len(sources):
                 captured_estimates.update(latest_estimates)
@@ -812,10 +1076,10 @@ def main() -> int:
                         target_points,
                         intrinsic,
                         dist_coeffs,
-                        settings,
+                        settings_by_camera[camera_id],
                         camera_id in captured_estimates,
                     )
-                    cv2.imshow(f"calibration camera {camera_id}", preview)
+                    cv2.imshow(calibration_window_name(camera_id), preview)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
@@ -872,7 +1136,17 @@ def print_target_geometry(target_points: dict[str, np.ndarray]) -> None:
     print("[calibration] target points, meters from center carbon:")
     for label in TARGET_POINT_LABELS:
         point = target_points[label]
-        print(f"  {label:12s}: [{point[0]:+.5f}, {point[1]:+.5f}, {point[2]:+.5f}]")
+        center_to_center_cm = float(np.linalg.norm(point)) / CM_TO_M
+        surface_gap_cm = TARGET_SURFACE_GAP_CM.get(label)
+        if surface_gap_cm is None:
+            print(f"  {label:12s}: [{point[0]:+.5f}, {point[1]:+.5f}, {point[2]:+.5f}]")
+        else:
+            print(
+                f"  {label:12s}: "
+                f"surface_gap={surface_gap_cm:5.1f}cm "
+                f"center_to_center={center_to_center_cm:5.1f}cm "
+                f"point=[{point[0]:+.5f}, {point[1]:+.5f}, {point[2]:+.5f}]"
+            )
 
 
 def print_pose_status(
@@ -880,19 +1154,30 @@ def print_pose_status(
     observations_by_camera: dict[int, list[mocap.MarkerObservation]],
     estimates: dict[int, PoseEstimate],
     captured_estimates: dict[int, PoseEstimate],
+    pose_stability_by_camera: dict[int, PoseStabilityState],
+    stable_pose_frames: int,
 ) -> None:
     parts: list[str] = []
     for source in sources:
         camera_id = source.camera_id
         blob_count = len(observations_by_camera.get(camera_id, []))
         estimate = estimates.get(camera_id)
+        stability = pose_stability_by_camera.get(camera_id)
+        stable_count = stability.stable_frames if stability is not None else 0
         captured = " captured" if camera_id in captured_estimates else ""
         if estimate is None:
-            parts.append(f"cam {camera_id}: {blob_count} blobs, no pose{captured}")
+            if stable_count > 0:
+                parts.append(
+                    f"cam {camera_id}: {blob_count} blobs, stabilizing "
+                    f"{stable_count}/{max(1, stable_pose_frames)}{captured}"
+                )
+            else:
+                parts.append(f"cam {camera_id}: {blob_count} blobs, no pose{captured}")
         else:
             x, y, z = estimate.position
             parts.append(
                 f"cam {camera_id}: {blob_count} blobs, {estimate.marker_count} marker pose, "
+                f"stable={stable_count}/{max(1, stable_pose_frames)}, "
                 f"err={estimate.reprojection_error_px:.2f}px, "
                 f"pos=({x:+.2f},{y:+.2f},{z:+.2f})m{captured}"
             )
