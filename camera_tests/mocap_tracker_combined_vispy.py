@@ -33,16 +33,22 @@ STANDARD_CALIBRATION_PATH = Path(__file__).resolve().with_name("mocap_calibratio
 ALIGNED_MOVEMENT_CALIBRATION_PATH = Path(__file__).resolve().with_name(
     "mocap_calibration_aligned.json"
 )
+TRACKED_POINT_COUNT = 2
+SCALING_FACTOR = 2.0
 
 DEFAULT_TRAIL_SECONDS = 4.0
 DEFAULT_UPDATE_HZ = 120.0
 DEFAULT_PANEL_WIDTH = 640
 DEFAULT_PANEL_HEIGHT = 400
 DEFAULT_COMBINED_WINDOW_NAME = "mocap combined preview"
-DEFAULT_POSITION_SCALE = 1.0
 DEFAULT_LINE_WIDTH = 4.0
 DEFAULT_POINT_SIZE = 12.0
-TRAIL_COLOR = (0.15, 1.00, 0.25, 1.0)
+TRAIL_COLORS = [
+    (0.15, 1.00, 0.25, 1.0),
+    (1.00, 0.30, 0.20, 1.0),
+    (0.20, 0.55, 1.00, 1.0),
+    (1.00, 0.72, 0.15, 1.0),
+]
 
 
 def default_calibration_path() -> Path:
@@ -77,7 +83,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update-hz", type=float, default=DEFAULT_UPDATE_HZ)
     parser.add_argument("--panel-width", type=int, default=DEFAULT_PANEL_WIDTH)
     parser.add_argument("--panel-height", type=int, default=DEFAULT_PANEL_HEIGHT)
-    parser.add_argument("--position-scale", type=float, default=DEFAULT_POSITION_SCALE)
+    parser.add_argument("--tracked-point-count", type=int, default=TRACKED_POINT_COUNT)
+    parser.add_argument("--scaling-factor", type=float, default=SCALING_FACTOR)
+    parser.add_argument(
+        "--position-scale",
+        dest="scaling_factor",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Alias for --scaling-factor.",
+    )
     parser.add_argument("--line-width", type=float, default=DEFAULT_LINE_WIDTH)
     parser.add_argument("--point-size", type=float, default=DEFAULT_POINT_SIZE)
     return parser
@@ -250,7 +264,9 @@ class CombinedMocapTrailApp:
             stationary_distance_m=args.stationary_distance,
             max_prediction_dt=args.max_prediction_dt,
         )
-        self.trail_points: deque[tuple[float, np.ndarray]] = deque()
+        self.trail_points_by_track: dict[int, deque[tuple[float, np.ndarray]]] = {}
+        self.track_lines: dict[int, object] = {}
+        self.track_markers: dict[int, object] = {}
         self.last_print_time = 0.0
         self.closed = False
 
@@ -298,22 +314,8 @@ class CombinedMocapTrailApp:
         self._add_axis_labels()
         self._add_camera_markers()
 
-        self.line = scene.visuals.Line(
-            pos=np.zeros((1, 3), dtype=np.float32),
-            color=(TRAIL_COLOR[0], TRAIL_COLOR[1], TRAIL_COLOR[2], 0.0),
-            width=float(self.args.line_width),
-            parent=self.view.scene,
-            method="gl",
-        )
-        self.marker = scene.visuals.Markers(parent=self.view.scene)
-        self.marker.set_data(
-            pos=np.zeros((0, 3), dtype=np.float32),
-            face_color=TRAIL_COLOR,
-            edge_color=(1.0, 1.0, 1.0, 1.0),
-            size=float(self.args.point_size),
-        )
         self.status_text = scene.visuals.Text(
-            "Waiting for triangulated point...",
+            "Waiting for triangulated points...",
             color="white",
             font_size=9,
             pos=(10, 10),
@@ -324,7 +326,7 @@ class CombinedMocapTrailApp:
         self.canvas.events.close.connect(self.close)
 
     def _add_axis_labels(self) -> None:
-        label_distance = 1.25 * float(self.args.position_scale)
+        label_distance = 1.25 * float(self.args.scaling_factor)
         scene.visuals.Text("X", color="red", font_size=20, pos=(label_distance, 0, 0), parent=self.view.scene)
         scene.visuals.Text("Y", color="green", font_size=20, pos=(0, label_distance, 0), parent=self.view.scene)
         scene.visuals.Text("Z", color="blue", font_size=20, pos=(0, 0, label_distance), parent=self.view.scene)
@@ -358,7 +360,7 @@ class CombinedMocapTrailApp:
             )
 
     def _visual_position(self, position: np.ndarray) -> np.ndarray:
-        return position.astype(np.float32) * float(self.args.position_scale)
+        return position.astype(np.float32) * float(self.args.scaling_factor)
 
     def update(self, _event) -> None:
         if self.closed:
@@ -395,11 +397,14 @@ class CombinedMocapTrailApp:
         live_tracks = [
             track for track in tracks if track.confirmed and track.missing_frames == 0
         ]
-        best_track = max(live_tracks, key=lambda track: track.confidence, default=None)
-        if best_track is not None:
-            self.trail_points.append((timestamp, best_track.position.copy()))
+        selected_tracks = self._select_display_tracks(live_tracks)
+        selected_track_ids = {track.track_id for track in selected_tracks}
+        for track in selected_tracks:
+            trail = self.trail_points_by_track.setdefault(track.track_id, deque())
+            trail.append((timestamp, track.position.copy()))
 
-        self._draw_trail(timestamp, best_track, observations_by_camera)
+        self._draw_trails(timestamp, selected_tracks, observations_by_camera)
+        self._hide_unused_track_visuals(selected_track_ids)
         self._print_status(timestamp, tracks, observations_by_camera)
 
         if not self.args.no_preview:
@@ -418,62 +423,120 @@ class CombinedMocapTrailApp:
             if key in (ord("q"), 27):
                 self.canvas.close()
 
-    def _draw_trail(
+    def _select_display_tracks(
+        self,
+        live_tracks: list[mocap.MarkerTrack],
+    ) -> list[mocap.MarkerTrack]:
+        max_tracks = max(int(self.args.tracked_point_count), 1)
+        return sorted(
+            live_tracks,
+            key=lambda track: (-track.confidence, -track.total_hits, track.track_id),
+        )[:max_tracks]
+
+    def _track_color(self, track_id: int) -> tuple[float, float, float, float]:
+        return TRAIL_COLORS[(track_id - 1) % len(TRAIL_COLORS)]
+
+    def _ensure_track_visuals(self, track_id: int):
+        if track_id not in self.track_lines:
+            color = self._track_color(track_id)
+            self.track_lines[track_id] = scene.visuals.Line(
+                pos=np.zeros((1, 3), dtype=np.float32),
+                color=(color[0], color[1], color[2], 0.0),
+                width=float(self.args.line_width),
+                parent=self.view.scene,
+                method="gl",
+            )
+            marker = scene.visuals.Markers(parent=self.view.scene)
+            marker.set_data(pos=np.zeros((0, 3), dtype=np.float32))
+            self.track_markers[track_id] = marker
+        return self.track_lines[track_id], self.track_markers[track_id]
+
+    def _draw_trails(
         self,
         timestamp: float,
-        best_track: mocap.MarkerTrack | None,
+        selected_tracks: list[mocap.MarkerTrack],
         observations_by_camera: dict[int, list[mocap.MarkerObservation]],
     ) -> None:
-        while self.trail_points and timestamp - self.trail_points[0][0] > self.args.trail_seconds:
-            self.trail_points.popleft()
+        for track in selected_tracks:
+            trail = self.trail_points_by_track.setdefault(track.track_id, deque())
+            while trail and timestamp - trail[0][0] > self.args.trail_seconds:
+                trail.popleft()
 
-        if self.trail_points:
+            line, marker = self._ensure_track_visuals(track.track_id)
+            color = self._track_color(track.track_id)
+            if not trail:
+                line.set_data(
+                    pos=np.zeros((1, 3), dtype=np.float32),
+                    color=(color[0], color[1], color[2], 0.0),
+                    width=float(self.args.line_width),
+                )
+                marker.set_data(pos=np.zeros((0, 3), dtype=np.float32))
+                continue
+
             positions = np.asarray(
-                [self._visual_position(position) for _point_time, position in self.trail_points],
+                [self._visual_position(position) for _point_time, position in trail],
                 dtype=np.float32,
             )
             ages = np.asarray(
-                [timestamp - point_time for point_time, _position in self.trail_points],
+                [timestamp - point_time for point_time, _position in trail],
                 dtype=np.float32,
             )
             alphas = np.clip(1.0 - ages / max(float(self.args.trail_seconds), 0.001), 0.05, 1.0)
-            colors = np.tile(np.asarray(TRAIL_COLOR, dtype=np.float32), (len(positions), 1))
+            colors = np.tile(np.asarray(color, dtype=np.float32), (len(positions), 1))
             colors[:, 3] = alphas
 
             if len(positions) >= 2:
-                self.line.set_data(
+                line.set_data(
                     pos=positions,
                     color=colors,
                     width=float(self.args.line_width),
                 )
-            self.marker.set_data(
+            else:
+                line.set_data(
+                    pos=np.zeros((1, 3), dtype=np.float32),
+                    color=(color[0], color[1], color[2], 0.0),
+                    width=float(self.args.line_width),
+                )
+            marker.set_data(
                 pos=positions[-1:],
-                face_color=TRAIL_COLOR,
+                face_color=color,
                 edge_color=(1.0, 1.0, 1.0, 1.0),
                 size=float(self.args.point_size),
             )
-        else:
-            self.line.set_data(
-                pos=np.zeros((1, 3), dtype=np.float32),
-                color=(TRAIL_COLOR[0], TRAIL_COLOR[1], TRAIL_COLOR[2], 0.0),
-                width=float(self.args.line_width),
-            )
-            self.marker.set_data(pos=np.zeros((0, 3), dtype=np.float32))
 
         blob_counts = ", ".join(
             f"cam {camera_id}: {len(observations)}"
             for camera_id, observations in sorted(observations_by_camera.items())
         )
-        if best_track is None:
-            self.status_text.text = f"Waiting for 3D point | {blob_counts}"
+        if not selected_tracks:
+            self.status_text.text = f"Waiting for 3D points | scale={self.args.scaling_factor:.2f} | {blob_counts}"
             return
 
-        x, y, z = best_track.position
+        track_parts = []
+        for track in selected_tracks:
+            x, y, z = track.position
+            track_parts.append(
+                f"id {track.track_id}: x={x:+.3f} y={y:+.3f} z={z:+.3f} "
+                f"err={track.reprojection_error_px:.1f}px"
+            )
         self.status_text.text = (
-            f"id {best_track.track_id} | "
-            f"x={x:+.3f}m y={y:+.3f}m z={z:+.3f}m | "
-            f"err={best_track.reprojection_error_px:.1f}px | {blob_counts}"
+            " | ".join(track_parts)
+            + f" | scale={self.args.scaling_factor:.2f} | {blob_counts}"
         )
+
+    def _hide_unused_track_visuals(self, selected_track_ids: set[int]) -> None:
+        for track_id, line in self.track_lines.items():
+            if track_id in selected_track_ids:
+                continue
+            color = self._track_color(track_id)
+            line.set_data(
+                pos=np.zeros((1, 3), dtype=np.float32),
+                color=(color[0], color[1], color[2], 0.0),
+                width=float(self.args.line_width),
+            )
+            marker = self.track_markers.get(track_id)
+            if marker is not None:
+                marker.set_data(pos=np.zeros((0, 3), dtype=np.float32))
 
     def _print_status(
         self,
