@@ -33,19 +33,20 @@ from pathlib import Path
 
 import numpy as np
 
+import multithreaded_camera_testing as camera_settings
 import mocap_tracker as mocap
 
 cv2 = mocap.cv2
 
 CM_TO_M = 0.01
 # Change this to [1, 2, 3, 4] when calibrating the full camera rig.
-CAMERA_IDS = [1, 2]
+CAMERA_IDS = list(camera_settings.CAMERA_IDS)
 DEFAULT_CAMERA_IDS = CAMERA_IDS
-FOUR_CAMERA_IDS = [1, 2, 3, 4]
-DEFAULT_FRAME_WIDTH = 1280
-DEFAULT_FRAME_HEIGHT = 800
-DEFAULT_FPS = 120
-DEFAULT_THRESHOLD = 230
+FOUR_CAMERA_IDS = list(camera_settings.FOUR_CAMERA_IDS)
+DEFAULT_FRAME_WIDTH = camera_settings.FRAME_WIDTH
+DEFAULT_FRAME_HEIGHT = camera_settings.FRAME_HEIGHT
+DEFAULT_FPS = camera_settings.FPS
+DEFAULT_THRESHOLD = camera_settings.THRESHOLD
 DEFAULT_OUTPUT_PATH = str(Path(__file__).resolve().with_name("mocap_calibration.json"))
 PREVIEW_SCALE = 0.75
 PREVIEW_WINDOW_WIDTH = 1600
@@ -57,31 +58,11 @@ DEFAULT_ASSIGNMENT_STABILITY_PIXELS = 35.0
 DEFAULT_STABLE_POSE_FRAMES = 4
 DEFAULT_ASSIGNMENT_MEMORY_WEIGHT = 0.04
 DEFAULT_ASSIGNMENT_SWITCH_MARGIN = 2.0
-DEFAULT_AUTOFOCUS = 0
-BLUR_KERNEL_BY_CAMERA = {
-    1: 15,
-    2: 15,
-    3: 15,
-    4: 15,
-}
-DEFAULT_AUTO_EXPOSURE_BY_CAMERA = {
-    1: 0,
-    2: 0,
-    3: 0.25,
-    4: 0,
-}
-DEFAULT_EXPOSURE_BY_CAMERA = {
-    1: -8,
-    2: -8,
-    3: -8,
-    4: -8,
-}
-DEFAULT_GAIN_BY_CAMERA = {
-    1: 0,
-    2: 0,
-    3: 0,
-    4: 0,
-}
+DEFAULT_AUTOFOCUS = camera_settings.AUTOFOCUS
+BLUR_KERNEL_BY_CAMERA = dict(camera_settings.BLUR_KERNEL_BY_CAMERA)
+DEFAULT_AUTO_EXPOSURE_BY_CAMERA = dict(camera_settings.AUTO_EXPOSURE_BY_CAMERA)
+DEFAULT_EXPOSURE_BY_CAMERA = dict(camera_settings.EXPOSURE_BY_CAMERA)
+DEFAULT_GAIN_BY_CAMERA = dict(camera_settings.GAIN_BY_CAMERA)
 
 CARBON_RADIUS_CM = 2.2 / 2.0
 SMALL_ATOM_RADIUS_CM = 1.6 / 2.0
@@ -579,25 +560,7 @@ def build_threshold_preview(
 
 
 def threshold_mask(frame: np.ndarray, settings: mocap.DetectionSettings) -> np.ndarray:
-    gray = frame if len(frame.shape) == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    kernel_size = settings.blur_kernel
-    if kernel_size > 1:
-        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-        gray = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
-
-    threshold = settings.threshold
-    if threshold is None:
-        threshold = max(settings.min_threshold, int(np.percentile(gray, settings.threshold_percentile)))
-    _ok, mask = cv2.threshold(gray, int(np.clip(threshold, 0, 255)), 255, cv2.THRESH_BINARY)
-
-    kernel_size = settings.morphology_kernel
-    if kernel_size > 1:
-        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    return mask
+    return mocap.threshold_mask(frame, settings)
 
 
 def calibration_window_name(camera_id: int) -> str:
@@ -742,14 +705,12 @@ def open_calibration_cameras(
             width,
             height,
             fps,
-            None,
-            None,
-            None,
-            configure_capture=False,
+            camera_exposure(camera_id, exposure),
+            camera_auto_exposure(camera_id, auto_exposure),
+            camera_gain(camera_id, gain),
+            configure_capture=True,
         )
         if source.open():
-            # Camera parameters are managed by external camera software.
-            # Do not call apply_camera_settings() here.
             sources.append(source)
             print_camera_settings(source)
         else:
@@ -763,16 +724,18 @@ def apply_camera_settings(
     exposure: float | None,
     gain: float | None,
 ) -> None:
-    _ = source, auto_exposure, exposure, gain
-    # Camera parameters are managed by external camera software.
-    # source.capture.set(cv2.CAP_PROP_FRAME_WIDTH, source.width)
-    # source.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, source.height)
-    # source.capture.set(cv2.CAP_PROP_FPS, source.fps)
-    # source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, source.auto_exposure)
-    # source.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
-    # source.capture.set(cv2.CAP_PROP_EXPOSURE, source.exposure)
-    # source.capture.set(cv2.CAP_PROP_GAIN, source.gain)
-    return
+    if source.capture is None:
+        return
+    camera_settings.apply_camera_capture_settings(
+        source.capture,
+        source.camera_id,
+        width=source.width,
+        height=source.height,
+        fps=source.fps,
+        exposure=exposure,
+        auto_exposure=auto_exposure,
+        gain=gain,
+    )
 
 
 def print_camera_settings(source: mocap.CameraSource) -> None:
@@ -843,9 +806,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override gain for every camera. Default uses the camera-test values.",
     )
     parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
-    parser.add_argument("--min-area", type=float, default=8.0)
+    parser.add_argument("--min-area", type=float, default=mocap.DEFAULT_MIN_BLOB_AREA)
     parser.add_argument("--max-area", type=float, default=3500.0)
-    parser.add_argument("--min-radius", type=float, default=2.0)
+    parser.add_argument("--min-radius", type=float, default=mocap.DEFAULT_MIN_BLOB_RADIUS)
     parser.add_argument("--max-radius", type=float, default=60.0)
     parser.add_argument("--min-circularity", type=float, default=0.45)
     parser.add_argument("--min-fill-ratio", type=float, default=0.35)

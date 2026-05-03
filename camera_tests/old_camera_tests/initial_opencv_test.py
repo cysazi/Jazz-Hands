@@ -1,10 +1,11 @@
 import cv2
 
+import multithreaded_camera_testing as camera_settings
+
 
 # Use 0, 1, or 2 to find the correct device node
-camera_index = 1
-cap = cv2.VideoCapture(camera_index)
-cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+camera_index = camera_settings.CAMERA_IDS[0]
+cap = camera_settings.configure_camera(camera_index)
 
 # On some macOS versions, explicitly set the backend
 # cap = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)

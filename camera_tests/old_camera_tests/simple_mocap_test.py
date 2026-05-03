@@ -4,24 +4,24 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import multithreaded_camera_testing as camera_settings
 import mocap_tracker as mocap
 
 
 # Exactly two OpenCV camera indexes. Change these when Windows assigns different indexes.
-CAMERA_IDS = [1, 2]
+CAMERA_IDS = list(camera_settings.CAMERA_IDS[:2])
 
 CALIBRATION_PATH = Path(__file__).resolve().with_name("mocap_calibration.json")
-FRAME_WIDTH = 1280
-FRAME_HEIGHT = 800
+FRAME_WIDTH = camera_settings.FRAME_WIDTH
+FRAME_HEIGHT = camera_settings.FRAME_HEIGHT
 FOCAL_LENGTH_PX = 850.0
 
-THRESHOLD = 230
-BLUR_KERNEL = 5
-MORPHOLOGY_KERNEL = 3
-MIN_AREA = 5.0
-MAX_AREA = 4500.0
-MIN_CIRCULARITY = 0.30
-MAX_ASPECT_RATIO = 3.0
+THRESHOLD = camera_settings.THRESHOLD
+BLUR_KERNEL_BY_CAMERA = camera_settings.BLUR_KERNEL_BY_CAMERA
+MIN_AREA = camera_settings.MIN_BLOB_AREA
+MAX_AREA = camera_settings.MAX_BLOB_AREA
+MIN_CIRCULARITY = camera_settings.MIN_BLOB_CIRCULARITY
+MAX_ASPECT_RATIO = camera_settings.MAX_BLOB_ASPECT_RATIO
 
 SHOW_WINDOWS = True
 SHOW_BINARY_WINDOWS = False
@@ -29,8 +29,7 @@ PRINT_INTERVAL_SECONDS = 0.05
 
 
 def open_camera(camera_id):
-    # Camera exposure/FPS/settings are managed outside this script.
-    cap = cv2.VideoCapture(camera_id)
+    cap = camera_settings.configure_camera(camera_id)
     if not cap.isOpened():
         cap.release()
         return None
@@ -38,30 +37,17 @@ def open_camera(camera_id):
     return cap
 
 
-def preprocess(gray):
-    if BLUR_KERNEL <= 1:
-        return gray
-    kernel_size = BLUR_KERNEL if BLUR_KERNEL % 2 == 1 else BLUR_KERNEL + 1
-    return cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+def preprocess(gray, camera_id):
+    return camera_settings.threshold_source_gray(gray, camera_id)
 
 
-def threshold_frame(frame):
+def threshold_frame(frame, camera_id):
     gray = frame if len(frame.shape) == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    processed = preprocess(gray)
-    _ok, mask = cv2.threshold(processed, THRESHOLD, 255, cv2.THRESH_BINARY)
-
-    if MORPHOLOGY_KERNEL > 1:
-        kernel_size = MORPHOLOGY_KERNEL
-        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    return gray, mask
+    return gray, camera_settings.build_threshold_mask(frame, camera_id)
 
 
 def detect_single_blob(frame, camera_id, timestamp):
-    gray, mask = threshold_frame(frame)
+    gray, mask = threshold_frame(frame, camera_id)
     contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     best_observation = None

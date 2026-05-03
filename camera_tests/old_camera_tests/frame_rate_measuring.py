@@ -2,16 +2,11 @@ import cv2
 import time
 from collections import deque
 
+import multithreaded_camera_testing as camera_settings
+
 # Use 0, 1, or 2 to find the correct device node
-camera_index = 1
-cap = cv2.VideoCapture(camera_index)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 800)
-cap.set(cv2.CAP_PROP_FPS, 120)
-cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
-cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-cap.set(cv2.CAP_PROP_EXPOSURE, -10)
-cap.set(cv2.CAP_PROP_GAIN, 0)
+camera_index = camera_settings.CAMERA_IDS[0]
+cap = camera_settings.configure_camera(camera_index)
 
 
 # print("Width:", cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -48,13 +43,12 @@ def process_frame(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     # Blur to reduce noise
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    blur = camera_settings.threshold_source_gray(gray, camera_index)
 
     # Edge detection
     edges = cv2.Canny(blur, 50, 100)
 
-    # Threshold bright regions
-    _, thresh = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY)
+    thresh = camera_settings.build_threshold_mask(frame, camera_index)
 
     return gray, blur, edges, thresh
 

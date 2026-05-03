@@ -1,6 +1,8 @@
 import cv2
 from pygrabber.dshow_graph import FilterGraph
 
+import multithreaded_camera_testing as camera_settings
+
 
 CAMERA_ROLES = {
     "vertical_1": "Vertical_plane_camera_1",
@@ -31,14 +33,7 @@ def open_camera(role_name, device_name):
     if not cap.isOpened():
         raise RuntimeError(f"Could not open {role_name} at index {index}")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 800)
-    cap.set(cv2.CAP_PROP_FPS, 120)
-
-    # You can change these later
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-    cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-    cap.set(cv2.CAP_PROP_GAIN, 0)
+    camera_settings.apply_camera_capture_settings(cap, index)
 
     print(f"{role_name} opened as OpenCV index {index}: {device_name}")
 

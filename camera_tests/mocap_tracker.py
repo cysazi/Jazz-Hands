@@ -36,13 +36,22 @@ try:
 except ImportError:  # Keep --help and py_compile usable without OpenCV installed.
     cv2 = None
 
+try:
+    import multithreaded_camera_testing as camera_settings
+except ImportError:  # Keep this script usable if the test helper is copied alone.
+    camera_settings = None
+
 # Change this to [1, 2, 3, 4] when running the full camera rig.
-CAMERA_IDS = [1, 2]
+CAMERA_IDS = list(camera_settings.CAMERA_IDS) if camera_settings is not None else [1, 2]
 DEFAULT_CAMERA_IDS = CAMERA_IDS
-FOUR_CAMERA_IDS = [1, 2, 3, 4]
-DEFAULT_FRAME_WIDTH = 1280
-DEFAULT_FRAME_HEIGHT = 800
-DEFAULT_FPS = 120
+FOUR_CAMERA_IDS = (
+    list(camera_settings.FOUR_CAMERA_IDS)
+    if camera_settings is not None
+    else [1, 2, 3, 4]
+)
+DEFAULT_FRAME_WIDTH = camera_settings.FRAME_WIDTH if camera_settings is not None else 1280
+DEFAULT_FRAME_HEIGHT = camera_settings.FRAME_HEIGHT if camera_settings is not None else 800
+DEFAULT_FPS = camera_settings.FPS if camera_settings is not None else 120
 DEFAULT_FOCAL_LENGTH_PX = 850.0
 DEFAULT_ROOM_BOUNDS = ((-5.0, 5.0), (-5.0, 5.0), (-5.0, 5.0))
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().with_name("mocap_calibration.json")
@@ -55,34 +64,62 @@ DEFAULT_VELOCITY_DAMPING = 0.25
 DEFAULT_MISSING_VELOCITY_DECAY = 0.80
 DEFAULT_STATIONARY_DISTANCE_M = 0.03
 DEFAULT_MAX_PREDICTION_DT = 0.10
-DEFAULT_THRESHOLD = 230
-DEFAULT_EXPOSURE = -8
-DEFAULT_GAIN = 0.0
-DEFAULT_AUTOFOCUS = 0
-BLUR_KERNEL_BY_CAMERA = {
-    1: 5,
-    2: 5,
-    3: 15,
-    4: 15,
-}
-DEFAULT_AUTO_EXPOSURE_BY_CAMERA = {
-    1: 0,
-    2: 0,
-    3: 0.25,
-    4: 0,
-}
-DEFAULT_EXPOSURE_BY_CAMERA = {
-    1: -8,
-    2: -8,
-    3: -8,
-    4: -8,
-}
-DEFAULT_GAIN_BY_CAMERA = {
-    1: 0,
-    2: 0,
-    3: 0,
-    4: 0,
-}
+DEFAULT_THRESHOLD = camera_settings.THRESHOLD if camera_settings is not None else 230
+DEFAULT_MIN_BLOB_AREA = (
+    camera_settings.MIN_BLOB_AREA if camera_settings is not None else 0.0
+)
+DEFAULT_MAX_BLOB_AREA = (
+    camera_settings.MAX_BLOB_AREA if camera_settings is not None else 4500.0
+)
+DEFAULT_MIN_BLOB_RADIUS = (
+    camera_settings.MIN_BLOB_RADIUS if camera_settings is not None else 0.0
+)
+DEFAULT_MAX_BLOB_RADIUS = (
+    camera_settings.MAX_BLOB_RADIUS if camera_settings is not None else 80.0
+)
+DEFAULT_MIN_BLOB_CIRCULARITY = (
+    camera_settings.MIN_BLOB_CIRCULARITY if camera_settings is not None else 0.30
+)
+DEFAULT_MIN_BLOB_FILL_RATIO = (
+    camera_settings.MIN_BLOB_FILL_RATIO if camera_settings is not None else 0.20
+)
+DEFAULT_MAX_BLOB_ASPECT_RATIO = (
+    camera_settings.MAX_BLOB_ASPECT_RATIO if camera_settings is not None else 3.0
+)
+DEFAULT_MORPHOLOGY_KERNEL = (
+    camera_settings.MORPHOLOGY_KERNEL if camera_settings is not None else 1
+)
+DEFAULT_EXPOSURE = (
+    camera_settings.EXPOSURE_BY_CAMERA.get(1, -8)
+    if camera_settings is not None
+    else -8
+)
+DEFAULT_GAIN = (
+    camera_settings.GAIN_BY_CAMERA.get(1, 0.0)
+    if camera_settings is not None
+    else 0.0
+)
+DEFAULT_AUTOFOCUS = camera_settings.AUTOFOCUS if camera_settings is not None else 0
+BLUR_KERNEL_BY_CAMERA = (
+    dict(camera_settings.BLUR_KERNEL_BY_CAMERA)
+    if camera_settings is not None
+    else {1: 5, 2: 5, 3: 15, 4: 15}
+)
+DEFAULT_AUTO_EXPOSURE_BY_CAMERA = (
+    dict(camera_settings.AUTO_EXPOSURE_BY_CAMERA)
+    if camera_settings is not None
+    else {1: 0, 2: 0, 3: 0.25, 4: 0}
+)
+DEFAULT_EXPOSURE_BY_CAMERA = (
+    dict(camera_settings.EXPOSURE_BY_CAMERA)
+    if camera_settings is not None
+    else {1: -8, 2: -8, 3: -8, 4: -8}
+)
+DEFAULT_GAIN_BY_CAMERA = (
+    dict(camera_settings.GAIN_BY_CAMERA)
+    if camera_settings is not None
+    else {1: 0, 2: 0, 3: 0, 4: 0}
+)
 
 
 @dataclass(slots=True)
@@ -90,16 +127,16 @@ class DetectionSettings:
     threshold: int | None = None
     threshold_percentile: float = 99.75
     min_threshold: int = 150
-    min_area: float = 5.0
-    max_area: float = 4500.0
-    min_radius_px: float = 1.5
-    max_radius_px: float = 80.0
-    min_circularity: float = 0.30
-    min_fill_ratio: float = 0.20
-    max_aspect_ratio: float = 3.0
+    min_area: float = DEFAULT_MIN_BLOB_AREA
+    max_area: float = DEFAULT_MAX_BLOB_AREA
+    min_radius_px: float = DEFAULT_MIN_BLOB_RADIUS
+    max_radius_px: float = DEFAULT_MAX_BLOB_RADIUS
+    min_circularity: float = DEFAULT_MIN_BLOB_CIRCULARITY
+    min_fill_ratio: float = DEFAULT_MIN_BLOB_FILL_RATIO
+    max_aspect_ratio: float = DEFAULT_MAX_BLOB_ASPECT_RATIO
     min_brightness: float = 0.0
     blur_kernel: int = 3
-    morphology_kernel: int = 1
+    morphology_kernel: int = DEFAULT_MORPHOLOGY_KERNEL
     max_markers_per_camera: int = 12
 
 
@@ -166,16 +203,7 @@ class ReflectiveMarkerDetector:
 
     def detect(self, frame: np.ndarray, camera_id: int, timestamp: float) -> list[MarkerObservation]:
         gray = self._to_gray(frame)
-        processed = self._preprocess(gray)
-        threshold = self._choose_threshold(processed)
-        _ok, mask = cv2.threshold(processed, threshold, 255, cv2.THRESH_BINARY)
-
-        kernel_size = self.settings.morphology_kernel
-        if kernel_size > 1:
-            kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = threshold_mask(frame, self.settings)
 
         contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         observations: list[MarkerObservation] = []
@@ -578,21 +606,30 @@ class CameraSource:
         if self.capture is None:
             return
 
-        # Camera parameters are managed by external camera software.
-        # self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        # self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        # self.capture.set(cv2.CAP_PROP_FPS, self.fps)
-        # self.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
+        if camera_settings is not None:
+            camera_settings.apply_camera_capture_settings(
+                self.capture,
+                self.camera_id,
+                width=self.width,
+                height=self.height,
+                fps=self.fps,
+                exposure=self.exposure,
+                auto_exposure=self.auto_exposure,
+                gain=self.gain,
+            )
+            return
+
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.capture.set(cv2.CAP_PROP_FPS, self.fps)
+        self.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
 
         if self.auto_exposure is not None:
-            # self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(self.auto_exposure))
-            pass
+            self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(self.auto_exposure))
         if self.exposure is not None:
-            # self.capture.set(cv2.CAP_PROP_EXPOSURE, float(self.exposure))
-            pass
+            self.capture.set(cv2.CAP_PROP_EXPOSURE, float(self.exposure))
         if self.gain is not None:
-            # self.capture.set(cv2.CAP_PROP_GAIN, float(self.gain))
-            pass
+            self.capture.set(cv2.CAP_PROP_GAIN, float(self.gain))
 
 
 def triangulate_two_views(
@@ -858,14 +895,12 @@ def open_available_cameras(
             width,
             height,
             fps,
-            None,
-            None,
-            None,
-            configure_capture=False,
+            camera_exposure(camera_id, exposure),
+            camera_auto_exposure(camera_id, auto_exposure),
+            camera_gain(camera_id, gain),
+            configure_capture=True,
         )
         if source.open():
-            # Camera parameters are managed by external camera software.
-            # Do not call apply_camera_settings() here.
             sources.append(source)
             print_camera_settings(source)
         else:
@@ -902,13 +937,28 @@ def apply_camera_settings(
     exposure: float | None,
     gain: float | None,
 ) -> None:
-    _ = source, auto_exposure, exposure, gain
-    # Camera parameters are managed by external camera software.
-    # source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, source.auto_exposure)
-    # source.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
-    # source.capture.set(cv2.CAP_PROP_EXPOSURE, source.exposure)
-    # source.capture.set(cv2.CAP_PROP_GAIN, source.gain)
-    return
+    if source.capture is None:
+        return
+    if camera_settings is not None:
+        camera_settings.apply_camera_capture_settings(
+            source.capture,
+            source.camera_id,
+            width=source.width,
+            height=source.height,
+            fps=source.fps,
+            exposure=exposure,
+            auto_exposure=auto_exposure,
+            gain=gain,
+        )
+        return
+
+    if auto_exposure is not None:
+        source.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, auto_exposure)
+    source.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
+    if exposure is not None:
+        source.capture.set(cv2.CAP_PROP_EXPOSURE, exposure)
+    if gain is not None:
+        source.capture.set(cv2.CAP_PROP_GAIN, gain)
 
 
 def print_camera_settings(source: CameraSource) -> None:
@@ -936,6 +986,7 @@ def build_detection_settings(args: argparse.Namespace, camera_id: int) -> Detect
         max_aspect_ratio=args.max_aspect_ratio,
         min_brightness=args.min_brightness,
         blur_kernel=BLUR_KERNEL_BY_CAMERA.get(camera_id, 1),
+        morphology_kernel=DEFAULT_MORPHOLOGY_KERNEL,
         max_markers_per_camera=args.max_markers_per_camera,
     )
 
@@ -1009,9 +1060,7 @@ def detect_blob_inside_box(
     timestamp: float,
 ) -> MarkerObservation | None:
     gray = frame if len(frame.shape) == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    processed = preprocess_gray(gray, settings.blur_kernel)
-    threshold = choose_threshold(processed, settings)
-    _ok, mask = cv2.threshold(processed, threshold, 255, cv2.THRESH_BINARY)
+    mask = threshold_mask(frame, settings)
 
     x_center, y_center = previous_observation.pixel
     height, width = mask.shape[:2]
@@ -1029,7 +1078,7 @@ def detect_blob_inside_box(
 
     for contour in contours:
         area = float(cv2.contourArea(contour))
-        if area < 1.0 or area > settings.max_area * 4.0:
+        if area < settings.min_area or area > settings.max_area * 4.0:
             continue
 
         (x, y), radius = cv2.minEnclosingCircle(contour)
@@ -1075,6 +1124,9 @@ def detect_blob_inside_box(
 
 
 def preprocess_gray(gray: np.ndarray, blur_kernel: int) -> np.ndarray:
+    if camera_settings is not None:
+        return camera_settings.threshold_source_gray(gray, 0, blur_kernel=blur_kernel)
+
     if blur_kernel <= 1:
         return gray
     blur_kernel = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
@@ -1090,6 +1142,14 @@ def choose_threshold(gray: np.ndarray, settings: DetectionSettings) -> int:
 
 
 def threshold_mask(frame: np.ndarray, settings: DetectionSettings) -> np.ndarray:
+    if camera_settings is not None:
+        return camera_settings.build_threshold_mask(
+            frame,
+            0,
+            threshold=settings.threshold,
+            blur_kernel=settings.blur_kernel,
+        )
+
     gray = frame if len(frame.shape) == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     processed = preprocess_gray(gray, settings.blur_kernel)
     threshold = choose_threshold(processed, settings)
@@ -1394,13 +1454,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="xmin,xmax,ymin,ymax,zmin,zmax in meters. Default: -5,5,-5,5,-5,5",
     )
     parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
-    parser.add_argument("--min-area", type=float, default=5.0)
-    parser.add_argument("--max-area", type=float, default=4500.0)
-    parser.add_argument("--min-radius", type=float, default=1.5)
-    parser.add_argument("--max-radius", type=float, default=80.0)
-    parser.add_argument("--min-circularity", type=float, default=0.30)
-    parser.add_argument("--min-fill-ratio", type=float, default=0.20)
-    parser.add_argument("--max-aspect-ratio", type=float, default=3.0)
+    parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_BLOB_AREA)
+    parser.add_argument("--max-area", type=float, default=DEFAULT_MAX_BLOB_AREA)
+    parser.add_argument("--min-radius", type=float, default=DEFAULT_MIN_BLOB_RADIUS)
+    parser.add_argument("--max-radius", type=float, default=DEFAULT_MAX_BLOB_RADIUS)
+    parser.add_argument("--min-circularity", type=float, default=DEFAULT_MIN_BLOB_CIRCULARITY)
+    parser.add_argument("--min-fill-ratio", type=float, default=DEFAULT_MIN_BLOB_FILL_RATIO)
+    parser.add_argument("--max-aspect-ratio", type=float, default=DEFAULT_MAX_BLOB_ASPECT_RATIO)
     parser.add_argument("--min-brightness", type=float, default=0.0)
     parser.add_argument("--max-markers-per-camera", type=int, default=12)
     parser.add_argument("--max-reprojection-error", type=float, default=45.0)

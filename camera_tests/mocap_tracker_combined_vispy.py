@@ -27,6 +27,13 @@ except ImportError:  # Keep --help and py_compile usable without VisPy installed
 import mocap_tracker as mocap
 
 
+# Set this to False to use mocap_calibration.json instead.
+USE_ALIGNED_MOVEMENT_CALIBRATION = True
+STANDARD_CALIBRATION_PATH = Path(__file__).resolve().with_name("mocap_calibration.json")
+ALIGNED_MOVEMENT_CALIBRATION_PATH = Path(__file__).resolve().with_name(
+    "mocap_calibration_aligned.json"
+)
+
 DEFAULT_TRAIL_SECONDS = 4.0
 DEFAULT_UPDATE_HZ = 120.0
 DEFAULT_PANEL_WIDTH = 640
@@ -36,6 +43,12 @@ DEFAULT_POSITION_SCALE = 1.0
 DEFAULT_LINE_WIDTH = 4.0
 DEFAULT_POINT_SIZE = 12.0
 TRAIL_COLOR = (0.15, 1.00, 0.25, 1.0)
+
+
+def default_calibration_path() -> Path:
+    if USE_ALIGNED_MOVEMENT_CALIBRATION:
+        return ALIGNED_MOVEMENT_CALIBRATION_PATH
+    return STANDARD_CALIBRATION_PATH
 
 
 def configure_vispy_backend() -> str:
@@ -55,6 +68,7 @@ def configure_vispy_backend() -> str:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = mocap.build_arg_parser()
+    parser.set_defaults(calibration=str(default_calibration_path()))
     parser.description = (
         "Track mocap markers with a single 2x2 camera preview window and "
         "a VisPy 3D trail window."

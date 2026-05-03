@@ -1,39 +1,25 @@
 import cv2
 import time
 
+import multithreaded_camera_testing as camera_settings
+
 # Change these if Windows assigns the cameras different indexes.
-CAMERA_INDEXES = [1]
+CAMERA_INDEXES = list(camera_settings.CAMERA_IDS)
 
 # CAMERA_ROLES = {
 #     "vertical_1": "Vertical_plane_camera_1",
 #     "vertical_2": "Vertical_plane_camera_2",
 # }
 
-FRAME_WIDTH = 1280
-FRAME_HEIGHT = 800
-FPS = 120
-THRESHOLD = 230
-AUTOFOCUS = 0
-BLUR_KERNEL_BY_CAMERA = {
-    1: 5,
-    2: 5,
-    3: 15,
-}
-AUTO_EXPOSURE_BY_CAMERA = {
-    1: 0,
-    2: 0,
-    3: 0.25,
-}
-EXPOSURE_BY_CAMERA = {
-    1: -8,
-    2: -8,
-    3: -8,
-}
-GAIN_BY_CAMERA = {
-    1: 0,
-    2: 0,
-    3: 0,
-}
+FRAME_WIDTH = camera_settings.FRAME_WIDTH
+FRAME_HEIGHT = camera_settings.FRAME_HEIGHT
+FPS = camera_settings.FPS
+THRESHOLD = camera_settings.THRESHOLD
+AUTOFOCUS = camera_settings.AUTOFOCUS
+BLUR_KERNEL_BY_CAMERA = camera_settings.BLUR_KERNEL_BY_CAMERA
+AUTO_EXPOSURE_BY_CAMERA = camera_settings.AUTO_EXPOSURE_BY_CAMERA
+EXPOSURE_BY_CAMERA = camera_settings.EXPOSURE_BY_CAMERA
+GAIN_BY_CAMERA = camera_settings.GAIN_BY_CAMERA
 
 
 class DeliveredFpsCounter:
@@ -54,22 +40,11 @@ class DeliveredFpsCounter:
 
 
 def configure_camera(camera_index):
-    cap = cv2.VideoCapture(camera_index)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, FPS)
-    apply_manual_exposure(cap, camera_index)
-    return cap
+    return camera_settings.configure_camera(camera_index)
 
 
 def apply_manual_exposure(cap, camera_index):
-    cap.set(
-        cv2.CAP_PROP_AUTO_EXPOSURE,
-        AUTO_EXPOSURE_BY_CAMERA.get(camera_index, 0.0),
-    )
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, AUTOFOCUS)
-    cap.set(cv2.CAP_PROP_EXPOSURE, EXPOSURE_BY_CAMERA.get(camera_index, -10))
-    cap.set(cv2.CAP_PROP_GAIN, GAIN_BY_CAMERA.get(camera_index, 0))
+    camera_settings.apply_manual_exposure(cap, camera_index)
 
 
 def draw_fps(frame, fps):
@@ -86,13 +61,7 @@ def draw_fps(frame, fps):
 
 
 def process_frame(frame, camera_index):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur_kernel = BLUR_KERNEL_BY_CAMERA.get(camera_index, 1)
-    if blur_kernel > 1:
-        blur_kernel = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
-        gray = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
-    _, thresh = cv2.threshold(gray, THRESHOLD, 255, cv2.THRESH_BINARY)
-    return thresh
+    return camera_settings.build_threshold_mask(frame, camera_index)
 
 
 captures = {}
