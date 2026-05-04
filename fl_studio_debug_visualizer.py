@@ -41,7 +41,8 @@ ENABLE_MIDI = True
 MIDI_OUTPUT_HINT = "JazzHands (A)"
 MIDI_BASE_NOTE = 60
 MIDI_VELOCITY = 96
-HAND_MIDI_CHANNELS_1_BASED = {"LEFT": 1, "RIGHT": 2}
+HAND_MIDI_CHANNELS_1_BASED = {"LEFT": 1, "RIGHT": 1}
+DEFAULT_MAX_MIDI_CHANNEL = 4
 
 POSITION_SCALE = 1.0
 MODEL_SCALE = 0.02
@@ -148,6 +149,11 @@ def configure_vispy_backend() -> str:
     return app.use_app().backend_name
 
 
+def clamp_midi_channel_1_based(value: int, max_channel: int = 16) -> int:
+    upper = int(np.clip(int(max_channel), 1, 16))
+    return int(np.clip(int(value), 1, upper))
+
+
 def normalize_quat(q: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64)
     norm = np.linalg.norm(q)
@@ -194,6 +200,7 @@ class DualHandFLStudioVisualizer:
         midi_base_note: int = MIDI_BASE_NOTE,
         midi_velocity: int = MIDI_VELOCITY,
         midi_channels_1_based: dict[str, int] | None = None,
+        max_midi_channel: int = DEFAULT_MAX_MIDI_CHANNEL,
         require_inside_plane_to_play: bool = False,
         keyboard_buttons_enabled: bool = True,
         controlled_hand_label: str = "LEFT",
@@ -208,10 +215,11 @@ class DualHandFLStudioVisualizer:
         self.midi_output_hint = str(midi_output_hint)
         self.midi_base_note = int(np.clip(midi_base_note, 0, 127))
         self.midi_velocity = int(np.clip(midi_velocity, 1, 127))
+        self.max_midi_channel = int(np.clip(int(max_midi_channel), 1, 16))
         channels = midi_channels_1_based or HAND_MIDI_CHANNELS_1_BASED
         self.midi_channels = {
-            "LEFT": int(np.clip(int(channels.get("LEFT", 1)), 1, 16)) - 1,
-            "RIGHT": int(np.clip(int(channels.get("RIGHT", 2)), 1, 16)) - 1,
+            "LEFT": clamp_midi_channel_1_based(channels.get("LEFT", HAND_MIDI_CHANNELS_1_BASED["LEFT"]), self.max_midi_channel) - 1,
+            "RIGHT": clamp_midi_channel_1_based(channels.get("RIGHT", HAND_MIDI_CHANNELS_1_BASED["RIGHT"]), self.max_midi_channel) - 1,
         }
         self.require_inside_plane_to_play = bool(require_inside_plane_to_play)
         self.keyboard_buttons_enabled = bool(keyboard_buttons_enabled)
@@ -436,9 +444,35 @@ class DualHandFLStudioVisualizer:
             self._send_note_on(desired_note, channel)
         self.active_midi_notes[label] = desired_note
 
-    def close_midi(self) -> None:
+    def _all_midi_notes_off(self) -> None:
+        if not hasattr(self, "active_midi_notes"):
+            return
         for label in self.hand_labels:
             self._update_midi_note(label, None)
+
+    def midi_channel_text(self) -> str:
+        left_channel = self.midi_channels["LEFT"] + 1
+        right_channel = self.midi_channels["RIGHT"] + 1
+        return f"channels LEFT={left_channel} RIGHT={right_channel} max={self.max_midi_channel}"
+
+    def set_hand_midi_channel(self, label: str, channel_1_based: int) -> None:
+        hand_label = self._normalize_label(label)
+        next_channel = clamp_midi_channel_1_based(channel_1_based, self.max_midi_channel) - 1
+        if next_channel == self.midi_channels[hand_label]:
+            return
+
+        self._update_midi_note(hand_label, None)
+        self.midi_channels[hand_label] = next_channel
+        print(f"[FL visualizer MIDI] {hand_label} channel {next_channel + 1}")
+
+    def cycle_hand_midi_channel(self, label: str, delta: int = 1) -> None:
+        hand_label = self._normalize_label(label)
+        current_channel = self.midi_channels[hand_label] + 1
+        next_channel = ((current_channel - 1 + int(delta)) % self.max_midi_channel) + 1
+        self.set_hand_midi_channel(hand_label, next_channel)
+
+    def close_midi(self) -> None:
+        self._all_midi_notes_off()
         if self.midi_out is not None:
             self.midi_out.close()
             self.midi_out = None
@@ -478,6 +512,14 @@ class DualHandFLStudioVisualizer:
             self.rotation_step = float(np.clip(self.rotation_step + ANGULAR_STEP_DELTA, ANGULAR_STEP_MIN, ANGULAR_STEP_MAX))
         elif key_name == "LEFT":
             self.rotation_step = float(np.clip(self.rotation_step - ANGULAR_STEP_DELTA, ANGULAR_STEP_MIN, ANGULAR_STEP_MAX))
+        elif key_name.isdigit() and key_name != "0":
+            channel = int(key_name)
+            if channel <= self.max_midi_channel:
+                self.set_hand_midi_channel(self.controlled_hand_label, channel)
+        elif key_name.startswith("DIGIT") and key_name[5:].isdigit():
+            channel = int(key_name[5:])
+            if 1 <= channel <= self.max_midi_channel:
+                self.set_hand_midi_channel(self.controlled_hand_label, channel)
 
         self._update_keyboard_motion()
 
@@ -824,6 +866,12 @@ class DualHandFLStudioVisualizer:
 
     def _update_status_text(self) -> None:
         lines = []
+        keyboard_channel_max = min(self.max_midi_channel, 9)
+        channel_key_text = (
+            "1 set selected channel"
+            if keyboard_channel_max <= 1
+            else f"1-{keyboard_channel_max} set selected channel"
+        )
         for label in self.hand_labels:
             state = self.hands[label]
             plane_text = "plane=not set"
@@ -844,18 +892,22 @@ class DualHandFLStudioVisualizer:
                 f"inside={'yes' if state.last_inside else 'no'} "
                 f"note={state.last_note_name} | {plane_text}"
             )
-        controls = (
-            "Keyboard ON: TAB hand, WASDQE move, IJKLUO rotate, SPACE draw, "
-            "C clear, F flip play side, arrows adjust steps"
-            if self.keyboard_controlled
-            else "Keyboard OFF: drive with set_hand_pose(label, position, rotation_quaternion, button_pressed)"
-        )
+        if self.keyboard_controlled:
+            controls = (
+                "Keyboard ON: TAB hand, WASDQE move, IJKLUO rotate, SPACE draw, "
+                f"C clear, F flip play side, arrows adjust steps, {channel_key_text}"
+            )
+        else:
+            controls = (
+                "Keyboard OFF: drive with set_hand_pose(label, position, rotation_quaternion, button_pressed) | "
+                f"{channel_key_text}"
+            )
         if not self.allow_hand_switching:
             controls = f"{controls} | controls locked to {self.controlled_hand_label}"
         midi_text = self.midi_output_name if self.midi_output_name else "disconnected"
         self.status_text.text = "\n".join(
             [
-                f"Controlling: {self.controlled_hand_label} | MIDI: {midi_text}",
+                f"Controlling: {self.controlled_hand_label} | MIDI: {midi_text} | {self.midi_channel_text()}",
                 *self.external_status_lines,
                 *lines,
                 f"move_step={self.velocity_step:.2f} rotate_step={self.rotation_step:.2f}",
@@ -881,6 +933,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--midi-velocity", type=int, default=MIDI_VELOCITY)
     parser.add_argument("--left-midi-channel", type=int, default=HAND_MIDI_CHANNELS_1_BASED["LEFT"])
     parser.add_argument("--right-midi-channel", type=int, default=HAND_MIDI_CHANNELS_1_BASED["RIGHT"])
+    parser.add_argument("--max-midi-channel", type=int, default=DEFAULT_MAX_MIDI_CHANNEL)
     parser.add_argument("--require-inside-plane", action="store_true")
     parser.add_argument("--update-hz", type=float, default=120.0)
     return parser
@@ -894,16 +947,15 @@ def main() -> int:
         midi_output_hint=args.midi_output_hint,
         midi_base_note=args.midi_base_note,
         midi_velocity=args.midi_velocity,
-        midi_channels_1_based={
-            "LEFT": args.left_midi_channel,
-            "RIGHT": args.right_midi_channel,
-        },
+        midi_channels_1_based={"LEFT": args.left_midi_channel, "RIGHT": args.right_midi_channel},
+        max_midi_channel=args.max_midi_channel,
         require_inside_plane_to_play=args.require_inside_plane,
         update_hz=args.update_hz,
     )
 
     print("Starting FL Studio Debug Visualizer...")
     print("Controls: TAB switches hand, WASDQE moves, IJKLUO rotates, SPACE draws, C clears, F flips play side.")
+    print("MIDI channels: number keys set the selected hand's channel.")
     try:
         app.run()
     finally:

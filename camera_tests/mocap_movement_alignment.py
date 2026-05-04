@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ import numpy as np
 
 import mocap_tracker as mocap
 import mocap_tracker_combined_vispy as combined
+import playing_test
 
 
 DEFAULT_OUTPUT_PATH = Path(__file__).resolve().with_name("mocap_calibration_aligned.json")
@@ -103,6 +105,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MIN_AXIS_DISTANCE_M,
         help="Minimum origin-to-up and horizontal origin-to-forward distance in meters.",
+    )
+    parser.add_argument(
+        "--threaded",
+        action="store_true",
+        help="Read and detect each camera on its own worker thread.",
+    )
+    parser.add_argument(
+        "--exit-after-save",
+        action="store_true",
+        help="Exit immediately after saving the aligned calibration.",
     )
     return parser
 
@@ -299,6 +311,8 @@ class MovementAlignmentApp:
         self.raw_calibration = raw_calibration
         self.input_path = input_path
         self.output_path = output_path
+        self.threaded = bool(getattr(args, "threaded", False))
+        self.stop_event = threading.Event()
         self.preview_camera_ids = [source.camera_id for source in sources[:2]]
         self.settings_by_camera = {
             source.camera_id: mocap.build_detection_settings(args, source.camera_id)
@@ -331,10 +345,25 @@ class MovementAlignmentApp:
         self.current_track: mocap.MarkerTrack | None = None
         self.last_print_time = 0.0
         self.last_save_error: str | None = None
+        self.last_processed_frame_numbers: dict[int, int] = {}
+        self.camera_workers: list[playing_test.CameraProcessingWorker] = []
         self.closed = False
 
         self._setup_combined_preview_window()
         self._setup_vispy_window()
+        if self.threaded:
+            self.camera_workers = [
+                playing_test.CameraProcessingWorker(
+                    source=source,
+                    detector=self.detectors[source.camera_id],
+                    stop_event=self.stop_event,
+                    build_preview_mask=False,
+                )
+                for source in self.sources
+            ]
+            for worker in self.camera_workers:
+                worker.start()
+            print(f"[alignment] started {len(self.camera_workers)} threaded camera workers")
         self.timer = app.Timer(
             interval=max(1.0 / max(float(args.update_hz), 1.0), 0.001),
             connect=self.update,
@@ -458,21 +487,13 @@ class MovementAlignmentApp:
             return
 
         timestamp = time.time()
-        frames: dict[int, np.ndarray] = {}
-        observations_by_camera: dict[int, list[mocap.MarkerObservation]] = {}
-
-        for source in self.sources:
-            ok, frame = source.read()
-            if not ok or frame is None:
-                observations_by_camera[source.camera_id] = []
-                continue
-
-            frames[source.camera_id] = frame
-            observations_by_camera[source.camera_id] = self.detectors[source.camera_id].detect(
-                frame,
-                source.camera_id,
-                timestamp,
-            )
+        frames, observations_by_camera, has_new_data = self._read_camera_inputs(timestamp)
+        if self.threaded and not has_new_data:
+            if not self.args.no_preview:
+                key = mocap.cv2.waitKey(1) & 0xFF
+                self._handle_key(key)
+            self._draw_vispy(timestamp, observations_by_camera)
+            return
 
         mocap.lock_observations_to_existing_tracks(
             frames,
@@ -511,6 +532,46 @@ class MovementAlignmentApp:
             mocap.cv2.imshow(DEFAULT_WINDOW_NAME, combined_preview)
             key = mocap.cv2.waitKey(1) & 0xFF
             self._handle_key(key)
+
+    def _read_camera_inputs(
+        self,
+        timestamp: float,
+    ) -> tuple[dict[int, np.ndarray], dict[int, list[mocap.MarkerObservation]], bool]:
+        if not self.threaded:
+            frames: dict[int, np.ndarray] = {}
+            observations_by_camera: dict[int, list[mocap.MarkerObservation]] = {}
+            for source in self.sources:
+                ok, frame = source.read()
+                if not ok or frame is None:
+                    observations_by_camera[source.camera_id] = []
+                    continue
+
+                frames[source.camera_id] = frame
+                observations_by_camera[source.camera_id] = self.detectors[source.camera_id].detect(
+                    frame,
+                    source.camera_id,
+                    timestamp,
+                )
+            return frames, observations_by_camera, True
+
+        snapshots = {worker.source.camera_id: worker.snapshot() for worker in self.camera_workers}
+        has_new_data = any(
+            snapshot.frame_number != self.last_processed_frame_numbers.get(camera_id, -1)
+            for camera_id, snapshot in snapshots.items()
+        )
+        for camera_id, snapshot in snapshots.items():
+            self.last_processed_frame_numbers[camera_id] = snapshot.frame_number
+
+        frames = {
+            camera_id: snapshot.frame
+            for camera_id, snapshot in snapshots.items()
+            if snapshot.frame is not None
+        }
+        observations_by_camera = {
+            camera_id: snapshot.observations or []
+            for camera_id, snapshot in snapshots.items()
+        }
+        return frames, observations_by_camera, has_new_data
 
     def _collect_pending_sample(self, track: mocap.MarkerTrack) -> None:
         if self.pending_label is None:
@@ -744,6 +805,13 @@ class MovementAlignmentApp:
 
         self.last_save_error = None
         print(f"[alignment] saved aligned calibration to {self.output_path}")
+        if getattr(self.args, "exit_after_save", False):
+            self.close()
+            self.canvas.close()
+            try:
+                app.quit()
+            except Exception:
+                pass
 
     def _status_message(
         self,
@@ -802,6 +870,9 @@ class MovementAlignmentApp:
         self.closed = True
         if hasattr(self, "timer"):
             self.timer.stop()
+        self.stop_event.set()
+        for worker in self.camera_workers:
+            worker.join(timeout=0.5)
         for source in self.sources:
             source.close()
         if mocap.cv2 is not None:

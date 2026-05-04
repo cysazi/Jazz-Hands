@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass
 from itertools import combinations, permutations
@@ -110,6 +111,22 @@ class PoseEstimate:
 class PoseStabilityState:
     estimate: PoseEstimate | None = None
     stable_frames: int = 0
+
+
+@dataclass(slots=True)
+class CalibrationCameraSnapshot:
+    camera_id: int
+    frame: np.ndarray | None = None
+    observations: list[mocap.MarkerObservation] | None = None
+    stable_estimate: PoseEstimate | None = None
+    stability_state: PoseStabilityState | None = None
+    timestamp: float = 0.0
+    frame_number: int = 0
+    delivered_fps: float = 0.0
+    read_ms: float = 0.0
+    detect_ms: float = 0.0
+    solve_ms: float = 0.0
+    error: str | None = None
 
 
 def build_default_target_points() -> dict[str, np.ndarray]:
@@ -767,6 +784,148 @@ def build_detection_settings(args: argparse.Namespace, camera_id: int) -> mocap.
     )
 
 
+class CalibrationCameraWorker(threading.Thread):
+    def __init__(
+        self,
+        source: mocap.CameraSource,
+        detector: mocap.ReflectiveMarkerDetector,
+        target_points: dict[str, np.ndarray],
+        intrinsic: np.ndarray,
+        dist_coeffs: np.ndarray,
+        args: argparse.Namespace,
+        stop_event: threading.Event,
+    ):
+        super().__init__(daemon=True)
+        self.source = source
+        self.detector = detector
+        self.target_points = target_points
+        self.intrinsic = intrinsic
+        self.dist_coeffs = dist_coeffs
+        self.args = args
+        self.stop_event = stop_event
+        self.lock = threading.Lock()
+        self.pose_stability = PoseStabilityState()
+        self.next_pose_solve_time = 0.0
+        self.frame_intervals: list[float] = []
+        self.last_frame_time: float | None = None
+        self.snapshot_data = CalibrationCameraSnapshot(
+            camera_id=source.camera_id,
+            observations=[],
+            stability_state=PoseStabilityState(),
+        )
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            read_start = time.perf_counter()
+            ok, frame = self.source.read()
+            read_end = time.perf_counter()
+            timestamp = time.time()
+
+            if not ok or frame is None:
+                self._store_snapshot(
+                    frame=None,
+                    observations=[],
+                    stable_estimate=None,
+                    timestamp=timestamp,
+                    read_ms=(read_end - read_start) * 1000.0,
+                    detect_ms=0.0,
+                    solve_ms=0.0,
+                    error="read failed",
+                )
+                time.sleep(0.001)
+                continue
+
+            detect_start = time.perf_counter()
+            observations = self.detector.detect(frame, self.source.camera_id, timestamp)
+            detect_end = time.perf_counter()
+
+            stable_estimate = self.snapshot_data.stable_estimate
+            solve_ms = 0.0
+            if timestamp >= self.next_pose_solve_time:
+                self.next_pose_solve_time = timestamp + max(self.args.pose_solve_interval, 0.05)
+                solve_start = time.perf_counter()
+                estimate = solve_camera_pose(
+                    self.source.camera_id,
+                    observations,
+                    self.target_points,
+                    self.intrinsic,
+                    self.dist_coeffs,
+                    self.args.max_reprojection_error,
+                    self.args.size_weight,
+                    self.args.min_pose_markers,
+                    self.args.max_pose_candidates,
+                    self.args.top_marker_label,
+                    self.args.top_marker_margin_px,
+                    self.pose_stability.estimate,
+                    self.args.assignment_memory_weight,
+                    self.args.assignment_switch_margin,
+                    self.args.assignment_stability_pixels,
+                )
+                solve_ms = (time.perf_counter() - solve_start) * 1000.0
+                stable_estimate = update_pose_stability(
+                    self.pose_stability,
+                    estimate,
+                    self.args.assignment_stability_pixels,
+                    self.args.stable_pose_frames,
+                )
+
+            if self.last_frame_time is not None:
+                interval = timestamp - self.last_frame_time
+                if interval > 0:
+                    self.frame_intervals.append(interval)
+                    self.frame_intervals = self.frame_intervals[-120:]
+            self.last_frame_time = timestamp
+
+            self._store_snapshot(
+                frame=frame,
+                observations=observations,
+                stable_estimate=stable_estimate,
+                timestamp=timestamp,
+                read_ms=(read_end - read_start) * 1000.0,
+                detect_ms=(detect_end - detect_start) * 1000.0,
+                solve_ms=solve_ms,
+                error=None,
+            )
+
+    def _store_snapshot(
+        self,
+        frame: np.ndarray | None,
+        observations: list[mocap.MarkerObservation],
+        stable_estimate: PoseEstimate | None,
+        timestamp: float,
+        read_ms: float,
+        detect_ms: float,
+        solve_ms: float,
+        error: str | None,
+    ) -> None:
+        with self.lock:
+            frame_number = self.snapshot_data.frame_number + (1 if frame is not None else 0)
+            delivered_fps = 0.0
+            if self.frame_intervals:
+                delivered_fps = len(self.frame_intervals) / sum(self.frame_intervals)
+            self.snapshot_data = CalibrationCameraSnapshot(
+                camera_id=self.source.camera_id,
+                frame=frame,
+                observations=list(observations),
+                stable_estimate=stable_estimate,
+                stability_state=PoseStabilityState(
+                    estimate=self.pose_stability.estimate,
+                    stable_frames=self.pose_stability.stable_frames,
+                ),
+                timestamp=timestamp,
+                frame_number=frame_number,
+                delivered_fps=delivered_fps,
+                read_ms=read_ms,
+                detect_ms=detect_ms,
+                solve_ms=solve_ms,
+                error=error,
+            )
+
+    def snapshot(self) -> CalibrationCameraSnapshot:
+        with self.lock:
+            return self.snapshot_data
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create mocap camera calibration JSON from the tetrahedral IR target.",
@@ -886,11 +1045,186 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--no-preview", action="store_true")
     parser.add_argument(
+        "--threaded",
+        action="store_true",
+        help="Read/detect/solve each camera on its own worker thread.",
+    )
+    parser.add_argument(
+        "--exit-after-save",
+        action="store_true",
+        help="Exit immediately after pressing s to save. Used by the full-run launcher.",
+    )
+    parser.add_argument(
         "--auto-save",
         action="store_true",
         help="Save and exit once every connected camera has a valid pose.",
     )
     return parser
+
+
+def run_threaded_calibration(
+    args: argparse.Namespace,
+    sources: list[mocap.CameraSource],
+    target_points: dict[str, np.ndarray],
+    intrinsic: np.ndarray,
+    dist_coeffs: np.ndarray,
+) -> int:
+    settings_by_camera = {
+        source.camera_id: build_detection_settings(args, source.camera_id)
+        for source in sources
+    }
+    detectors = {
+        camera_id: mocap.ReflectiveMarkerDetector(settings)
+        for camera_id, settings in settings_by_camera.items()
+    }
+    stop_event = threading.Event()
+    workers = [
+        CalibrationCameraWorker(
+            source,
+            detectors[source.camera_id],
+            target_points,
+            intrinsic,
+            dist_coeffs,
+            args,
+            stop_event,
+        )
+        for source in sources
+    ]
+    for worker in workers:
+        worker.start()
+    print(f"[calibration] started {len(workers)} threaded camera workers")
+
+    show_preview = not args.no_preview
+    if show_preview:
+        create_preview_windows(sources)
+
+    captured_estimates: dict[int, PoseEstimate] = {}
+    last_print_time = 0.0
+
+    try:
+        while True:
+            timestamp = time.time()
+            snapshots = {worker.source.camera_id: worker.snapshot() for worker in workers}
+            latest_observations = {
+                camera_id: snapshot.observations or []
+                for camera_id, snapshot in snapshots.items()
+            }
+            latest_frames = {
+                camera_id: snapshot.frame
+                for camera_id, snapshot in snapshots.items()
+                if snapshot.frame is not None
+            }
+            latest_estimates = {
+                camera_id: snapshot.stable_estimate
+                for camera_id, snapshot in snapshots.items()
+                if snapshot.stable_estimate is not None
+            }
+            pose_stability_by_camera = {
+                camera_id: snapshot.stability_state or PoseStabilityState()
+                for camera_id, snapshot in snapshots.items()
+            }
+
+            if timestamp - last_print_time > 0.5:
+                last_print_time = timestamp
+                print_pose_status(
+                    sources,
+                    latest_observations,
+                    latest_estimates,
+                    captured_estimates,
+                    pose_stability_by_camera,
+                    args.stable_pose_frames,
+                )
+                stats = " | ".join(
+                    f"cam {camera_id}: {snapshot.delivered_fps:.1f}fps "
+                    f"read={snapshot.read_ms:.1f}ms detect={snapshot.detect_ms:.1f}ms solve={snapshot.solve_ms:.1f}ms"
+                    for camera_id, snapshot in sorted(snapshots.items())
+                    if snapshot.error is None
+                )
+                if stats:
+                    print(f"[calibration threads] {stats}")
+
+            if args.auto_save and len(latest_estimates) == len(sources):
+                captured_estimates.update(latest_estimates)
+                write_calibration_json(
+                    args.output,
+                    captured_estimates,
+                    target_points,
+                    intrinsic,
+                    dist_coeffs,
+                    args.width,
+                    args.height,
+                    args.focal_length_px,
+                )
+                print(f"[calibration] saved {len(captured_estimates)} cameras to {args.output}")
+                break
+
+            if show_preview:
+                for camera_id, frame in latest_frames.items():
+                    preview = draw_estimate_overlay(
+                        frame,
+                        latest_observations.get(camera_id, []),
+                        latest_estimates.get(camera_id),
+                        target_points,
+                        intrinsic,
+                        dist_coeffs,
+                        settings_by_camera[camera_id],
+                        camera_id in captured_estimates,
+                    )
+                    cv2.imshow(calibration_window_name(camera_id), preview)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    break
+                if key == ord("c"):
+                    if latest_estimates:
+                        captured_estimates.update(latest_estimates)
+                        print(f"[calibration] captured cameras: {sorted(captured_estimates)}")
+                    else:
+                        print("[calibration] no valid poses to capture yet")
+                if key == ord("s"):
+                    if not captured_estimates:
+                        print("[calibration] nothing captured yet; press c first")
+                    else:
+                        write_calibration_json(
+                            args.output,
+                            captured_estimates,
+                            target_points,
+                            intrinsic,
+                            dist_coeffs,
+                            args.width,
+                            args.height,
+                            args.focal_length_px,
+                        )
+                        print(f"[calibration] saved {len(captured_estimates)} cameras to {args.output}")
+                        if args.exit_after_save:
+                            break
+            else:
+                if latest_estimates:
+                    captured_estimates.update(latest_estimates)
+                    write_calibration_json(
+                        args.output,
+                        captured_estimates,
+                        target_points,
+                        intrinsic,
+                        dist_coeffs,
+                        args.width,
+                        args.height,
+                        args.focal_length_px,
+                    )
+                    print(f"[calibration] saved {len(captured_estimates)} cameras to {args.output}")
+                    break
+    except KeyboardInterrupt:
+        print("\n[calibration] stopped")
+    finally:
+        stop_event.set()
+        for worker in workers:
+            worker.join(timeout=0.5)
+        for source in sources:
+            source.close()
+        if cv2 is not None:
+            cv2.destroyAllWindows()
+
+    return 0
 
 
 def main() -> int:
@@ -925,6 +1259,9 @@ def main() -> int:
     if not sources:
         print("[calibration] no cameras opened")
         return 1
+
+    if args.threaded:
+        return run_threaded_calibration(args, sources, target_points, intrinsic, dist_coeffs)
 
     settings_by_camera = {
         source.camera_id: build_detection_settings(args, source.camera_id)
@@ -1068,6 +1405,8 @@ def main() -> int:
                             args.focal_length_px,
                         )
                         print(f"[calibration] saved {len(captured_estimates)} cameras to {args.output}")
+                        if args.exit_after_save:
+                            break
             else:
                 if latest_estimates:
                     captured_estimates.update(latest_estimates)

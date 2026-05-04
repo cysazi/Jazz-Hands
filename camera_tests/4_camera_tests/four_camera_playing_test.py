@@ -39,6 +39,8 @@ RIGHT_HAND_HIGHER_ON_SIDE_AXIS = two_camera_playing.RIGHT_HAND_HIGHER_ON_SIDE_AX
 CONTROLLED_HAND_LABEL = two_camera_playing.CONTROLLED_HAND_LABEL
 USE_SERIAL_IMU_ROTATION = two_camera_playing.USE_SERIAL_IMU_ROTATION
 IMU_PLANE_DRAW_HAND_LABEL = two_camera_playing.IMU_PLANE_DRAW_HAND_LABEL
+IMU_CHANNEL_CYCLE_HAND_LABEL = two_camera_playing.IMU_CHANNEL_CYCLE_HAND_LABEL
+IMU_CHANNEL_CYCLE_TARGET_HAND_LABEL = two_camera_playing.IMU_CHANNEL_CYCLE_TARGET_HAND_LABEL
 IMU_SERIAL_PORT = two_camera_playing.IMU_SERIAL_PORT
 IMU_SERIAL_BAUD = two_camera_playing.IMU_SERIAL_BAUD
 IMU_PACKET_STALE_SECONDS = two_camera_playing.IMU_PACKET_STALE_SECONDS
@@ -129,6 +131,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=IMU_PLANE_DRAW_HAND_LABEL,
         help="Only this hand module's physical button draws the plane.",
     )
+    parser.add_argument(
+        "--imu-channel-cycle-hand",
+        choices=HAND_LABELS,
+        default=IMU_CHANNEL_CYCLE_HAND_LABEL,
+        help="This hand module's physical button cycles a MIDI channel.",
+    )
+    parser.add_argument(
+        "--imu-channel-cycle-target-hand",
+        choices=(*HAND_LABELS, "CONTROLLED"),
+        default=IMU_CHANNEL_CYCLE_TARGET_HAND_LABEL,
+        help="Which hand channel the cycle button changes. CONTROLLED means --controlled-hand.",
+    )
     parser.add_argument("--no-midi", action="store_true")
     parser.add_argument("--midi-output-hint", default=fl_debug.MIDI_OUTPUT_HINT)
     parser.add_argument("--midi-base-note", type=int, default=fl_debug.MIDI_BASE_NOTE)
@@ -143,6 +157,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=fl_debug.HAND_MIDI_CHANNELS_1_BASED["RIGHT"],
     )
+    parser.add_argument("--max-midi-channel", type=int, default=fl_debug.DEFAULT_MAX_MIDI_CHANNEL)
     parser.add_argument(
         "--require-inside-plane",
         action="store_true",
@@ -189,6 +204,7 @@ class FourCameraPlayingTestApp:
         self.last_preview_draw_time = 0.0
         self.last_visualizer_update_time = 0.0
         self.cv2_space_button = False
+        self.last_imu_channel_cycle_button_pressed = False
         self.closed = False
 
         self.keyboard = two_camera_playing.KeyboardPoller()
@@ -200,10 +216,8 @@ class FourCameraPlayingTestApp:
             midi_output_hint=args.midi_output_hint,
             midi_base_note=args.midi_base_note,
             midi_velocity=args.midi_velocity,
-            midi_channels_1_based={
-                "LEFT": args.left_midi_channel,
-                "RIGHT": args.right_midi_channel,
-            },
+            midi_channels_1_based={"LEFT": args.left_midi_channel, "RIGHT": args.right_midi_channel},
+            max_midi_channel=args.max_midi_channel,
             require_inside_plane_to_play=args.require_inside_plane,
             controlled_hand_label=args.controlled_hand,
             allow_hand_switching=False,
@@ -223,6 +237,10 @@ class FourCameraPlayingTestApp:
             )
             self.imu_reader.start()
             print(f"[4cam playing] IMU plane draw button is mapped to {args.imu_plane_draw_hand}")
+            print(
+                "[4cam playing] IMU channel cycle button is mapped to "
+                f"{args.imu_channel_cycle_hand} -> {args.imu_channel_cycle_target_hand}"
+            )
 
         self.timer = fl_debug.app.Timer(
             interval=max(1.0 / max(float(args.update_hz), 1.0), 0.001),
@@ -380,11 +398,14 @@ class FourCameraPlayingTestApp:
 
     def _feed_imu_to_visualizer(self, tracked_hand_labels: set[str]) -> None:
         plane_draw_hand = str(self.args.imu_plane_draw_hand).upper()
+        channel_cycle_hand = str(self.args.imu_channel_cycle_hand).upper()
         now = time.time()
         for label in HAND_LABELS:
             imu_snapshot = self._imu_snapshot_for_hand(label)
             button_pressed = False if label == plane_draw_hand else None
             if imu_snapshot is None:
+                if label == channel_cycle_hand:
+                    self.last_imu_channel_cycle_button_pressed = False
                 self.visualizer.set_hand_imu_state(label, button_pressed=button_pressed)
                 continue
 
@@ -393,24 +414,53 @@ class FourCameraPlayingTestApp:
                 if imu_snapshot.has_fresh_quat(self.args.imu_packet_stale_seconds)
                 else None
             )
+            if label == channel_cycle_hand:
+                channel_cycle_button_pressed = self._fresh_imu_button_pressed(
+                    label,
+                    imu_snapshot,
+                    now,
+                    tracked_hand_labels,
+                    require_tracking=False,
+                )
+                if channel_cycle_button_pressed and not self.last_imu_channel_cycle_button_pressed:
+                    self.visualizer.cycle_hand_midi_channel(self._channel_cycle_target_hand(), 1)
+                self.last_imu_channel_cycle_button_pressed = channel_cycle_button_pressed
             if label == plane_draw_hand:
-                button_is_fresh = (
-                    now - imu_snapshot.receive_time
-                ) <= self.args.imu_packet_stale_seconds
-                button_pressed = (
-                    imu_snapshot.button_pressed
-                    if (
-                        label in tracked_hand_labels
-                        and button_is_fresh
-                        and (imu_snapshot.packet_type & two_camera_playing.IMU_PACKET_HAS_BUTTON)
-                    )
-                    else False
+                button_pressed = self._fresh_imu_button_pressed(
+                    label,
+                    imu_snapshot,
+                    now,
+                    tracked_hand_labels,
+                    require_tracking=True,
                 )
             self.visualizer.set_hand_imu_state(
                 label,
                 rotation_quaternion=rotation_quaternion,
                 button_pressed=button_pressed,
             )
+
+    def _fresh_imu_button_pressed(
+        self,
+        label: str,
+        imu_snapshot,
+        now: float,
+        tracked_hand_labels: set[str],
+        require_tracking: bool,
+    ) -> bool:
+        button_is_fresh = (now - imu_snapshot.receive_time) <= self.args.imu_packet_stale_seconds
+        if require_tracking and label not in tracked_hand_labels:
+            return False
+        return bool(
+            button_is_fresh
+            and (imu_snapshot.packet_type & two_camera_playing.IMU_PACKET_HAS_BUTTON)
+            and imu_snapshot.button_pressed
+        )
+
+    def _channel_cycle_target_hand(self) -> str:
+        target = str(self.args.imu_channel_cycle_target_hand).upper()
+        if target == "CONTROLLED":
+            return self.visualizer.controlled_hand_label
+        return target
 
     def _correct_imu_quaternion(self, label: str, quaternion: np.ndarray) -> np.ndarray:
         signs = two_camera_playing.IMU_QUATERNION_COMPONENT_SIGNS.get(
