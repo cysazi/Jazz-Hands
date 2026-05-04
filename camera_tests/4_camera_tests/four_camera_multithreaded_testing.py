@@ -17,8 +17,29 @@ import multithreaded_camera_testing as camera_test
 CAMERA_IDS = list(camera_test.FOUR_CAMERA_IDS)
 COMBINED_WINDOW_NAME = "4 Camera Multithreaded Preview"
 CONTROL_WINDOW_NAME = "4 Camera Controls"
+
+# 4-camera test-local knobs. The base frame size/FPS/threshold/blob settings
+# still come from camera_tests/multithreaded_camera_testing.py so every script
+# sees the same raw/threshold behavior. The UVC JSON below is for AMCap-style
+# controls like brightness, contrast, gamma, backlight compensation, etc.
 PANEL_WIDTH = 420
 PANEL_HEIGHT = 260
+PREVIEW_HZ = 30.0
+CONTROL_PREVIEW_HZ = 5.0
+APPLY_UVC_SETTINGS_ON_START = True
+UVC_SETTINGS_JSON_PATH = Path(__file__).resolve().with_name("four_camera_uvc_settings_values.json")
+EXPOSURE_BY_CAMERA = {
+    1: -11,
+    2: -11,
+    3: -11,
+    4: -11,
+}
+GAIN_BY_CAMERA = {
+    1: 0,
+    2: 0,
+    3: 0,
+    4: 0,
+}
 
 
 def configure_four_camera_defaults() -> None:
@@ -28,6 +49,33 @@ def configure_four_camera_defaults() -> None:
     camera_test.CONTROL_WINDOW_NAME = CONTROL_WINDOW_NAME
     camera_test.PANEL_WIDTH = PANEL_WIDTH
     camera_test.PANEL_HEIGHT = PANEL_HEIGHT
+    camera_test.EXPOSURE_BY_CAMERA.update(EXPOSURE_BY_CAMERA)
+    camera_test.GAIN_BY_CAMERA.update(GAIN_BY_CAMERA)
+
+
+def apply_four_camera_uvc_settings_on_start() -> None:
+    if not APPLY_UVC_SETTINGS_ON_START:
+        return
+    try:
+        import camera_uvc_settings
+    except Exception as error:
+        print(f"[4cam settings] could not import camera_uvc_settings: {error}")
+        return
+
+    if not UVC_SETTINGS_JSON_PATH.exists():
+        print(f"[4cam settings] settings JSON not found: {UVC_SETTINGS_JSON_PATH}")
+        return
+
+    print(f"[4cam settings] applying saved UVC settings from {UVC_SETTINGS_JSON_PATH}")
+    try:
+        applied = camera_uvc_settings.apply_configured_camera_settings(
+            camera_ids=list(CAMERA_IDS),
+            settings_path=UVC_SETTINGS_JSON_PATH,
+        )
+    except Exception as error:
+        print(f"[4cam settings] could not apply UVC settings: {error}")
+        return
+    print(f"[4cam settings] wrote {applied} UVC controls")
 
 
 def create_windows(controls: camera_test.ProcessingControls) -> None:
@@ -248,6 +296,7 @@ def build_combined_preview(snapshots: dict[int, tuple], controls: camera_test.Pr
 
 def main() -> int:
     configure_four_camera_defaults()
+    apply_four_camera_uvc_settings_on_start()
     stop_event = threading.Event()
     controls = camera_test.ProcessingControls()
     workers = [
@@ -264,6 +313,9 @@ def main() -> int:
     last_errors: dict[int, str] = {}
     last_displayed_frames: dict[int, int] = {}
     last_stats_time = time.time()
+    last_preview_time = 0.0
+    last_control_preview_time = 0.0
+    controls_preview = None
     try:
         while True:
             any_open = False
@@ -304,11 +356,22 @@ def main() -> int:
                 print("Error: Could not open any cameras")
                 break
 
-            if camera_test.SHOW_WINDOWS and displayed_new_frame:
-                camera_test.cv2.imshow(COMBINED_WINDOW_NAME, build_combined_preview(snapshots, controls))
-                camera_test.cv2.imshow(CONTROL_WINDOW_NAME, build_controls_preview(controls))
-
             now = time.time()
+            if camera_test.SHOW_WINDOWS:
+                preview_interval = 1.0 / max(float(PREVIEW_HZ), 1.0)
+                if displayed_new_frame and now - last_preview_time >= preview_interval:
+                    last_preview_time = now
+                    camera_test.cv2.imshow(
+                        COMBINED_WINDOW_NAME,
+                        build_combined_preview(snapshots, controls),
+                    )
+
+                control_interval = 1.0 / max(float(CONTROL_PREVIEW_HZ), 1.0)
+                if controls_preview is None or now - last_control_preview_time >= control_interval:
+                    last_control_preview_time = now
+                    controls_preview = build_controls_preview(controls)
+                    camera_test.cv2.imshow(CONTROL_WINDOW_NAME, controls_preview)
+
             if now - last_stats_time >= camera_test.PRINT_STATS_EVERY_SECONDS:
                 stat_parts = []
                 for worker in workers:

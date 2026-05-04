@@ -1,0 +1,199 @@
+{
+  "cameras": {
+    "1": {
+      "identity": {
+        "friendly_name": "Vertical_plane_camera_1",
+        "serial": "UC001"
+      },
+      "settings": {
+        "backlight_compensation": {
+          "auto": false,
+          "value": 2
+        },
+        "brightness": {
+          "auto": false,
+          "value": 62
+        },
+        "contrast": {
+          "auto": false,
+          "value": 28
+        },
+        "exposure": {
+          "auto": false,
+          "value": -11
+        },
+        "gain": {
+          "auto": false,
+          "value": 0
+        },
+        "gamma": {
+          "auto": false,
+          "value": 100
+        },
+        "hue": {
+          "auto": false,
+          "value": 0
+        },
+        "saturation": {
+          "auto": false,
+          "value": 64
+        },
+        "sharpness": {
+          "auto": false,
+          "value": 3
+        },
+        "white_balance": {
+          "auto": true,
+          "value": 4600
+        }
+      }
+    },
+    "2": {
+      "identity": {
+        "friendly_name": "Vertical_plane_camera_2",
+        "serial": "UC002"
+      },
+      "settings": {
+        "backlight_compensation": {
+          "auto": false,
+          "value": 2
+        },
+        "brightness": {
+          "auto": false,
+          "value": 62
+        },
+        "contrast": {
+          "auto": false,
+          "value": 45
+        },
+        "exposure": {
+          "auto": false,
+          "value": -11
+        },
+        "gain": {
+          "auto": false,
+          "value": 0
+        },
+        "gamma": {
+          "auto": false,
+          "value": 72
+        },
+        "hue": {
+          "auto": false,
+          "value": 0
+        },
+        "saturation": {
+          "auto": false,
+          "value": 64
+        },
+        "sharpness": {
+          "auto": false,
+          "value": 3
+        },
+        "white_balance": {
+          "auto": true,
+          "value": 4600
+        }
+      }
+    },
+    "3": {
+      "identity": {
+        "friendly_name": "Vertical_plane_camera_3",
+        "serial": "UC003"
+      },
+      "settings": {
+        "backlight_compensation": {
+          "auto": false,
+          "value": 2
+        },
+        "brightness": {
+          "auto": false,
+          "value": 62
+        },
+        "contrast": {
+          "auto": false,
+          "value": 28
+        },
+        "exposure": {
+          "auto": false,
+          "value": -11
+        },
+        "gain": {
+          "auto": false,
+          "value": 0
+        },
+        "gamma": {
+          "auto": false,
+          "value": 100
+        },
+        "hue": {
+          "auto": false,
+          "value": 0
+        },
+        "saturation": {
+          "auto": false,
+          "value": 64
+        },
+        "sharpness": {
+          "auto": false,
+          "value": 3
+        },
+        "white_balance": {
+          "auto": true,
+          "value": 4600
+        }
+      }
+    },
+    "4": {
+      "identity": {
+        "friendly_name": "Vertical_plane_camera_4",
+        "serial": "UC004"
+      },
+      "settings": {
+        "backlight_compensation": {
+          "auto": false,
+          "value": 2
+        },
+        "brightness": {
+          "auto": false,
+          "value": 62
+        },
+        "contrast": {
+          "auto": false,
+          "value": 45
+        },
+        "exposure": {
+          "auto": false,
+          "value": -11
+        },
+        "gain": {
+          "auto": false,
+          "value": 0
+        },
+        "gamma": {
+          "auto": false,
+          "value": 72
+        },
+        "hue": {
+          "auto": false,
+          "value": 0
+        },
+        "saturation": {
+          "auto": false,
+          "value": 64
+        },
+        "sharpness": {
+          "auto": false,
+          "value": 3
+        },
+        "white_balance": {
+          "auto": true,
+          "value": 4600
+        }
+      }
+    }
+  },
+  "created_at": "2026-05-04T00:00:00Z",
+  "description": "Seeded 4-camera UVC settings. Cameras 3 and 4 copy the current settings from cameras 1 and 2 respectively.",
+  "schema_version": 2
+}
