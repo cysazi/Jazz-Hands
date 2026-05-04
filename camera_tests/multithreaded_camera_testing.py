@@ -40,14 +40,14 @@ AUTO_EXPOSURE_BY_CAMERA = {
     4: 0,
 }
 EXPOSURE_BY_CAMERA = {
-    1: -8,
-    2: -8,
+    1: -10,
+    2: -10,
     3: -8,
     4: -8,
 }
 GAIN_BY_CAMERA = {
-    1: 0,
-    2: 0,
+    1: 25,
+    2: 25,
     3: 0,
     4: 0,
 }

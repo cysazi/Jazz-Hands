@@ -1,0 +1,463 @@
+{
+  "cameras": {
+    "1": {
+      "controls": {
+        "backlight_compensation": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 8,
+          "range": {
+            "caps_flags": 2,
+            "default": 1,
+            "max": 2,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 2
+        },
+        "brightness": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 0,
+          "range": {
+            "caps_flags": 2,
+            "default": 0,
+            "max": 64,
+            "min": -64,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 62
+        },
+        "contrast": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 1,
+          "range": {
+            "caps_flags": 2,
+            "default": 32,
+            "max": 64,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 28
+        },
+        "exposure": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "camera_control",
+          "property_id": 4,
+          "range": {
+            "caps_flags": 3,
+            "default": -6,
+            "max": -1,
+            "min": -13,
+            "step": 1,
+            "supports_auto": true,
+            "supports_manual": true
+          },
+          "value": -11
+        },
+        "gain": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 9,
+          "range": {
+            "caps_flags": 2,
+            "default": 0,
+            "max": 100,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 0
+        },
+        "gamma": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 5,
+          "range": {
+            "caps_flags": 2,
+            "default": 100,
+            "max": 500,
+            "min": 72,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 100
+        },
+        "hue": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 2,
+          "range": {
+            "caps_flags": 2,
+            "default": 0,
+            "max": 40,
+            "min": -40,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 0
+        },
+        "saturation": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 3,
+          "range": {
+            "caps_flags": 2,
+            "default": 64,
+            "max": 128,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 64
+        },
+        "sharpness": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 4,
+          "range": {
+            "caps_flags": 2,
+            "default": 3,
+            "max": 6,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 3
+        },
+        "white_balance": {
+          "auto": true,
+          "flags": 1,
+          "flags_label": "auto",
+          "group": "video_proc_amp",
+          "property_id": 7,
+          "range": {
+            "caps_flags": 3,
+            "default": 4600,
+            "max": 6500,
+            "min": 2800,
+            "step": 1,
+            "supports_auto": true,
+            "supports_manual": true
+          },
+          "value": 4600
+        }
+      },
+      "identity": {
+        "friendly_name": "Vertical_plane_camera_1",
+        "serial": "UC001"
+      },
+      "matched_device": {
+        "device_path": "\\\\?\\usb#vid_0c45&pid_6366&mi_00#7&2c8718b9&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+        "directshow_index": 2,
+        "friendly_name": "Vertical_plane_camera_1",
+        "parent_device_id": "USB\\VID_0C45&PID_6366\\UC001",
+        "pnp_device_id": "USB\\VID_0C45&PID_6366&MI_00\\7&2C8718B9&0&0000",
+        "serial": "UC001"
+      },
+      "settings": {
+        "backlight_compensation": {
+          "auto": false,
+          "value": 2
+        },
+        "brightness": {
+          "auto": false,
+          "value": 62
+        },
+        "contrast": {
+          "auto": false,
+          "value": 28
+        },
+        "exposure": {
+          "auto": false,
+          "value": -11
+        },
+        "gain": {
+          "auto": false,
+          "value": 0
+        },
+        "gamma": {
+          "auto": false,
+          "value": 100
+        },
+        "hue": {
+          "auto": false,
+          "value": 0
+        },
+        "saturation": {
+          "auto": false,
+          "value": 64
+        },
+        "sharpness": {
+          "auto": false,
+          "value": 3
+        },
+        "white_balance": {
+          "auto": true,
+          "value": 4600
+        }
+      }
+    },
+    "2": {
+      "controls": {
+        "backlight_compensation": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 8,
+          "range": {
+            "caps_flags": 2,
+            "default": 1,
+            "max": 2,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 2
+        },
+        "brightness": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 0,
+          "range": {
+            "caps_flags": 2,
+            "default": 0,
+            "max": 64,
+            "min": -64,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 62
+        },
+        "contrast": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 1,
+          "range": {
+            "caps_flags": 2,
+            "default": 32,
+            "max": 64,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 45
+        },
+        "exposure": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "camera_control",
+          "property_id": 4,
+          "range": {
+            "caps_flags": 3,
+            "default": -6,
+            "max": -1,
+            "min": -13,
+            "step": 1,
+            "supports_auto": true,
+            "supports_manual": true
+          },
+          "value": -11
+        },
+        "gain": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 9,
+          "range": {
+            "caps_flags": 2,
+            "default": 0,
+            "max": 100,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 0
+        },
+        "gamma": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 5,
+          "range": {
+            "caps_flags": 2,
+            "default": 100,
+            "max": 500,
+            "min": 72,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 72
+        },
+        "hue": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 2,
+          "range": {
+            "caps_flags": 2,
+            "default": 0,
+            "max": 40,
+            "min": -40,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 0
+        },
+        "saturation": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 3,
+          "range": {
+            "caps_flags": 2,
+            "default": 64,
+            "max": 128,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 64
+        },
+        "sharpness": {
+          "auto": false,
+          "flags": 2,
+          "flags_label": "manual",
+          "group": "video_proc_amp",
+          "property_id": 4,
+          "range": {
+            "caps_flags": 2,
+            "default": 3,
+            "max": 6,
+            "min": 0,
+            "step": 1,
+            "supports_auto": false,
+            "supports_manual": true
+          },
+          "value": 3
+        },
+        "white_balance": {
+          "auto": true,
+          "flags": 1,
+          "flags_label": "auto",
+          "group": "video_proc_amp",
+          "property_id": 7,
+          "range": {
+            "caps_flags": 3,
+            "default": 4600,
+            "max": 6500,
+            "min": 2800,
+            "step": 1,
+            "supports_auto": true,
+            "supports_manual": true
+          },
+          "value": 4600
+        }
+      },
+      "identity": {
+        "friendly_name": "Vertical_plane_camera_2",
+        "serial": "UC002"
+      },
+      "matched_device": {
+        "device_path": "\\\\?\\usb#vid_0c45&pid_6366&mi_00#7&19cd6814&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+        "directshow_index": 1,
+        "friendly_name": "Vertical_plane_camera_2",
+        "parent_device_id": "USB\\VID_0C45&PID_6366\\UC002",
+        "pnp_device_id": "USB\\VID_0C45&PID_6366&MI_00\\7&19CD6814&0&0000",
+        "serial": "UC002"
+      },
+      "settings": {
+        "backlight_compensation": {
+          "auto": false,
+          "value": 2
+        },
+        "brightness": {
+          "auto": false,
+          "value": 62
+        },
+        "contrast": {
+          "auto": false,
+          "value": 45
+        },
+        "exposure": {
+          "auto": false,
+          "value": -11
+        },
+        "gain": {
+          "auto": false,
+          "value": 0
+        },
+        "gamma": {
+          "auto": false,
+          "value": 72
+        },
+        "hue": {
+          "auto": false,
+          "value": 0
+        },
+        "saturation": {
+          "auto": false,
+          "value": 64
+        },
+        "sharpness": {
+          "auto": false,
+          "value": 3
+        },
+        "white_balance": {
+          "auto": true,
+          "value": 4600
+        }
+      }
+    }
+  },
+  "created_at": "2026-05-04T03:15:54Z",
+  "description": "Snapshot of current DirectShow UVC controls. The settings blocks are apply-compatible; controls include AMCap-style range/device metadata.",
+  "schema_version": 2
+}

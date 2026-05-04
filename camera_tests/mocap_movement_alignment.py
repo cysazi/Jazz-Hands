@@ -408,7 +408,7 @@ class MovementAlignmentApp:
         self.canvas.events.key_press.connect(self._handle_vispy_key)
 
     def _add_axis_labels(self) -> None:
-        label_distance = 1.25 * float(self.args.position_scale)
+        label_distance = 1.25 * self._position_scale()
         scene.visuals.Text("X", color="red", font_size=20, pos=(label_distance, 0, 0), parent=self.view.scene)
         scene.visuals.Text("Y", color="green", font_size=20, pos=(0, label_distance, 0), parent=self.view.scene)
         scene.visuals.Text("Z", color="blue", font_size=20, pos=(0, 0, label_distance), parent=self.view.scene)
@@ -442,7 +442,16 @@ class MovementAlignmentApp:
             )
 
     def _visual_position(self, position: np.ndarray) -> np.ndarray:
-        return position.astype(np.float32) * float(self.args.position_scale)
+        return position.astype(np.float32) * self._position_scale()
+
+    def _position_scale(self) -> float:
+        return float(
+            getattr(
+                self.args,
+                "position_scale",
+                getattr(self.args, "scaling_factor", combined.SCALING_FACTOR),
+            )
+        )
 
     def update(self, _event) -> None:
         if self.closed:
