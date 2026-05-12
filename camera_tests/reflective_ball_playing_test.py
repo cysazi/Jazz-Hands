@@ -34,6 +34,59 @@ CONTROLLED_HAND_LABEL = "RIGHT"
 DEFAULT_CALIBRATION_PATH = combined.ALIGNED_MOVEMENT_CALIBRATION_PATH
 MIN_OCTAVE_OFFSET = -4
 MAX_OCTAVE_OFFSET = 4
+STACKED_PLANE_OCTAVES = (-1, 0, 1)
+
+NOTE_TO_SEMITONE = {
+    "C": 0,
+    "B#": 0,
+    "C#": 1,
+    "DB": 1,
+    "D": 2,
+    "D#": 3,
+    "EB": 3,
+    "E": 4,
+    "FB": 4,
+    "E#": 5,
+    "F": 5,
+    "F#": 6,
+    "GB": 6,
+    "G": 7,
+    "G#": 8,
+    "AB": 8,
+    "A": 9,
+    "A#": 10,
+    "BB": 10,
+    "B": 11,
+    "CB": 11,
+}
+SEMITONE_NAMES = ("C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B")
+SCALE_INTERVALS = {
+    "chromatic": tuple(range(12)),
+    "major": (0, 2, 4, 5, 7, 9, 11),
+    "ionian": (0, 2, 4, 5, 7, 9, 11),
+    "natural-minor": (0, 2, 3, 5, 7, 8, 10),
+    "minor": (0, 2, 3, 5, 7, 8, 10),
+    "aeolian": (0, 2, 3, 5, 7, 8, 10),
+    "dorian": (0, 2, 3, 5, 7, 9, 10),
+    "phrygian": (0, 1, 3, 5, 7, 8, 10),
+    "lydian": (0, 2, 4, 6, 7, 9, 11),
+    "mixolydian": (0, 2, 4, 5, 7, 9, 10),
+    "locrian": (0, 1, 3, 5, 6, 8, 10),
+    "harmonic-minor": (0, 2, 3, 5, 7, 8, 11),
+    "melodic-minor": (0, 2, 3, 5, 7, 9, 11),
+    "harmonic-major": (0, 2, 4, 5, 7, 8, 11),
+    "double-harmonic": (0, 1, 4, 5, 7, 8, 11),
+    "hungarian-minor": (0, 2, 3, 6, 7, 8, 11),
+    "ukrainian-dorian": (0, 2, 3, 6, 7, 9, 10),
+    "neapolitan-minor": (0, 1, 3, 5, 7, 8, 11),
+    "neapolitan-major": (0, 1, 3, 5, 7, 9, 11),
+    "enigmatic": (0, 1, 4, 6, 8, 10, 11),
+    "persian": (0, 1, 4, 5, 6, 8, 11),
+    "romanian-minor": (0, 2, 3, 6, 7, 9, 10),
+    "spanish-gypsy": (0, 1, 4, 5, 7, 8, 10),
+    "altered": (0, 1, 3, 4, 6, 8, 10),
+    "whole-tone-plus": (0, 2, 4, 6, 8, 10, 11),
+}
 
 
 class KeyboardPoller:
@@ -83,9 +136,314 @@ class KeyboardPoller:
         return pressed, released
 
 
+def normalize_scale_name(name: str) -> str:
+    normalized = str(name).strip().lower().replace("_", "-").replace(" ", "-")
+    if normalized not in SCALE_INTERVALS:
+        available = ", ".join(sorted(SCALE_INTERVALS))
+        raise argparse.ArgumentTypeError(f"Unknown scale {name!r}. Available: {available}")
+    return normalized
+
+
+def parse_midi_note(value: str | int) -> int:
+    if isinstance(value, int):
+        return int(np.clip(value, 0, 127))
+
+    text = str(value).strip()
+    if text.isdigit():
+        return int(np.clip(int(text), 0, 127))
+
+    note_part = text[:-1].upper()
+    octave_part = text[-1:]
+    if len(text) >= 3 and text[-2] == "-":
+        note_part = text[:-2].upper()
+        octave_part = text[-2:]
+    if note_part not in NOTE_TO_SEMITONE:
+        raise argparse.ArgumentTypeError(f"Expected MIDI note number or note name like C4, F#3, Bb4; got {value!r}")
+    try:
+        octave = int(octave_part)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"Expected octave number in note name {value!r}") from error
+    return int(np.clip((octave + 1) * 12 + NOTE_TO_SEMITONE[note_part], 0, 127))
+
+
+def midi_note_name(midi_note: int) -> str:
+    note = int(np.clip(midi_note, 0, 127))
+    return f"{SEMITONE_NAMES[note % 12]}{(note // 12) - 1}"
+
+
 class BallPlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
+    def __init__(
+        self,
+        *args,
+        scale_name: str = "chromatic",
+        middle_note: int = fl_debug.MIDI_BASE_NOTE,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.scale_name = normalize_scale_name(scale_name)
+        self.scale_intervals = SCALE_INTERVALS[self.scale_name]
+        self.midi_base_note = int(np.clip(middle_note, 0, 127))
+        self.stacked_plane_meshes: dict[tuple[str, int], object] = {}
+        self.stacked_plane_outlines: dict[tuple[str, int], object] = {}
+        self.stacked_plane_section_lines: dict[tuple[str, int], list[object]] = {}
+
     def _update_left_controls(self) -> None:
         self.current_attack_value = self.midi_velocity
+
+    @property
+    def section_count(self) -> int:
+        return len(self.scale_intervals)
+
+    def scale_status_text(self) -> str:
+        return f"{self.scale_name} middle={midi_note_name(self.midi_base_note)}"
+
+    def set_scale(self, scale_name: str) -> None:
+        self._all_midi_notes_off()
+        self.scale_name = normalize_scale_name(scale_name)
+        self.scale_intervals = SCALE_INTERVALS[self.scale_name]
+        for label in self.hand_labels:
+            state = self.hands[label]
+            if state.plane is not None:
+                self._update_plane_visuals(label, state.plane, preview=False)
+        print(f"[ball playing] scale={self.scale_name} sections={self.section_count}")
+
+    def set_middle_note(self, middle_note: int) -> None:
+        self._all_midi_notes_off()
+        self.midi_base_note = int(np.clip(middle_note, 0, 127))
+        print(f"[ball playing] middle note={midi_note_name(self.midi_base_note)} ({self.midi_base_note})")
+
+    def clear_plane(self, label: str | None = None) -> None:
+        super().clear_plane(label)
+        labels = self.hand_labels if label is None else (self._normalize_label(label),)
+        for hand_label in labels:
+            for octave_index in STACKED_PLANE_OCTAVES:
+                key = (hand_label, octave_index)
+                mesh = self.stacked_plane_meshes.get(key)
+                outline = self.stacked_plane_outlines.get(key)
+                if mesh is not None:
+                    mesh.visible = False
+                if outline is not None:
+                    outline.visible = False
+                for line in self.stacked_plane_section_lines.get(key, []):
+                    line.visible = False
+
+    def _stacked_plane_definition(
+        self,
+        definition: fl_debug.PlaneDefinition,
+        octave_index: int,
+    ) -> fl_debug.PlaneDefinition:
+        note_axis, note_half, _other_axis, _other_half = self._note_axis_and_half_extent(definition)
+        center = definition.center.copy()
+        center[note_axis] += float(octave_index) * (2.0 * note_half)
+        return fl_debug.PlaneDefinition(
+            center=center,
+            axis_u=definition.axis_u,
+            axis_v=definition.axis_v,
+            normal_axis=definition.normal_axis,
+            half_u=definition.half_u,
+            half_v=definition.half_v,
+        )
+
+    def _ensure_stacked_plane_visuals(self, label: str, octave_index: int) -> None:
+        key = (label, octave_index)
+        if key not in self.stacked_plane_meshes:
+            mesh = fl_debug.scene.visuals.Mesh(
+                vertices=np.zeros((4, 3), dtype=np.float32),
+                faces=fl_debug.PLANE_FACES,
+                color=(0.25, 0.85, 1.0, 0.0),
+                shading=None,
+                parent=self.view.scene,
+            )
+            mesh.visible = False
+            self.stacked_plane_meshes[key] = mesh
+
+        if key not in self.stacked_plane_outlines:
+            outline = fl_debug.scene.visuals.Line(
+                pos=np.zeros((2, 3), dtype=np.float32),
+                color=(0.75, 0.95, 1.0, 0.0),
+                width=2,
+                method="gl",
+                parent=self.view.scene,
+            )
+            outline.visible = False
+            self.stacked_plane_outlines[key] = outline
+
+        lines = self.stacked_plane_section_lines.setdefault(key, [])
+        while len(lines) < self.section_count - 1:
+            line = fl_debug.scene.visuals.Line(
+                pos=np.zeros((2, 3), dtype=np.float32),
+                color=(0.75, 0.95, 1.0, 0.0),
+                width=1,
+                method="gl",
+                parent=self.view.scene,
+            )
+            line.visible = False
+            lines.append(line)
+
+    def _section_line_segments_for_count(
+        self,
+        definition: fl_debug.PlaneDefinition,
+        section_count: int,
+    ) -> list[np.ndarray]:
+        segments = []
+        note_axis, note_half, other_axis, other_half = self._note_axis_and_half_extent(definition)
+        axis_min = definition.center[note_axis] - note_half
+        for split_index in range(1, section_count):
+            split_ratio = split_index / section_count
+            split_coord = axis_min + split_ratio * (2.0 * note_half)
+            p0 = definition.center.copy()
+            p1 = definition.center.copy()
+            p0[note_axis] = split_coord
+            p1[note_axis] = split_coord
+            p0[other_axis] = definition.center[other_axis] - other_half
+            p1[other_axis] = definition.center[other_axis] + other_half
+            segments.append(np.array([p0, p1], dtype=np.float32))
+        return segments
+
+    def _update_plane_visuals(self, label: str, definition: fl_debug.PlaneDefinition, preview: bool) -> None:
+        colors_by_label = {
+            "LEFT": {
+                "fill": (0.30, 0.80, 1.00, 0.08 if preview else 0.16),
+                "edge": (0.45, 0.88, 1.00, 0.55 if preview else 0.9),
+                "split": (0.72, 0.93, 1.00, 0.35 if preview else 0.65),
+            },
+            "RIGHT": {
+                "fill": (1.00, 0.48, 0.32, 0.08 if preview else 0.16),
+                "edge": (1.00, 0.62, 0.45, 0.55 if preview else 0.9),
+                "split": (1.00, 0.84, 0.70, 0.35 if preview else 0.65),
+            },
+        }
+        colors = colors_by_label[label]
+        section_count = self.section_count
+
+        for octave_index in STACKED_PLANE_OCTAVES:
+            stacked = self._stacked_plane_definition(definition, octave_index)
+            self._ensure_stacked_plane_visuals(label, octave_index)
+            key = (label, octave_index)
+            alpha_scale = 1.0 if octave_index == 0 else 0.55
+            fill = (*colors["fill"][:3], colors["fill"][3] * alpha_scale)
+            edge = (*colors["edge"][:3], colors["edge"][3] * alpha_scale)
+            split = (*colors["split"][:3], colors["split"][3] * alpha_scale)
+
+            vertices = self._plane_vertices(stacked) * fl_debug.POSITION_SCALE
+            outline = np.vstack([vertices, vertices[0]])
+            self.stacked_plane_meshes[key].set_data(vertices=vertices, faces=fl_debug.PLANE_FACES, color=fill)
+            self.stacked_plane_meshes[key].visible = True
+            self.stacked_plane_outlines[key].set_data(pos=outline, color=edge)
+            self.stacked_plane_outlines[key].visible = True
+
+            segments = self._section_line_segments_for_count(stacked, section_count)
+            lines = self.stacked_plane_section_lines[key]
+            for index, line in enumerate(lines):
+                if index < len(segments):
+                    line.set_data(pos=segments[index] * fl_debug.POSITION_SCALE, color=split)
+                    line.visible = True
+                else:
+                    line.visible = False
+
+    def _note_section_from_position(
+        self,
+        position: np.ndarray,
+        definition: fl_debug.PlaneDefinition,
+    ) -> tuple[int, str, str, float]:
+        note_axis, note_half, _other_axis, _other_half = self._note_axis_and_half_extent(definition)
+        axis_min = definition.center[note_axis] - note_half
+        normalized = (position[note_axis] - axis_min) / (2.0 * note_half)
+        if normalized < 0.0:
+            octave_index = -1
+            local = float(np.clip(normalized + 1.0, 0.0, 1.0))
+        elif normalized >= 1.0:
+            octave_index = 1
+            local = float(np.clip(normalized - 1.0, 0.0, 1.0))
+        else:
+            octave_index = 0
+            local = float(np.clip(normalized, 0.0, 1.0))
+
+        section_index = min(int(local * self.section_count), self.section_count - 1)
+        semitone_offset = self.scale_intervals[section_index] + (12 * octave_index)
+        midi_note = int(np.clip(self.midi_base_note + semitone_offset, 0, 127))
+        note_name = midi_note_name(midi_note)
+        axis_name = f"{fl_debug.AXIS_NAMES[note_axis]} oct={octave_index:+d}"
+        return semitone_offset, note_name, axis_name, local * 100.0
+
+    def _stacked_plane_position_metrics(
+        self,
+        position: np.ndarray,
+        definition: fl_debug.PlaneDefinition,
+    ) -> tuple[float, float, bool, int]:
+        note_axis, note_half, other_axis, other_half = self._note_axis_and_half_extent(definition)
+        axis_min = definition.center[note_axis] - note_half
+        normalized = (position[note_axis] - axis_min) / (2.0 * note_half)
+        if normalized < 0.0:
+            octave_index = -1
+            local_note = normalized + 1.0
+        elif normalized >= 1.0:
+            octave_index = 1
+            local_note = normalized - 1.0
+        else:
+            octave_index = 0
+            local_note = normalized
+
+        other_min = definition.center[other_axis] - other_half
+        other_normalized = (position[other_axis] - other_min) / (2.0 * other_half)
+        inside = (
+            octave_index in STACKED_PLANE_OCTAVES
+            and 0.0 <= local_note <= 1.0
+            and 0.0 <= other_normalized <= 1.0
+        )
+        return (
+            float(np.clip(local_note, 0.0, 1.0) * 100.0),
+            float(np.clip(other_normalized, 0.0, 1.0) * 100.0),
+            inside,
+            octave_index,
+        )
+
+    def _update_note_state(self, label: str) -> None:
+        state = self.hands[label]
+        if not state.tracking_active:
+            state.active_note_index = None
+            state.preview_note_index = None
+            state.last_note_name = "tracking lost"
+            state.is_on_play_side = False
+            self._update_midi_note(label, None)
+            return
+
+        if state.plane is None:
+            state.active_note_index = None
+            state.preview_note_index = None
+            state.last_note_name = "inactive"
+            self._update_midi_note(label, None)
+            return
+
+        u_pct, v_pct, inside, octave_index = self._stacked_plane_position_metrics(state.position, state.plane)
+        play_offset = float(state.position[0] - state.plane.center[0])
+        if state.is_on_play_side:
+            if play_offset <= fl_debug.PLAY_EXIT_THRESHOLD:
+                state.is_on_play_side = False
+        elif play_offset >= fl_debug.PLAY_ENTER_THRESHOLD:
+            state.is_on_play_side = True
+
+        if label == "RIGHT":
+            note_offset, note_name, note_axis, note_pct = self._note_section_from_position(state.position, state.plane)
+            if state.preview_note_index != note_offset:
+                self.haptics.pulse(label, fl_debug.HAPTICS_NOTE_INTENSITY, fl_debug.HAPTICS_NOTE_DURATION_MS)
+            state.preview_note_index = note_offset
+            can_play = state.is_on_play_side and (inside or not self.require_inside_plane_to_play)
+            state.active_note_index = note_offset if can_play else None
+            state.last_note_name = (
+                f"{note_name} {self.scale_name} {note_axis} pos={note_pct:5.1f}%"
+                if can_play
+                else f"preview={note_name} {self.scale_name} oct={octave_index:+d}"
+            )
+        else:
+            state.active_note_index = None
+            state.preview_note_index = None
+            state.last_note_name = "ball controls only"
+        state.last_inside = inside
+        state.last_offset = play_offset
+        state.last_u_pct = u_pct
+        state.last_v_pct = v_pct
+        self._update_midi_note(label, state.active_note_index if label == "RIGHT" else None)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -129,6 +487,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-midi", action="store_true")
     parser.add_argument("--midi-output-hint", default=None)
     parser.add_argument("--midi-base-note", type=int, default=fl_debug.MIDI_BASE_NOTE)
+    parser.add_argument(
+        "--middle-note",
+        default=None,
+        help="Middle stacked plane base note as MIDI number or note name, for example C4, D3, F#4.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=normalize_scale_name,
+        default="chromatic",
+        help="Scale for the plane sections. Use --list-scales to see options.",
+    )
+    parser.add_argument("--list-scales", action="store_true", help="Print available scales and exit.")
     parser.add_argument("--midi-velocity", type=int, default=fl_debug.MIDI_VELOCITY)
     parser.add_argument("--left-midi-channel", type=int, default=fl_debug.HAND_MIDI_CHANNELS_1_BASED["LEFT"])
     parser.add_argument("--right-midi-channel", type=int, default=fl_debug.HAND_MIDI_CHANNELS_1_BASED["RIGHT"])
@@ -178,12 +548,13 @@ class ReflectiveBallPlayingApp:
             max_prediction_dt=args.max_prediction_dt,
         )
         self.keyboard = KeyboardPoller()
+        middle_note = parse_midi_note(args.middle_note) if args.middle_note is not None else int(args.midi_base_note)
         self.visualizer = BallPlayingVisualizer(
             keyboard_controlled=False,
             keyboard_buttons_enabled=True,
             enable_midi=not args.no_midi,
             midi_output_hint=args.midi_output_hint,
-            midi_base_note=args.midi_base_note,
+            midi_base_note=middle_note,
             midi_velocity=args.midi_velocity,
             midi_channels_1_based={
                 "LEFT": args.left_midi_channel,
@@ -197,6 +568,8 @@ class ReflectiveBallPlayingApp:
             update_hz=args.visualizer_hz,
             start_timer=False,
             show=True,
+            scale_name=args.scale,
+            middle_note=middle_note,
         )
         self.initial_midi_base_note = int(self.visualizer.midi_base_note)
         self.octave_offset = 0
@@ -523,6 +896,7 @@ class ReflectiveBallPlayingApp:
         )
         print(
             f"[ball playing] octave offset {self.octave_offset:+d}; "
+            f"middle={midi_note_name(self.visualizer.midi_base_note)} "
             f"base_note={self.visualizer.midi_base_note}"
         )
 
@@ -539,8 +913,8 @@ class ReflectiveBallPlayingApp:
             assignments = "no tracked balls"
         self.visualizer.set_external_status(
             [
-                "Ball controls: Space draw | 1-9/0 channel | Up/Down octave | C/R clear | Esc quit",
-                f"octave={self.octave_offset:+d} base_note={self.visualizer.midi_base_note}",
+                "Ball controls: Space draw | 1-9/0 channel | Up/Down middle octave | C/R clear | Esc quit",
+                f"scale={self.visualizer.scale_status_text()} octave={self.octave_offset:+d}",
                 (
                     f"mocap measurements={measurement_count} live_tracks={live_track_count} "
                     f"exclusive_pairing={'yes' if self.last_used_exclusive_pairing else 'no'} | "
@@ -589,7 +963,7 @@ class ReflectiveBallPlayingApp:
             "[ball playing] "
             f"measurements={measurement_count} live_tracks={live_track_count} "
             f"assignments={assignment_text} octave={self.octave_offset:+d} "
-            f"base_note={self.visualizer.midi_base_note}"
+            f"scale={self.visualizer.scale_status_text()}"
         )
 
     def close(self, *_args) -> None:
@@ -608,6 +982,11 @@ class ReflectiveBallPlayingApp:
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.list_scales:
+        print("Available scales:")
+        for scale_name in sorted(SCALE_INTERVALS):
+            print(f"  {scale_name}")
+        return 0
     combined.apply_scaling_defaults(args)
 
     if mocap.cv2 is None:
@@ -637,7 +1016,12 @@ def main() -> int:
             "3D ball tracking needs at least two calibrated views."
         )
 
-    print("[ball playing] controls: Space draw, 1-9/0 channel, Up/Down octave, C/R clear, Esc quit")
+    selected_middle = args.middle_note if args.middle_note is not None else str(args.midi_base_note)
+    print(
+        "[ball playing] controls: Space draw, 1-9/0 channel, "
+        "Up/Down middle octave, C/R clear, Esc quit"
+    )
+    print(f"[ball playing] scale={args.scale} middle_note={selected_middle}")
     app = ReflectiveBallPlayingApp(args, sources, calibrations)
     try:
         fl_debug.app.run()
