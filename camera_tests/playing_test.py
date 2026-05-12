@@ -142,6 +142,22 @@ class ImuPacketSnapshot:
         return max(current_time - self.accel_receive_time, 0.0)
 
 
+@dataclass
+class ProcessedSceneState:
+    timestamp: float
+    frames: dict[int, np.ndarray]
+    observations_by_camera: dict[int, list[mocap.MarkerObservation]]
+    camera_snapshots: dict[int, CameraWorkerSnapshot]
+    tracks: list[mocap.MarkerTrack]
+    selected_tracks: list[mocap.MarkerTrack]
+    tracked_hand_labels: set[str]
+    hand_assignments: dict[str, int]
+    hand_display_positions: dict[str, np.ndarray]
+    measurement_count: int
+    live_track_count: int
+    used_exclusive_pairing: bool
+
+
 class SerialImuReader(threading.Thread):
     def __init__(
         self,
@@ -841,6 +857,8 @@ class MocapPlayingTestApp:
         self.cv2_space_button = False
         self.last_imu_channel_cycle_button_pressed = False
         self.closed = False
+        self.processing_lock = threading.Lock()
+        self.latest_scene_state: ProcessedSceneState | None = None
 
         self.keyboard = KeyboardPoller()
         self.stop_event = threading.Event()
@@ -896,8 +914,20 @@ class MocapPlayingTestApp:
                 f"{args.imu_channel_cycle_hand} -> {args.imu_channel_cycle_target_hand}"
             )
 
+        self.processing_thread = threading.Thread(
+            target=self._processing_loop,
+            name="playing-test-processing",
+            daemon=True,
+        )
+        self.processing_thread.start()
+
+        ui_update_hz = max(
+            float(args.visualizer_hz),
+            60.0,
+            0.0 if args.no_preview else float(args.preview_hz),
+        )
         self.timer = fl_debug.app.Timer(
-            interval=max(1.0 / max(float(args.update_hz), 1.0), 0.001),
+            interval=max(1.0 / max(ui_update_hz, 1.0), 0.001),
             connect=self.update,
             start=True,
         )
@@ -918,51 +948,71 @@ class MocapPlayingTestApp:
 
         timestamp = time.time()
         self._handle_polled_keyboard()
-        frames, observations_by_camera, camera_snapshots = self._collect_camera_snapshots()
-        if not self._has_new_camera_data(camera_snapshots):
-            self._pump_preview_keyboard()
-            self._update_visualizer_if_due(timestamp)
-            return
-        self._mark_camera_data_processed(camera_snapshots)
-
-        mocap.lock_observations_to_existing_tracks(
-            frames,
-            observations_by_camera,
-            self.tracker.tracks,
-            self.settings_by_camera,
-            self.args.track_memory_pixels,
-            timestamp,
-        )
-        measurements = self._triangulate_measurements(observations_by_camera, timestamp)
-        self.last_measurement_count = len(measurements)
-        tracks = self.tracker.update(measurements, timestamp)
-
-        live_tracks = [
-            track for track in tracks if track.confirmed and track.missing_frames == 0
-        ]
-        self.last_live_track_count = len(live_tracks)
-        selected_tracks = self._select_display_tracks(live_tracks)
-        self._feed_tracks_to_visualizer(selected_tracks)
+        scene_state = self._latest_scene_state_snapshot()
+        if scene_state is not None:
+            self._apply_scene_state_to_visualizer(scene_state)
         self._update_visualizer_if_due(timestamp)
-        self._print_status(timestamp, tracks, observations_by_camera, camera_snapshots, selected_tracks)
+        if scene_state is not None:
+            self._print_status_from_scene_state(scene_state)
 
-        if not self.args.no_preview:
+        if not self.args.no_preview and scene_state is not None:
             preview_interval = 1.0 / max(float(self.args.preview_hz), 1.0)
             if timestamp - self.last_preview_draw_time >= preview_interval:
                 self.last_preview_draw_time = timestamp
                 preview = build_threaded_combined_preview(
                     self.preview_camera_ids,
-                    frames,
-                    observations_by_camera,
-                    tracks,
-                    camera_snapshots,
+                    scene_state.frames,
+                    scene_state.observations_by_camera,
+                    scene_state.tracks,
+                    scene_state.camera_snapshots,
                     self.args.track_memory_pixels,
                     int(self.args.panel_width),
                     int(self.args.panel_height),
                 )
                 mocap.cv2.imshow(combined.DEFAULT_COMBINED_WINDOW_NAME, preview)
-            key = mocap.cv2.waitKey(1) & 0xFF
-            self._handle_cv2_key(key)
+        self._pump_preview_keyboard()
+
+    def _processing_loop(self) -> None:
+        interval = 1.0 / max(float(self.args.update_hz), 1.0)
+        while not self.stop_event.is_set():
+            loop_start = time.perf_counter()
+            timestamp = time.time()
+            frames, observations_by_camera, camera_snapshots = self._collect_camera_snapshots()
+            if self._has_new_camera_data(camera_snapshots):
+                self._mark_camera_data_processed(camera_snapshots)
+
+                mocap.lock_observations_to_existing_tracks(
+                    frames,
+                    observations_by_camera,
+                    self.tracker.tracks,
+                    self.settings_by_camera,
+                    self.args.track_memory_pixels,
+                    timestamp,
+                )
+                measurements = self._triangulate_measurements(observations_by_camera, timestamp)
+                tracks = self.tracker.update(measurements, timestamp)
+                live_tracks = [
+                    track for track in tracks if track.confirmed and track.missing_frames == 0
+                ]
+                selected_tracks = self._select_display_tracks(live_tracks)
+                self._store_scene_state(
+                    timestamp,
+                    frames,
+                    observations_by_camera,
+                    camera_snapshots,
+                    tracks,
+                    selected_tracks,
+                    len(measurements),
+                    len(live_tracks),
+                    self.last_used_exclusive_pairing,
+                )
+
+            elapsed = time.perf_counter() - loop_start
+            remaining = interval - elapsed
+            if remaining > 0.0:
+                self.stop_event.wait(min(remaining, 0.01))
+            else:
+                time.sleep(0.001)
 
     def _collect_camera_snapshots(
         self,
@@ -1096,6 +1146,80 @@ class MocapPlayingTestApp:
 
         self.display_track_ids = selected_ids
         return [live_by_id[track_id] for track_id in selected_ids]
+
+    def _store_scene_state(
+        self,
+        timestamp: float,
+        frames: dict[int, np.ndarray],
+        observations_by_camera: dict[int, list[mocap.MarkerObservation]],
+        camera_snapshots: dict[int, CameraWorkerSnapshot],
+        tracks: list[mocap.MarkerTrack],
+        selected_tracks: list[mocap.MarkerTrack],
+        measurement_count: int,
+        live_track_count: int,
+        used_exclusive_pairing: bool,
+    ) -> None:
+        scale = np.array(
+            [
+                float(self.args.x_scaling_factor),
+                float(self.args.y_scaling_factor),
+                float(self.args.z_scaling_factor),
+            ],
+            dtype=np.float64,
+        )
+        assigned_tracks = self._assign_tracks_to_hands(selected_tracks)
+        self._prune_display_positions({track.track_id for track in selected_tracks})
+        hand_assignments = {
+            label: track.track_id
+            for label, track in assigned_tracks.items()
+        }
+        tracked_hand_labels = set(assigned_tracks)
+        hand_display_positions = {
+            label: self._smoothed_display_position(track) * scale
+            for label, track in assigned_tracks.items()
+        }
+
+        scene_state = ProcessedSceneState(
+            timestamp=timestamp,
+            frames=frames,
+            observations_by_camera=observations_by_camera,
+            camera_snapshots=camera_snapshots,
+            tracks=tracks,
+            selected_tracks=selected_tracks,
+            tracked_hand_labels=tracked_hand_labels,
+            hand_assignments=hand_assignments,
+            hand_display_positions=hand_display_positions,
+            measurement_count=measurement_count,
+            live_track_count=live_track_count,
+            used_exclusive_pairing=used_exclusive_pairing,
+        )
+        with self.processing_lock:
+            self.latest_scene_state = scene_state
+
+    def _latest_scene_state_snapshot(self) -> ProcessedSceneState | None:
+        with self.processing_lock:
+            return self.latest_scene_state
+
+    def _apply_scene_state_to_visualizer(self, scene_state: ProcessedSceneState) -> None:
+        self.last_measurement_count = scene_state.measurement_count
+        self.last_live_track_count = scene_state.live_track_count
+        self.last_used_exclusive_pairing = scene_state.used_exclusive_pairing
+        self.last_hand_assignments = dict(scene_state.hand_assignments)
+        self.last_tracked_hand_labels = set(scene_state.tracked_hand_labels)
+
+        for label in HAND_LABELS:
+            display_position = scene_state.hand_display_positions.get(label)
+            if display_position is None:
+                self.visualizer.set_hand_tracking_active(label, False)
+                continue
+            self.visualizer.set_hand_pose(
+                label,
+                display_position,
+                rotation_quaternion=None,
+                button_pressed=None,
+            )
+            self.visualizer.set_hand_tracking_active(label, True)
+        self._feed_imu_to_visualizer(scene_state.tracked_hand_labels)
 
     def _feed_tracks_to_visualizer(self, selected_tracks: list[mocap.MarkerTrack]) -> None:
         scale = np.array(
@@ -1365,6 +1489,15 @@ class MocapPlayingTestApp:
             + " | ".join(thread_parts)
         )
 
+    def _print_status_from_scene_state(self, scene_state: ProcessedSceneState) -> None:
+        self._print_status(
+            scene_state.timestamp,
+            scene_state.tracks,
+            scene_state.observations_by_camera,
+            scene_state.camera_snapshots,
+            scene_state.selected_tracks,
+        )
+
     def _imu_status_text(self) -> str:
         return " | ".join(self._imu_status_lines())
 
@@ -1380,6 +1513,8 @@ class MocapPlayingTestApp:
         if hasattr(self, "timer"):
             self.timer.stop()
         self.stop_event.set()
+        if hasattr(self, "processing_thread"):
+            self.processing_thread.join(timeout=0.5)
         for worker in self.camera_workers:
             worker.join(timeout=0.5)
         if self.imu_reader is not None:
