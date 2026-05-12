@@ -83,6 +83,11 @@ class KeyboardPoller:
         return pressed, released
 
 
+class BallPlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
+    def _update_left_controls(self) -> None:
+        self.current_attack_value = self.midi_velocity
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = combined.build_arg_parser()
     parser.description = (
@@ -173,7 +178,7 @@ class ReflectiveBallPlayingApp:
             max_prediction_dt=args.max_prediction_dt,
         )
         self.keyboard = KeyboardPoller()
-        self.visualizer = fl_debug.DualHandFLStudioVisualizer(
+        self.visualizer = BallPlayingVisualizer(
             keyboard_controlled=False,
             keyboard_buttons_enabled=True,
             enable_midi=not args.no_midi,
