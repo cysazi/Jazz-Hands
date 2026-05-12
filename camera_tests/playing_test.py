@@ -34,10 +34,11 @@ if str(ROOT_DIR) not in sys.path:
 import fl_studio_debug_visualizer as fl_debug
 import mocap_tracker as mocap
 import mocap_tracker_combined_vispy as combined
+from haptics_controller import HapticsController
 
 
-DEFAULT_PREVIEW_HZ = 30.0
-DEFAULT_VISUALIZER_HZ = 120
+DEFAULT_PREVIEW_HZ = 15.0
+DEFAULT_VISUALIZER_HZ = 60
 HAND_LABELS = ("LEFT", "RIGHT")
 HAND_SIDE_AXIS = "y"
 RIGHT_HAND_HIGHER_ON_SIDE_AXIS = False
@@ -55,6 +56,8 @@ IMU_PACKET_HEADER = 0xAAAA
 IMU_HEADER_BYTES = b"\xAA\xAA"
 IMU_PACKET_STRUCT = struct.Struct("<HBIIBB7fB")
 IMU_PACKET_SIZE = IMU_PACKET_STRUCT.size
+HAPTICS_COMMAND_STRUCT = struct.Struct("<HBBH")
+HAPTICS_COMMAND_HEADER = 0xCC33
 IMU_PACKET_HAS_ACCEL = 0b00000001
 IMU_PACKET_HAS_QUAT = 0b00000010
 IMU_PACKET_HAS_BUTTON = 0b00000100
@@ -74,6 +77,7 @@ IMU_MOUNTING_QUATERNION_OFFSETS = {
     ),
     "RIGHT": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64),
 }
+ENABLE_NOTE_HAPTICS = True
 
 
 @dataclass
@@ -154,6 +158,7 @@ class SerialImuReader(threading.Thread):
         self.lock = threading.Lock()
         self.snapshots_by_label: dict[str, ImuPacketSnapshot] = {}
         self.port_name: str | None = None
+        self.serial_port = None
         self.error: str | None = None
         self.packet_count = 0
 
@@ -172,11 +177,14 @@ class SerialImuReader(threading.Thread):
         self.port_name = port
         try:
             with serial.Serial(port, self.baud, timeout=0.02) as serial_port:
+                self.serial_port = serial_port
                 print(f"[playing test IMU] reading ESP-NOW receiver on {port} @ {self.baud}")
                 self._read_loop(serial_port)
         except Exception as error:
             self.error = str(error)
             print(f"[playing test IMU] serial reader stopped: {error}")
+        finally:
+            self.serial_port = None
 
     def _auto_detect_port(self) -> str | None:
         if list_ports is None:
@@ -357,6 +365,21 @@ class SerialImuReader(threading.Thread):
 
     def status_text(self) -> str:
         return " | ".join(self.status_lines())
+
+    def send_haptics_command(self, hand_label: str, intensity: int, duration_ms: int) -> bool:
+        device_id = 1 if str(hand_label).upper() == "LEFT" else 2
+        payload = HAPTICS_COMMAND_STRUCT.pack(
+            HAPTICS_COMMAND_HEADER,
+            int(device_id),
+            int(np.clip(intensity, 0, 255)),
+            int(np.clip(duration_ms, 1, 1000)),
+        )
+        with self.lock:
+            serial_port = self.serial_port
+            if serial_port is None or not serial_port.is_open:
+                return False
+            serial_port.write(payload)
+        return True
 
 
 class CameraProcessingWorker(threading.Thread):
@@ -673,7 +696,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.set_defaults(
         calibration=str(DEFAULT_PLAYING_TEST_CALIBRATION_PATH),
         tracked_point_count=2,
-        update_hz=60.0,
+        update_hz=120.0,
     )
     parser.add_argument("--preview-hz", type=float, default=DEFAULT_PREVIEW_HZ)
     parser.add_argument("--visualizer-hz", type=float, default=DEFAULT_VISUALIZER_HZ)
@@ -759,6 +782,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=fl_debug.HAND_MIDI_CHANNELS_1_BASED["RIGHT"],
     )
     parser.add_argument("--max-midi-channel", type=int, default=fl_debug.DEFAULT_MAX_MIDI_CHANNEL)
+    parser.add_argument("--no-haptics", action="store_true")
     parser.add_argument(
         "--require-inside-plane",
         action="store_true",
@@ -840,6 +864,7 @@ class MocapPlayingTestApp:
             midi_velocity=args.midi_velocity,
             midi_channels_1_based={"LEFT": args.left_midi_channel, "RIGHT": args.right_midi_channel},
             max_midi_channel=args.max_midi_channel,
+            enable_haptics=False,
             require_inside_plane_to_play=args.require_inside_plane,
             controlled_hand_label=args.controlled_hand,
             allow_hand_switching=False,
@@ -861,6 +886,10 @@ class MocapPlayingTestApp:
                 self.stop_event,
             )
             self.imu_reader.start()
+            self.visualizer.haptics = HapticsController(
+                enabled=(ENABLE_NOTE_HAPTICS and not args.no_haptics),
+                send_func=self.imu_reader.send_haptics_command,
+            )
             print(f"[playing test] IMU plane draw button is mapped to {args.imu_plane_draw_hand}")
             print(
                 "[playing test] IMU channel cycle button is mapped to "
@@ -1140,6 +1169,7 @@ class MocapPlayingTestApp:
             self.visualizer.set_hand_imu_state(
                 label,
                 rotation_quaternion=rotation_quaternion,
+                acceleration=imu_snapshot.accel if imu_snapshot.has_accel else None,
                 button_pressed=button_pressed,
             )
 

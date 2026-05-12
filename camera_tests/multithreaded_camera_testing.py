@@ -11,7 +11,7 @@ import numpy as np
 cv2.setNumThreads(1)
 
 # Change these if Windows assigns the cameras different indexes.
-CAMERA_IDS = [1, 2]
+CAMERA_IDS = [0,2]
 FOUR_CAMERA_IDS = [1, 2, 3, 4]
 
 FRAME_WIDTH = 1280
@@ -28,26 +28,30 @@ MAX_BLOB_ASPECT_RATIO = 3.0
 MORPHOLOGY_KERNEL = 1
 AUTOFOCUS = 0
 BLUR_KERNEL_BY_CAMERA = {
-    1: 15,
-    2: 15,
-    3: 15,
-    4: 15,
+    0: 1,
+    1: 1,
+    2: 1,
+    3: 1,
+    4: 1,
 }
 AUTO_EXPOSURE_BY_CAMERA = {
+    0: 0,
     1: 0,
     2: 0,
     3: 0,
     4: 0,
 }
 EXPOSURE_BY_CAMERA = {
-    1: -10,
-    2: -10,
+    0: -8,
+    1: -8,
+    2: -8,
     3: -8,
     4: -8,
 }
 GAIN_BY_CAMERA = {
-    1: 25,
-    2: 25,
+    0: 0,
+    1: 0,
+    2: 0,
     3: 0,
     4: 0,
 }

@@ -1,6 +1,7 @@
 # region ======================= Imports =======================
 import math
 import os
+import sys
 # Limit BLAS/OpenMP threads to 1 to avoid periodic thread contention and latency spikes in real-time.
 # Must be set before importing numpy.
 os.environ.setdefault('OMP_NUM_THREADS', '1')
@@ -14,10 +15,12 @@ import struct
 import queue
 import time
 import threading
+import subprocess
+from serial.tools import list_ports
 
 from dataclasses import dataclass, field
-from typing import Callable
 from collections import deque
+from pathlib import Path
 
 from vispy import app, scene
 from vispy.scene import visuals
@@ -27,57 +30,60 @@ from vispy.visuals.transforms import MatrixTransform
 
 import mido
 
+from haptics_controller import HapticsController
+
 # endregion
 
 # region ======================= Constants and Definitions =======================
 
-# --- UWB Configuration ---0
-NUM_UWB_ANCHORS: int = 4  # Set to 3, 4, or 5
-UWB_OUTLIER_THRESHOLD: float = 3  # meters
-UWB_DATA_TIMEOUT_S: float = 10.0  # Seconds before UWB data is considered stale
-# Set to None for auto-calibration, or provide positions as [(x,y,z), ...] to skip calibration
-# Positions should be in meters. Example: [(0,0,0), (5,0,0), (2.5,4.33,0), (2.5,2.16,3)]
-MANUAL_ANCHOR_POSITIONS: list[tuple[float, float, float]] | None = [(0.0, 0.0, 0.0), (00.0, 2.11, 0.510),
-                                                                    (1.83, 2.7, 0.91), (2.92, 0, 0)]
-# Alternative: specify individual distances and let Python calculate positions
-# Format: {(anchor1, anchor2): distance, ...} - distances in meters
-MANUAL_ANCHOR_DISTANCES: dict[tuple[int, int], float] | None = None
-# Example: {(1,2): 5.0, (1,3): 5.0, (2,3): 5.0, (1,4): 6.0, (2,4): 6.0, (3,4): 6.0}
-
 # --- Serial and Packet Definitions ---
-COM_PORTS: list[str] = ["/dev/cu.usbserial-023BB305"]
-PACKET_SIZE: int = 70  # Updated for 5 UWB distances (4 bytes per extra anchor)
-CALIBRATION_PACKET_SIZE: int = 8  # header(2) + source(1) + dest(1) + distance(4)
+COM_PORTS: list[str] = []
+SERIAL_BAUD: int = 921600
+PACKET_HEADER: int = 0xAAAA
 HEADER_BYTE: bytes = b'\xAA\xAA'
-CALIBRATION_HEADER_BYTE: bytes = b'\xBB\xBB'
-# Updated format: pos(3f), vel(3f), uwb(5f), quat(4f)
-PACKET_FORMAT: str = '<HBIBB 3f 3f 5f 4f B'
-CALIBRATION_FORMAT: str = '<H B B f'
+PACKET_STRUCT = struct.Struct('<HBIIBB7fB')
+PACKET_SIZE: int = PACKET_STRUCT.size
+assert PACKET_SIZE == 42, "ESP-NOW receiver packet must match hand_imu_packet_t"
+HAPTICS_COMMAND_STRUCT = struct.Struct("<HBBH")
+HAPTICS_COMMAND_HEADER: int = 0xCC33
 
 # --- Bit Flagging Constants ---
-PACKET_HAS_UWB_1: int = 0b00000100
-PACKET_HAS_UWB_2: int = 0b00001000
-PACKET_HAS_UWB_3: int = 0b00010000
-PACKET_HAS_UWB_4: int = 0b00100000
-PACKET_HAS_UWB_5: int = 0b01000000
+PACKET_HAS_ACCEL: int = 0b00000001
+PACKET_HAS_QUAT: int = 0b00000010
+PACKET_HAS_BUTTON: int = 0b00000100
 PACKET_HAS_ERROR: int = 0b10000000
-# Maximum allowed UWB distance (meters). Distances larger than this are treated as missing/invalid.
-MAX_UWB_DISTANCE: float = 10.0
-# Tolerance added to weighted least squares weights to reduce sensitivity to small UWB fluctuations
-UWB_WEIGHT_TOLERANCE: float = 0.05  # meters
+ERROR_ESPNOW_SEND: int = 0b00000001
+ERROR_QUAT_STALE: int = 0b00000010
+ERROR_ACCEL_STALE: int = 0b00000100
 
 # --- System and Physics Constants ---
 BOUNDING_BOX_NORMAL_TOLERANCE: float = 0.15  # meters, ±tolerance in normal direction
 MIDI_DEBUG_LOGGING: bool = True
 PERFORMANCE_MODE: bool = False  # for mirroring the L and R hands
-# Debug mode: when True, ignore IMU dead-reckoning and use multilateration-only
-# after the glove has been UWB-calibrated (useful for testing/validation).
-MULTILATERATION_ONLY: bool = True
 # Reduce console logging for real-time performance
 DEBUG_LOGGING: bool = True
-SHOWING_ANCHORS:bool = False
-# Minimum interval between sending corrections for a glove (ms)
-CORRECTION_MIN_INTERVAL_MS: int = 100
+CAMERA_POSITION_STALE_SECONDS: float = 0.35
+
+# Camera integration: set to 2 or 4.
+CAMERA_MODE: int = 2
+CAMERA_UPDATE_HZ: float = 120.0
+CAMERA_HAND_SIDE_AXIS: int = 0  # x axis: lower x is left, higher x is right
+CAMERA_POSITION_SCALE = np.array([4.0, 4.0, 4.0], dtype=np.float64)
+
+ENABLE_HAPTICS: bool = True
+ENABLE_NOTE_HAPTICS: bool = True
+HAPTICS_PORT: str | None = None
+HAPTICS_BAUD: int = 115200
+HAPTICS_NOTE_INTENSITY: int = 150
+HAPTICS_NOTE_DURATION_MS: int = 55
+
+ROOT_DIR = Path(__file__).resolve().parent
+CAMERA_TESTS_DIR = ROOT_DIR / "camera_tests"
+TWO_CAMERA_IDS: tuple[int, int] = (1, 2)
+TWO_CAMERA_IDS_ARG = ",".join(str(camera_id) for camera_id in TWO_CAMERA_IDS)
+TWO_CAMERA_SETTINGS_JSON = CAMERA_TESTS_DIR / "camera_uvc_settings_values.json"
+TWO_CAMERA_CALIBRATION_JSON = CAMERA_TESTS_DIR / "mocap_calibration.json"
+TWO_CAMERA_ALIGNED_CALIBRATION_JSON = CAMERA_TESTS_DIR / "mocap_calibration_aligned.json"
 
 INSTRUMENT_CYCLE: tuple[str, ...] = (
     "Synth",
@@ -92,6 +98,8 @@ INSTRUMENT_CYCLE: tuple[str, ...] = (
 )
 GESTURE_ROLL_RATE_THRESHOLD_DPS: float = 360.0
 GESTURE_ROLL_DELTA_THRESHOLD_DEG: float = 40.0
+GESTURE_ROLL_ANGLE_THRESHOLD_DEG: float = 100.0
+GESTURE_ACCEL_SPIKE_THRESHOLD_MPS2: float = 3.0
 GESTURE_WINDOW_MS: int = 220
 GESTURE_COOLDOWN_MS: int = 300
 
@@ -114,7 +122,7 @@ def rot_x(deg: float) -> np.ndarray:
 
 MODEL_OFFSET = rot_x(-90.0)
 
-# Helper: validate positions to avoid NaNs or wildly incorrect multilateration results
+# Helper: validate positions to avoid NaNs or wildly incorrect tracking results
 def is_reasonable_position(pos, max_norm=50.0):
     if pos is None:
         return False
@@ -126,6 +134,116 @@ def is_reasonable_position(pos, max_norm=50.0):
     return True
 
 
+def prompt_yes_no(prompt: str, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        response = input(f"{prompt} {suffix} ").strip().lower()
+        if not response:
+            return default
+        if response in {"y", "yes"}:
+            return True
+        if response in {"n", "no"}:
+            return False
+        print("Please answer yes or no.")
+
+
+def _run_python_step(script_path: Path, args: list[str], description: str) -> None:
+    command = [sys.executable, "-u", str(script_path), *args]
+    print(f"\n[{description}] starting")
+    print(" ".join(command))
+    completed = subprocess.run(command, cwd=str(ROOT_DIR), check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(f"{description} failed with exit code {completed.returncode}")
+
+
+def maybe_run_two_camera_calibration() -> None:
+    print("\nJazz Hands startup")
+    print(f"2-camera mode is active: cameras {TWO_CAMERA_IDS_ARG}")
+
+    _run_python_step(
+        CAMERA_TESTS_DIR / "camera_uvc_settings.py",
+        [
+            "--apply",
+            "--camera-ids",
+            TWO_CAMERA_IDS_ARG,
+            "--settings-json",
+            str(TWO_CAMERA_SETTINGS_JSON),
+        ],
+        "Apply saved camera settings",
+    )
+
+    if not prompt_yes_no("Do you want to initiate calibration?", default=False):
+        if not TWO_CAMERA_ALIGNED_CALIBRATION_JSON.exists() and not TWO_CAMERA_CALIBRATION_JSON.exists():
+            print(
+                "Warning: no saved camera calibration file was found. "
+                "The tracker may not start until you run calibration."
+            )
+        return
+
+    _run_python_step(
+        CAMERA_TESTS_DIR / "calibrate_mocap_cameras.py",
+        [
+            "--cameras",
+            TWO_CAMERA_IDS_ARG,
+            "--output",
+            str(TWO_CAMERA_CALIBRATION_JSON),
+            "--threaded",
+            "--exit-after-save",
+        ],
+        "2-camera calibration",
+    )
+    _run_python_step(
+        CAMERA_TESTS_DIR / "mocap_movement_alignment.py",
+        [
+            "--cameras",
+            TWO_CAMERA_IDS_ARG,
+            "--calibration",
+            str(TWO_CAMERA_CALIBRATION_JSON),
+            "--output",
+            str(TWO_CAMERA_ALIGNED_CALIBRATION_JSON),
+            "--threaded",
+            "--exit-after-save",
+        ],
+        "2-camera movement alignment",
+    )
+
+
+def discover_serial_ports() -> list[str]:
+    if COM_PORTS:
+        return list(COM_PORTS)
+
+    ports = list(list_ports.comports())
+    if not ports:
+        return []
+
+    preferred_keywords = (
+        "usb",
+        "uart",
+        "cp210",
+        "ch340",
+        "wch",
+        "silicon labs",
+        "esp32",
+    )
+    ranked: list[tuple[int, str]] = []
+    for port_info in ports:
+        text = " ".join(
+            str(value).lower()
+            for value in (
+                port_info.device,
+                port_info.description,
+                port_info.manufacturer,
+                port_info.hwid,
+            )
+            if value
+        )
+        priority = 0 if any(keyword in text for keyword in preferred_keywords) else 1
+        ranked.append((priority, str(port_info.device)))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [device for _priority, device in ranked]
+
+
 
 # endregion
 
@@ -133,27 +251,22 @@ def is_reasonable_position(pos, max_norm=50.0):
 
 @dataclass
 class PacketData:
-    """Represents the data structure of a packet from the ESP32."""
+    """Represents one ESP-NOW IMU packet forwarded by the receiver ESP32."""
     device_number: int
     timestamp: int
+    timestamp_us: int
+    sequence: int
+    packet_type: int
     packet_flags: int
-    button_state: bool
-    pos_x: float
-    pos_y: float
-    pos_z: float
-    vel_x: float
-    vel_y: float
-    vel_z: float
-    UWB_distance_1: float | None
-    UWB_distance_2: float | None
-    UWB_distance_3: float | None
-    UWB_distance_4: float | None
-    UWB_distance_5: float | None
-    quat_w: float
-    quat_i: float
-    quat_j: float
-    quat_k: float
-    error_handler: int | None
+    button_pressed: bool
+    accel_x: float | None
+    accel_y: float | None
+    accel_z: float | None
+    quat_w: float | None
+    quat_i: float | None
+    quat_j: float | None
+    quat_k: float | None
+    error_handler: int
 
     @classmethod
     def from_bytes(cls, binary_data: bytes) -> "PacketData":
@@ -161,51 +274,42 @@ class PacketData:
         if len(binary_data) != PACKET_SIZE:
             raise ValueError(f"Expected packet size {PACKET_SIZE}, got {len(binary_data)}")
 
-        unpacked = struct.unpack(PACKET_FORMAT, binary_data)
-        temp_packet_flag = unpacked[3]
+        unpacked = PACKET_STRUCT.unpack(binary_data)
+        (
+            header,
+            device_id,
+            timestamp_us,
+            sequence,
+            packet_flags,
+            button_pressed,
+            accel_x,
+            accel_y,
+            accel_z,
+            quat_w,
+            quat_i,
+            quat_j,
+            quat_k,
+            error_handler,
+        ) = unpacked
+        if header != PACKET_HEADER:
+            raise ValueError(f"Unexpected packet header 0x{header:04X}")
 
         return cls(
-            device_number=unpacked[1],
-            timestamp=unpacked[2],
-            packet_flags=temp_packet_flag,
-            button_state=bool(unpacked[4]),
-            pos_x=unpacked[5],
-            pos_y=unpacked[6],
-            pos_z=unpacked[7],
-            vel_x=unpacked[8],
-            vel_y=unpacked[9],
-            vel_z=unpacked[10],
-            UWB_distance_1=unpacked[11] if (temp_packet_flag & PACKET_HAS_UWB_1) else None,
-            UWB_distance_2=unpacked[12] if (temp_packet_flag & PACKET_HAS_UWB_2) else None,
-            UWB_distance_3=unpacked[13] if (temp_packet_flag & PACKET_HAS_UWB_3) else None,
-            UWB_distance_4=unpacked[14] if (temp_packet_flag & PACKET_HAS_UWB_4) else None,
-            UWB_distance_5=unpacked[15] if (temp_packet_flag & PACKET_HAS_UWB_5) else None,
-            quat_w=unpacked[16],
-            quat_i=unpacked[17],
-            quat_j=unpacked[18],
-            quat_k=unpacked[19],
-            error_handler=unpacked[20] if (temp_packet_flag & PACKET_HAS_ERROR) else None
-        )
-
-
-@dataclass
-class CalibrationData:
-    """Represents a calibration packet from the anchors."""
-    source_anchor: int
-    dest_anchor: int
-    distance: float
-
-    @classmethod
-    def from_bytes(cls, binary_data: bytes) -> "CalibrationData":
-        """Parses a calibration packet."""
-        if len(binary_data) != CALIBRATION_PACKET_SIZE:
-            raise ValueError(f"Expected calibration packet size {CALIBRATION_PACKET_SIZE}, got {len(binary_data)}")
-
-        unpacked = struct.unpack(CALIBRATION_FORMAT, binary_data)
-        return cls(
-            source_anchor=unpacked[1],
-            dest_anchor=unpacked[2],
-            distance=unpacked[3]
+            device_number=int(device_id),
+            timestamp=int(timestamp_us // 1000),
+            timestamp_us=int(timestamp_us),
+            sequence=int(sequence),
+            packet_type=int(packet_flags),
+            packet_flags=int(packet_flags),
+            button_pressed=bool(button_pressed) if (packet_flags & PACKET_HAS_BUTTON) else False,
+            accel_x=float(accel_x) if (packet_flags & PACKET_HAS_ACCEL) else None,
+            accel_y=float(accel_y) if (packet_flags & PACKET_HAS_ACCEL) else None,
+            accel_z=float(accel_z) if (packet_flags & PACKET_HAS_ACCEL) else None,
+            quat_w=float(quat_w) if (packet_flags & PACKET_HAS_QUAT) else None,
+            quat_i=float(quat_i) if (packet_flags & PACKET_HAS_QUAT) else None,
+            quat_j=float(quat_j) if (packet_flags & PACKET_HAS_QUAT) else None,
+            quat_k=float(quat_k) if (packet_flags & PACKET_HAS_QUAT) else None,
+            error_handler=int(error_handler) if (packet_flags & PACKET_HAS_ERROR) else 0,
         )
 
 
@@ -226,14 +330,12 @@ class ThreadedMultiDeviceReader:
 
     def __init__(self):
         self.processing_queues: dict[int, queue.Queue] = {}
-        self.calibration_queue: queue.Queue = queue.Queue()  # Global calibration queue
         self.relays: dict[int, dict] = {}
         self.threads: dict[int, threading.Thread] = {}
         self.running: bool = False
         self.lock = threading.Lock()
-        self.calibration_mode: bool = (MANUAL_ANCHOR_POSITIONS is None and MANUAL_ANCHOR_DISTANCES is None)
 
-    def add_device(self, relay_id: int, port: str, baudrate: int = 115200) -> bool:
+    def add_device(self, relay_id: int, port: str, baudrate: int = SERIAL_BAUD) -> bool:
         """Adds a device to be monitored and starts its reading thread."""
         with self.lock:
             if relay_id in self.relays:
@@ -263,33 +365,16 @@ class ThreadedMultiDeviceReader:
                 if ser.in_waiting > 0:
                     buffer.extend(ser.read(ser.in_waiting))
 
-                    # Check for calibration packets first (smaller, higher priority)
-                    if self.calibration_mode and len(buffer) >= CALIBRATION_PACKET_SIZE:
-                        cal_header_index = buffer.find(CALIBRATION_HEADER_BYTE)
-                        if cal_header_index != -1:
-                            if cal_header_index > 0:
-                                buffer[:] = buffer[cal_header_index:]
-                            if len(buffer) >= CALIBRATION_PACKET_SIZE:
-                                cal_packet_bytes = bytes(buffer[:CALIBRATION_PACKET_SIZE])
-                                try:
-                                    cal_data = CalibrationData.from_bytes(cal_packet_bytes)
-                                    self.calibration_queue.put(cal_data)
-                                    print(
-                                        f"Calibration: Anchor {cal_data.source_anchor} -> {cal_data.dest_anchor}: {cal_data.distance:.3f}m")
-                                except ValueError as e:
-                                    print(f"Calibration packet error: {e}")
-                                finally:
-                                    buffer[:] = buffer[CALIBRATION_PACKET_SIZE:]
-                                continue
-
-                    # Check for normal data packets
                     while len(buffer) >= PACKET_SIZE:
                         header_index = buffer.find(HEADER_BYTE)
                         if header_index == -1:
-                            buffer.clear()
+                            if buffer[-1:] == HEADER_BYTE[:1]:
+                                del buffer[:-1]
+                            else:
+                                buffer.clear()
                             break
                         if header_index > 0:
-                            buffer[:] = buffer[header_index:]
+                            del buffer[:header_index]
                         if len(buffer) >= PACKET_SIZE:
                             packet_bytes = bytes(buffer[:PACKET_SIZE])
                             try:
@@ -299,7 +384,7 @@ class ThreadedMultiDeviceReader:
                             except ValueError as e:
                                 print(f"Relay {relay_id} packet error: {e}")
                             finally:
-                                buffer[:] = buffer[PACKET_SIZE:]  # Consume packet
+                                del buffer[:PACKET_SIZE]
                 else:
                     time.sleep(0.001)
             except Exception as e:
@@ -323,152 +408,28 @@ class ThreadedMultiDeviceReader:
                 if device['serial'].is_open:
                     device['serial'].close()
 
-    def send_correction(self, relay_id: int, device_id: int, correction: np.ndarray):
-        """Sends a position correction vector to the specified device."""
-        if DEBUG_LOGGING:
-            print(f"Sending correction: {device_id}, {correction}")
+    def send_haptics_command(self, hand_label: str, intensity: int, duration_ms: int) -> bool:
+        device_id = 1 if str(hand_label).upper() == "LEFT" else 2
+        payload = HAPTICS_COMMAND_STRUCT.pack(
+            HAPTICS_COMMAND_HEADER,
+            int(device_id),
+            int(np.clip(intensity, 0, 255)),
+            int(np.clip(duration_ms, 1, 1000)),
+        )
         with self.lock:
-            if relay_id in self.relays and self.relays[relay_id]['serial'].is_open:
-                # Message format: 'C' for Correction, the device number, followed by 3 floats (dx, dy, dz)
-                message = struct.pack('<cb3f', b'C', device_id, correction[0], correction[1], correction[2])
-                self.relays[relay_id]['serial'].write(message)
+            if not self.relays:
+                return False
+            first_relay = self.relays.get(1) or next(iter(self.relays.values()))
+            serial_port = first_relay["serial"]
+            if not serial_port.is_open:
+                return False
+            serial_port.write(payload)
+        return True
 
 
 # endregion
 
 # region ======================= Math Helper Functions =======================
-
-def calculate_anchor_positions_from_distances(distances: dict[tuple[int, int], float]) -> dict[int, np.ndarray]:
-    """
-    Calculate 3D anchor positions from pairwise distances.
-    This function defines a coordinate system based on the first few anchors:
-    - Anchor 1 is at the origin (0,0,0).
-    - Anchor 2 is on the positive X-axis.
-    - Anchor 3 is on the XY plane with a positive Y value.
-    - Anchors 4, 5, etc., are placed in 3D space relative to this frame.
-    """
-    positions = {}
-    if NUM_UWB_ANCHORS < 3:
-        raise ValueError("At least 3 anchors are required for 3D positioning.")
-
-    # Anchor 1 at origin
-    positions[1] = np.array([0.0, 0.0, 0.0])
-
-    # Anchor 2 on X-axis
-    d12 = distances.get((1, 2)) or distances.get((2, 1))
-    if d12 is None: raise ValueError("Missing distance between anchors 1 and 2")
-    positions[2] = np.array([d12, 0.0, 0.0])
-
-    # Anchor 3 in XY plane
-    d13 = distances.get((1, 3)) or distances.get((3, 1))
-    d23 = distances.get((2, 3)) or distances.get((3, 2))
-    if d13 is None or d23 is None: raise ValueError("Missing distances for anchor 3")
-
-    # Law of cosines to find x3, y3
-    x3 = (d13 ** 2 + d12 ** 2 - d23 ** 2) / (2 * d12)
-    y3_squared = d13 ** 2 - x3 ** 2
-    y3 = math.sqrt(max(0.0, y3_squared))
-    positions[3] = np.array([x3, y3, 0.0])
-
-    # General trilateration for subsequent anchors (4, 5, ...)
-    for i in range(4, NUM_UWB_ANCHORS + 1):
-        d1i = distances.get((1, i)) or distances.get((i, 1))
-        d2i = distances.get((2, i)) or distances.get((i, 2))
-        d3i = distances.get((3, i)) or distances.get((i, 3))
-        if d1i is None or d2i is None or d3i is None:
-            raise ValueError(f"Missing distances for anchor {i}")
-
-        # Solve for position (xi, yi, zi) using anchors 1, 2, and 3
-        p2_x = positions[2][0]
-        p3_x, p3_y = positions[3][0], positions[3][1]
-
-        # from sphere equations (x-x_n)^2 + ... = d_n^2
-        xi = (d1i ** 2 - d2i ** 2 + p2_x ** 2) / (2 * p2_x)
-        yi = (d1i ** 2 - d3i ** 2 + p3_x ** 2 + p3_y ** 2 - 2 * p3_x * xi) / (2 * p3_y)
-        zi_squared = d1i ** 2 - xi ** 2 - yi ** 2
-        zi = math.sqrt(max(0, zi_squared))
-        positions[i] = np.array([xi, yi, zi])
-
-    return positions
-
-
-def multilaterate_3d_wls(distances: list[float], anchor_positions: dict[int, np.ndarray],
-                         previous_position: np.ndarray) -> np.ndarray:
-    """
-    3D multilateration using Weighted Least Squares tolerant to missing anchors.
-    Accepts a distances list (one entry per anchor index starting at 1) where any
-    entry may be None. Uses any subset of >=3 available anchors to compute the
-    position. If 4+ anchors are available they are used in a weighted least
-    squares solution; if exactly 3 are available the closed-form trilateration
-    (as WLS with 2x2 solve) is equivalent.
-    Returns the mapped (visualizer-frame) (x, y, z) position.
-    """
-    # Collect available anchors and their distances (anchor IDs start at 1)
-    available = [(idx + 1, float(d)) for idx, d in enumerate(distances) if d is not None]
-    m = len(available)
-    if m < 3:
-        raise ValueError("Need at least 3 valid distances for 3D multilateration.")
-
-    # Choose reference anchor as the last available (arbitrary but deterministic)
-    ref_id, ref_dist = available[-1]
-    ref_pos = anchor_positions.get(ref_id)
-    if ref_pos is None:
-        raise ValueError(f"Reference anchor {ref_id} position is missing from anchor_positions")
-
-    # Build linear system using all other available anchors
-    A = np.zeros((m - 1, 3), dtype=np.float64)
-    b = np.zeros(m - 1, dtype=np.float64)
-    W = np.eye(m - 1, dtype=np.float64)
-
-    for i in range(m - 1):
-        anchor_id, d_i = available[i]
-        p_i = anchor_positions.get(anchor_id)
-        if p_i is None:
-            raise ValueError(f"Anchor position for id {anchor_id} missing")
-        A[i, :] = 2.0 * (ref_pos - p_i)
-        b[i] = (d_i ** 2) - (ref_dist ** 2) - np.dot(p_i, p_i) + np.dot(ref_pos, ref_pos)
-        denom = max(d_i + UWB_WEIGHT_TOLERANCE, 0.05)
-        W[i, i] = 1.0 / (denom ** 2)
-
-    # Solve weighted least squares: (A^T W A) x = A^T W b
-    try:
-        AT_W_A = A.T @ W @ A
-        AT_W_b = A.T @ W @ b
-        pos = np.linalg.solve(AT_W_A, AT_W_b)
-    except np.linalg.LinAlgError:
-        # fallback to least squares
-        pos, *_ = np.linalg.lstsq(A, b, rcond=None)
-        pos = np.asarray(pos).flatten()
-
-    # Validate solution
-    if not is_reasonable_position(pos, max_norm=50.0):
-        if previous_position is not None and is_reasonable_position(previous_position, max_norm=50.0):
-            if DEBUG_LOGGING:
-                print("Multilateration produced invalid position, reverting to previous_position.")
-            return previous_position
-        else:
-            if DEBUG_LOGGING:
-                print("Multilateration produced invalid position and no previous valid position, returning zeros.")
-            return np.zeros(3)
-
-    # Outlier detection relative to previous
-    if previous_position is not None and np.all(np.isfinite(previous_position)):
-        distance_from_last = np.linalg.norm(pos - previous_position)
-        if distance_from_last > UWB_OUTLIER_THRESHOLD:
-            if DEBUG_LOGGING:
-                print(f"UWB outlier detected. Dist: {distance_from_last:.2f}m. Discarding.")
-            return previous_position
-
-    # Map multilateration result into the visualizer/IMU frame so axes match the visuals
-    try:
-        mapped_pos = FRAME_MAP @ pos
-        mapped_pos = MODEL_OFFSET @ mapped_pos
-    except Exception:
-        # Fallback: if mapping fails for any reason, return raw pos
-        mapped_pos = pos
-    print(mapped_pos)
-    return mapped_pos
-
 
 def quat_to_euler(q):
     """
@@ -536,11 +497,7 @@ def quaternion_inverse(q):
 
 
 def rotate_vector_by_quaternion(v, q):
-    """Rotates a 3D vector by a quaternion and maps it to the visualizer frame.
-
-    This ensures accelerations/positions rotated by quaternions in Kalman match the
-    FRAME_MAP / MODEL_OFFSET conventions used by the visualizer code.
-    """
+    """Rotates a 3D vector by a quaternion and maps it to the visualizer frame."""
     # Quaternion-vector multiplication: treat v as a pure quaternion (0, vx, vy, vz)
     q_vec = np.array([0.0, float(v[0]), float(v[1]), float(v[2])], dtype=np.float64)
     q_inv = quaternion_inverse(q)
@@ -592,10 +549,6 @@ class Glove:
     device_id: int
     active_area_x_subsections: int
     active_area_y_subsections: int
-    triangulate_func: Callable | None = None  # Will be set based on NUM_UWB_ANCHORS
-    single_correction_func: Callable | None = None
-    anchor_positions: dict[int, np.ndarray] = field(default_factory=dict)  # 3D positions of UWB anchors
-    is_UWB_calibrated: bool = False
     button_pressed: bool = False
     glove_state: int = 0
     in_active_area: bool = False
@@ -608,295 +561,96 @@ class Glove:
     active_area_half_extents: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     plane_normal_axis: int = 2  # Default to XY plane (Z-axis normal)
 
-    # State updated directly from ESP32's dead-reckoning
+    # Position comes from camera triangulation; orientation/acceleration come from IMU packets.
     position: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     velocity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
+    acceleration: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
+    world_acceleration: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     rotation_quaternion: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0]))
     rotation_euler: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     # Position translated into sections
     x_section: int = 0
     y_section: int = 0
 
-    # Raw UWB data for correction calculation
-    UWB_distance_1: float | None = None
-    UWB_distance_2: float | None = None
-    UWB_distance_3: float | None = None
-    UWB_distance_4: float | None = None
-    UWB_distance_5: float | None = None
-    UWB_timestamp_1: float = 0.0
-    UWB_timestamp_2: float = 0.0
-    UWB_timestamp_3: float = 0.0
-    UWB_timestamp_4: float = 0.0
-    UWB_timestamp_5: float = 0.0
-
-    # Reference point for UWB coordinate system calibration
-    reference_UWB_position: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
+    raw_camera_position: np.ndarray | None = None
+    camera_position_timestamp: float = 0.0
+    reference_camera_position: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
+    has_camera_reference: bool = False
     reference_orientation_quaternion: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0]))
     inverse_reference_orientation: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0]))
+    last_packet_receive_time: float = 0.0
 
     # History for gesture detection
     position_history: deque = field(default_factory=lambda: deque(maxlen=10))
     velocity_history: deque = field(default_factory=lambda: deque(maxlen=10))
     quat_history: deque = field(default_factory=lambda: deque(maxlen=10))
     euler_history: deque = field(default_factory=lambda: deque(maxlen=10))
-    # Timestamp of last sent correction (seconds since epoch)
-    last_correction_time: float = 0.0
 
-    def _get_uwb_distances(self) -> list[float | None]:
-        """Returns a list of UWB distances, filtering out stale data."""
-        now = time.time()
-        all_distances = [
-            self.UWB_distance_1 if now - self.UWB_timestamp_1 < UWB_DATA_TIMEOUT_S else None,
-            self.UWB_distance_2 if now - self.UWB_timestamp_2 < UWB_DATA_TIMEOUT_S else None,
-            self.UWB_distance_3 if now - self.UWB_timestamp_3 < UWB_DATA_TIMEOUT_S else None,
-            self.UWB_distance_4 if now - self.UWB_timestamp_4 < UWB_DATA_TIMEOUT_S else None,
-            self.UWB_distance_5 if now - self.UWB_timestamp_5 < UWB_DATA_TIMEOUT_S else None,
-        ]
-        if DEBUG_LOGGING:
-            print(all_distances)
-        return all_distances[:NUM_UWB_ANCHORS]
+    def has_fresh_camera_position(self, now: float | None = None) -> bool:
+        if self.raw_camera_position is None:
+            return False
+        current_time = time.time() if now is None else float(now)
+        return (current_time - self.camera_position_timestamp) <= CAMERA_POSITION_STALE_SECONDS
 
     def calibrate_zero_frame(self) -> bool:
-        """Sets the current UWB position as the origin of the coordinate system.
-
-        After computing an absolute UWB position, store it as the reference and
-        compute a one-time correction to align the IMU-derived position with the
-        UWB reference. The correction sent to the single_correction_func will be
-        such that (IMU_position + correction) == (UWB_position - reference_UWB_position)
-        which yields zero immediately after calibration.
-        """
-        distances = self._get_uwb_distances()
-
-        if all(d is not None for d in distances):
-            # Use 3D multilateration to get absolute position (already mapped inside the function)
-            uwb_position: np.ndarray = self.triangulate_func(distances, self.anchor_positions,
-                                                             self.position) if self.triangulate_func else ValueError(
-                "Triangulation function not set.")
-            # Validate
-            if not is_reasonable_position(uwb_position, max_norm=50.0):
-                print(f"Calibration multilateration returned invalid position for glove {self.device_id}: {uwb_position}")
-                return False
-
-            # Save a copy to avoid unexpected aliasing
-            self.reference_UWB_position = np.asarray(uwb_position, dtype=np.float64).copy()
-
-            # Save current orientation as the rotational reference
-            self.reference_orientation_quaternion = self.rotation_quaternion.copy()
-            self.inverse_reference_orientation = quaternion_inverse(self.reference_orientation_quaternion)
-
-            # Compute IMU-derived position in the same (mapped) frame
-            imu_pos = np.asarray(self.position, dtype=np.float64).copy()
-
-            # Compute correction needed to align IMU position to UWB reference.
-            # We want: (imu_pos + correction) == (uwb_position - reference_UWB_position)
-            # Since reference_UWB_position == uwb_position at calibration time, the RHS is zero,
-            # so correction = -imu_pos. However using the general formula is clearer and
-            # robust to future changes:
-            desired_rel = np.asarray(uwb_position, dtype=np.float64) - self.reference_UWB_position
-            correction = desired_rel - imu_pos
-
-            # Mark calibrated before sending correction so downstream logic can assume calibration
-            self.is_UWB_calibrated = True
-
-            if self.single_correction_func:
-                try:
-                    self.single_correction_func(self.device_id, correction)
-                except Exception as e:
-                    print(f"Error sending calibration correction for glove {self.device_id}: {e}")
-            else:
-                raise ValueError("Single correction function (only for calibration) not set.")
-
-            print(f"Glove {self.device_id} UWB calibrated at {self.reference_UWB_position}")
-            return True
-        else:
-            print(f"Glove {self.device_id}: UWB calibration failed. Missing UWB data.")
+        """Sets the current camera-triangulated position as the local origin."""
+        if not self.has_fresh_camera_position() or not is_reasonable_position(self.raw_camera_position, max_norm=50.0):
+            print(f"Glove {self.device_id}: camera zero-frame calibration failed. Missing camera position.")
             return False
 
-    def update_from_packet(self, p: DevicePacket):
-        """Updates the glove's state from an incoming ESP32 packet."""
-        self.button_pressed = not p.data.button_state
-        now = time.time()
+        self.reference_camera_position = np.asarray(self.raw_camera_position, dtype=np.float64).copy()
+        self.reference_orientation_quaternion = self.rotation_quaternion.copy()
+        self.inverse_reference_orientation = quaternion_inverse(self.reference_orientation_quaternion)
+        self.has_camera_reference = True
+        self.position = np.array([0.0, 0.0, 0.0])
+        self.velocity = np.array([0.0, 0.0, 0.0])
+        print(f"Glove {self.device_id} camera origin calibrated at {self.reference_camera_position}")
+        return True
 
-        # Remember previous states
-        self.position_history.append(self.position)
-        self.velocity_history.append(self.velocity)
-        self.euler_history.append(self.rotation_euler)
-        # Raw data from packet
-        raw_position = np.array([p.data.pos_x, p.data.pos_y, p.data.pos_z])
-        raw_velocity = np.array([p.data.vel_x, p.data.vel_y, p.data.vel_z])
-        raw_rotation = np.array([p.data.quat_w, p.data.quat_i, p.data.quat_j, p.data.quat_k])
+    def update_from_camera_position(self, position: np.ndarray | tuple[float, float, float],
+                                    timestamp: float | None = None):
+        """Updates glove position from camera triangulation."""
+        new_raw_position = np.asarray(position, dtype=np.float64).reshape(3)
+        if not is_reasonable_position(new_raw_position, max_norm=50.0):
+            if DEBUG_LOGGING:
+                print(f"Ignoring invalid camera position for device {self.device_id}: {new_raw_position}")
+            return
 
-        # If MULTILATERATION_ONLY is enabled and UWB calibration exists, prefer UWB position
-        if MULTILATERATION_ONLY and self.is_UWB_calibrated and self.triangulate_func is not None:
-            distances = self._get_uwb_distances()
-            if all(d is not None for d in distances):
-                try:
-                    abs_uwb_pos = self.triangulate_func(distances, self.anchor_positions, self.position)
-                    rel_uwb_pos = abs_uwb_pos - self.reference_UWB_position
-                    # Use multilateration result as the authoritative position in the calibrated frame
-                    self.position = rel_uwb_pos
-                    # Velocity is unknown from multilateration alone; set to zero to avoid integrating bad IMU velocities
-                    self.velocity = np.array([0.0, 0.0, 0.0])
-                except Exception as e:
-                    print(f"Multilateration error for device {self.device_id}: {e}")
-                    # Fallback to IMU-derived transform
-                    self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
-                    self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
-            else:
-                # Not enough UWB data yet: fallback to IMU
-                self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
-                self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
+        now = time.time() if timestamp is None else float(timestamp)
+        previous_position = self.position.copy()
+        previous_timestamp = self.camera_position_timestamp
+
+        self.raw_camera_position = new_raw_position.copy()
+        self.camera_position_timestamp = now
+        self.position_history.append(previous_position)
+        self.velocity_history.append(self.velocity.copy())
+
+        if self.has_camera_reference:
+            self.position = new_raw_position - self.reference_camera_position
         else:
-            # Default: transform IMU dead-reckoning into calibrated world frame
-            self.position = rotate_vector_by_quaternion(raw_position, self.inverse_reference_orientation)
-            self.velocity = rotate_vector_by_quaternion(raw_velocity, self.inverse_reference_orientation)
+            self.position = new_raw_position
 
-        # Rotation should still be derived from the IMU quaternion
-        self.rotation_quaternion = quaternion_multiply(self.inverse_reference_orientation, raw_rotation)
+        dt = now - previous_timestamp if previous_timestamp > 0.0 else 0.0
+        if dt > 1e-6:
+            self.velocity = (self.position - previous_position) / dt
+        else:
+            self.velocity = np.array([0.0, 0.0, 0.0])
 
-        self.rotation_euler = np.array(quat_to_euler_deg(self.rotation_quaternion), dtype=np.float64)
+    def update_from_packet(self, p: DevicePacket):
+        """Updates IMU-derived state from an incoming ESP32 packet."""
+        self.button_pressed = p.data.button_pressed
+        self.last_packet_receive_time = time.time()
 
-        # Validate resulting position; if invalid, revert to previous valid position if available
-        try:
-            if not is_reasonable_position(self.position, max_norm=50.0):
-                if self.position_history:
-                    prev = self.position_history[-1]
-                    if is_reasonable_position(prev, max_norm=50.0):
-                        print(f"Discarding invalid position for device {self.device_id}; reverting to previous.")
-                        self.position = prev.copy()
-                        self.velocity = np.array([0.0, 0.0, 0.0])
-                else:
-                    print(f"Invalid position received for device {self.device_id} and no previous position to revert to.")
-        except Exception:
-            pass
+        self.euler_history.append(self.rotation_euler)
+        if p.data.quat_w is not None:
+            raw_rotation = np.array([p.data.quat_w, p.data.quat_i, p.data.quat_j, p.data.quat_k], dtype=np.float64)
+            self.quat_history.append(self.rotation_quaternion.copy())
+            self.rotation_quaternion = quaternion_multiply(self.inverse_reference_orientation, raw_rotation)
+            self.rotation_euler = np.array(quat_to_euler_deg(self.rotation_quaternion), dtype=np.float64)
 
-        # Treat distances > MAX_UWB_DISTANCE as missing (None)
-        if p.data.UWB_distance_1 is not None:
-            if abs(p.data.UWB_distance_1) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_1 = p.data.UWB_distance_1
-                self.UWB_timestamp_1 = now
-            else:
-                self.UWB_distance_1 = None
-        if p.data.UWB_distance_2 is not None:
-            if abs(p.data.UWB_distance_2) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_2 = p.data.UWB_distance_2
-                self.UWB_timestamp_2 = now
-            else:
-                self.UWB_distance_2 = None
-        if p.data.UWB_distance_3 is not None:
-            if abs(p.data.UWB_distance_3) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_3 = p.data.UWB_distance_3
-                self.UWB_timestamp_3 = now
-            else:
-                self.UWB_distance_3 = None
-        if p.data.UWB_distance_4 is not None:
-            if abs(p.data.UWB_distance_4) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_4 = p.data.UWB_distance_4
-                self.UWB_timestamp_4 = now
-            else:
-                self.UWB_distance_4 = None
-        if p.data.UWB_distance_5 is not None:
-            if abs(p.data.UWB_distance_5) <= MAX_UWB_DISTANCE:
-                self.UWB_distance_5 = p.data.UWB_distance_5
-                self.UWB_timestamp_5 = now
-            else:
-                self.UWB_distance_5 = None
-
-    def calculate_and_send_correction(self, reader: ThreadedMultiDeviceReader, relay_id: int, device_id: int):
-        distances = self._get_uwb_distances()
-
-        # Only proceed if we have fresh UWB data
-        if all(d is not None for d in distances):
-            # Rate-limit corrections to avoid flooding the serial link and heavy computation
-            now = time.time()
-            if (now - self.last_correction_time) * 1000.0 < CORRECTION_MIN_INTERVAL_MS:
-                return
-
-            # 1. Calculate UWB ground truth in the absolute anchor frame
-            abs_uwb_pos = self.triangulate_func(distances, self.anchor_positions,
-                                                self.position) if self.triangulate_func else ValueError(
-                "Triangulation function not set.")
-
-            # Validate multilateration result before using it
-            if not is_reasonable_position(abs_uwb_pos, max_norm=50.0):
-                if DEBUG_LOGGING:
-                    print(f"Ignoring invalid UWB solution for glove {self.device_id}: {abs_uwb_pos}")
-                # Invalidate UWB to avoid repeated bad corrections
-                self.UWB_distance_1 = None
-                self.UWB_distance_2 = None
-                self.UWB_distance_3 = None
-                self.UWB_distance_4 = None
-                self.UWB_distance_5 = None
-                return
-
-            # 2. Translate to the relative frame based on the calibration origin
-            rel_uwb_pos = abs_uwb_pos - self.reference_UWB_position
-
-            # 3. Calculate the correction vector (the drift)
-            correction = rel_uwb_pos - self.position
-
-            # 4. Enforce bounding box margins so the glove stays within the active plane
-            #    - keep at least PLANE_BOUNDARY_MARGIN (0.1m) away from planar edges (u,v axes)
-            #    - keep within PLANE_SURFACE_MAX_DISTANCE (0.2m) from the plane surface (normal axis)
-            #    The active plane is assumed centered at origin with half extents stored in active_area_half_extents.
-            if self.glove_state == 2:
-                plane_axes = [i for i in range(3) if i != self.plane_normal_axis]
-                u_axis, v_axis = plane_axes[0], plane_axes[1]
-
-                # margins and limits
-                PLANE_BOUNDARY_MARGIN = 0.1  # meters from edges
-                PLANE_SURFACE_MAX_DISTANCE = 0.2  # meters from plane surface (positive side)
-
-                # Proposed new position after applying raw correction
-                proposed_pos = self.position + correction
-
-                # U/V axes (plane bounds)
-                u_half = self.active_area_half_extents[u_axis]
-                v_half = self.active_area_half_extents[v_axis]
-
-                # If extents are tiny or unset, skip planar clamping
-                if u_half > 1e-6 and v_half > 1e-6:
-                    u_min = -u_half + PLANE_BOUNDARY_MARGIN
-                    u_max = u_half - PLANE_BOUNDARY_MARGIN
-                    v_min = -v_half + PLANE_BOUNDARY_MARGIN
-                    v_max = v_half - PLANE_BOUNDARY_MARGIN
-
-                    if proposed_pos[u_axis] < u_min:
-                        correction[u_axis] += (u_min - proposed_pos[u_axis])
-                    else:
-                        if proposed_pos[u_axis] > u_max:
-                            correction[u_axis] += (u_max - proposed_pos[u_axis])
-
-                    if proposed_pos[v_axis] < v_min:
-                        correction[v_axis] += (v_min - proposed_pos[v_axis])
-                    else:
-                        if proposed_pos[v_axis] > v_max:
-                            correction[v_axis] += (v_max - proposed_pos[v_axis])
-
-                # Normal axis (keep on positive side and within max distance from plane)
-                n_axis = self.plane_normal_axis
-                proposed_n = proposed_pos[n_axis]
-                # Enforce minimum (on or above plane surface) and maximum distance
-                if proposed_n < 0.0:
-                    correction[n_axis] += (0.0 - proposed_n)
-                else:
-                    if proposed_n > PLANE_SURFACE_MAX_DISTANCE:
-                        correction[n_axis] += (PLANE_SURFACE_MAX_DISTANCE - proposed_n)
-
-            # 5. Send the correction back to the ESP32
-            reader.send_correction(relay_id, device_id, correction)
-            # record send time
-            self.last_correction_time = now
-
-            # 6. Immediately apply the correction locally for smooth visualization
-            self.position += correction
-
-            # 7. Invalidate UWB data after use to prevent re-sending the same correction
-            self.UWB_distance_1 = None
-            self.UWB_distance_2 = None
-            self.UWB_distance_3 = None
-            self.UWB_distance_4 = None
-            self.UWB_distance_5 = None
+        if p.data.accel_x is not None:
+            self.acceleration = np.array([p.data.accel_x, p.data.accel_y, p.data.accel_z], dtype=np.float64)
+            self.world_acceleration = rotate_vector_by_quaternion(self.acceleration, self.rotation_quaternion)
 
     @staticmethod
     def _get_section_index(pos_val: float, num_sections: int, area_half_length: float) -> int:
@@ -949,6 +703,10 @@ class Glove:
     def get_section_from_position(self):
         """Convert positions to sections and other instructions"""
         if self.glove_state == 2:
+            if not self.has_fresh_camera_position():
+                self.in_active_area = False
+                return
+
             plane_axes = [i for i in range(3) if i != self.plane_normal_axis]
             u_axis, v_axis = plane_axes[0], plane_axes[1]
 
@@ -978,9 +736,12 @@ class Glove:
                     self.plane_normal_axis = int(np.argmin(abs_pos))
 
                     plane_axes = [i for i in range(3) if i != self.plane_normal_axis]
-                    max_dim = max(abs_pos[plane_axes[0]], abs_pos[plane_axes[1]])
+                    half_u = max(float(abs_pos[plane_axes[0]]), 0.005)
+                    half_v = max(float(abs_pos[plane_axes[1]]), 0.005)
 
-                    dimensions = np.full(3, max_dim) * 2.0
+                    dimensions = np.full(3, 0.005, dtype=np.float64)
+                    dimensions[plane_axes[0]] = half_u * 2.0
+                    dimensions[plane_axes[1]] = half_v * 2.0
                     dimensions[self.plane_normal_axis] = 0.005
 
                     transform = np.eye(4)
@@ -994,9 +755,9 @@ class Glove:
                     self.glove_state = 2
                     abs_pos = np.abs(self.position)
                     plane_axes = [i for i in range(3) if i != self.plane_normal_axis]
-                    max_extent = max(abs_pos[plane_axes[0]], abs_pos[plane_axes[1]])
-
-                    self.active_area_half_extents = np.full(3, max_extent)
+                    self.active_area_half_extents = np.zeros(3, dtype=np.float64)
+                    self.active_area_half_extents[plane_axes[0]] = max(float(abs_pos[plane_axes[0]]), 0.005)
+                    self.active_area_half_extents[plane_axes[1]] = max(float(abs_pos[plane_axes[1]]), 0.005)
                     self.active_area_half_extents[self.plane_normal_axis] = 0.0
 
                     self._update_section_visuals()
@@ -1005,16 +766,15 @@ class Glove:
 @dataclass
 class LeftHand(Glove):
     """Manages the parameters controlled by the left hand"""
-    note: int = 0
     volume: int = 0
-    reverb_mode: int = 0
+    reverb_amount: int = 0
+    attack: int = 0
 
 
 @dataclass
 class RightHand(Glove):
     """Manages the parameters controlled by the right hand"""
-    stereo: float = 0
-    attack: int = 0
+    note: int = 0
     instrument: str = "Synth"
 
 
@@ -1030,6 +790,7 @@ class GlovePair:
     current_octave: int = 4
     right_roll_samples: deque = field(default_factory=lambda: deque(maxlen=10))
     last_instrument_gesture_ms: int = field(default=-10_000)
+    last_preview_note: int | None = field(default=None)
     running: bool = field(init=False, default=False)
     processing_thread: threading.Thread = field(init=False)
 
@@ -1041,18 +802,31 @@ class GlovePair:
         self.processing_thread.start()
 
     def _process_single_packet(self, packet: DevicePacket, from_queue: bool = False):
-        glove = self.left_hand if packet.data.device_number % 2 != 0 else self.right_hand
+        glove = self._hand_for_device_id(packet.data.device_number)
         glove.update_from_packet(packet)
         glove.get_section_from_position()
-
-        if glove.glove_state == 2:
-            glove.calculate_and_send_correction(self.reader, self.relay_id, glove.device_id)
 
         if from_queue:
             self.relay_queue.task_done()
 
+        self._update_playing_state(glove, packet)
+
+    def _hand_for_device_id(self, device_id: int) -> Glove:
+        return self.left_hand if device_id % 2 != 0 else self.right_hand
+
+    def update_camera_position(self, device_id: int, position: np.ndarray | tuple[float, float, float],
+                               timestamp: float | None = None):
+        """Feeds a camera-triangulated position into the matching hand."""
+        glove = self._hand_for_device_id(device_id)
+        glove.update_from_camera_position(position, timestamp)
+        glove.get_section_from_position()
+        self._update_playing_state(glove)
+
+    def _update_playing_state(self, updated_glove: Glove, packet: DevicePacket | None = None):
+        self._update_note_preview_haptics()
         if self.left_hand.glove_state == 2 and self.right_hand.glove_state == 2:
-            self._update_right_roll_gesture(glove, packet)
+            if packet is not None:
+                self._update_right_roll_gesture(updated_glove, packet)
 
             if self.left_hand.in_active_area and self.right_hand.in_active_area:
                 self.section_to_note()
@@ -1060,6 +834,20 @@ class GlovePair:
             else:
                 self.daw_interface.stop_notes()
                 self.daw_interface.previous_note = NoteData.blank_note()
+
+    def _update_note_preview_haptics(self) -> None:
+        preview_note = None
+        if self.right_hand.glove_state == 2 and self.right_hand.in_active_area:
+            preview_note = int(self.right_hand.y_section + (self.current_octave * 12))
+
+        if (
+            ENABLE_NOTE_HAPTICS
+            and preview_note is not None
+            and preview_note != self.last_preview_note
+        ):
+            self.daw_interface.haptics.pulse("RIGHT", HAPTICS_NOTE_INTENSITY, HAPTICS_NOTE_DURATION_MS)
+
+        self.last_preview_note = preview_note
 
     @staticmethod
     def _roll_delta_deg(current_roll: float, previous_roll: float) -> float:
@@ -1113,8 +901,11 @@ class GlovePair:
 
         delta_roll = self._roll_delta_deg(current_roll, oldest_roll)
         roll_rate_dps = delta_roll / (dt_ms / 1000.0)
+        accel_norm = float(np.linalg.norm(self.right_hand.acceleration))
         if (
-                abs(delta_roll) >= GESTURE_ROLL_DELTA_THRESHOLD_DEG
+                abs(current_roll) >= GESTURE_ROLL_ANGLE_THRESHOLD_DEG
+                and accel_norm >= GESTURE_ACCEL_SPIKE_THRESHOLD_MPS2
+                and abs(delta_roll) >= GESTURE_ROLL_DELTA_THRESHOLD_DEG
                 and abs(roll_rate_dps) >= GESTURE_ROLL_RATE_THRESHOLD_DPS
                 and (current_t - self.last_instrument_gesture_ms) >= GESTURE_COOLDOWN_MS
         ):
@@ -1148,11 +939,11 @@ class GlovePair:
 
     def play_note(self):
         note_packet = NoteData(
-            note=self.left_hand.note,
+            note=self.right_hand.note,
             volume=self.left_hand.volume,
-            reverb_mode=self.left_hand.reverb_mode,
-            stereo=self.right_hand.stereo,
-            attack=self.right_hand.attack,
+            reverb_mode=self.left_hand.reverb_amount,
+            stereo=0.0,
+            attack=self.left_hand.attack,
             instrument=self.right_hand.instrument
         )
         if MIDI_DEBUG_LOGGING:
@@ -1173,23 +964,23 @@ class GlovePair:
                 if hand.button_pressed:
                     self.current_octave -= 1 if self.current_octave > 2 else 0
 
-                hand.note = hand.y_section + (self.current_octave * 12)
+                volume_roll = float(np.clip(hand.rotation_euler[0], 0.0, 180.0))
+                hand.volume = int(np.clip(round((volume_roll / 180.0) * 127.0), 0, 127))
 
-                hand.volume = int(np.clip(round(hand.rotation_euler[0] / 180 * 63 + 64), 0, 127))
-
-                if hand.x_section == 1 or hand.x_section == 2:
-                    hand.reverb_mode = 1
-                elif hand.x_section == 0:
-                    hand.reverb_mode = 0
-                else:
-                    hand.reverb_mode = 2
+                plane_axes = [i for i in range(3) if i != hand.plane_normal_axis]
+                x_axis, y_axis = plane_axes[0], plane_axes[1]
+                x_extent = float(hand.active_area_half_extents[x_axis]) if float(hand.active_area_half_extents[x_axis]) > 1e-6 else 1.0
+                y_extent = float(hand.active_area_half_extents[y_axis]) if float(hand.active_area_half_extents[y_axis]) > 1e-6 else 1.0
+                x_normalized = float(np.clip((hand.position[x_axis] + x_extent) / (2.0 * x_extent), 0.0, 1.0))
+                y_normalized = float(np.clip((hand.position[y_axis] + y_extent) / (2.0 * y_extent), 0.0, 1.0))
+                hand.reverb_amount = int(np.clip(round(x_normalized * 127.0), 0, 127))
+                hand.attack = int(np.clip(round(y_normalized * 127.0), 0, 127))
 
             if hand is self.right_hand:
                 if hand.button_pressed:
                     self.current_octave += 1 if self.current_octave < 7 else 0
 
-                hand.stereo = float(np.clip((hand.x_section - 2) * 0.25, -0.5, 0.5))  # section to stereo pan
-                hand.attack = hand.y_section * 18  # converts section number 0 to 7 to attack int 0 to 127 (approximately)
+                hand.note = hand.y_section + (self.current_octave * 12)
 
 
 # endregion
@@ -1204,8 +995,8 @@ class NoteData:
 
     # Control data
     volume: int | None  # 0-127
-    stereo: float | None  # between -0.5 and +0.5
-    reverb_mode: int | None  # 0, 1, or 2
+    stereo: float | None  # unused for now
+    reverb_mode: int | None  # continuous 0-127
 
     @classmethod
     def blank_note(cls):
@@ -1222,6 +1013,7 @@ class NoteData:
 @dataclass
 class DawInterface:
     port: mido.backends.rtmidi.Output
+    haptics: HapticsController = field(default_factory=lambda: HapticsController(HAPTICS_PORT, HAPTICS_BAUD, ENABLE_HAPTICS))
     previous_note: NoteData = field(init=False)
 
 
@@ -1283,6 +1075,8 @@ class DawInterface:
         return inst_channel
 
     def stop_notes(self):
+        if self.port is None:
+            return
         self.port.send(mido.Message(
             'note_off',
             note=self.previous_note.note,
@@ -1312,17 +1106,11 @@ class DawInterface:
 
         def add_control_msgs(msg_list: list[mido.Message]):
             if note.reverb_mode != self.previous_note.reverb_mode:
-                if note.reverb_mode == 0:
-                    reverb = 5
-                elif note.reverb_mode == 1:
-                    reverb = 32
-                else:
-                    reverb = 127
                 reverb_msg = mido.Message(
                     'control_change',
                     channel=11,
                     control=100,
-                    value=reverb
+                    value=int(np.clip(note.reverb_mode, 0, 127))
                 )
                 msg_list.append(reverb_msg)
             if note.volume != self.previous_note.volume:
@@ -1336,7 +1124,7 @@ class DawInterface:
                 stereo_msg = mido.Message(
                     'control_change',
                     control=102,
-                    value=note_pan
+                    value=64
                 )
                 msg_list.append(stereo_msg)
 
@@ -1372,6 +1160,7 @@ class DawInterface:
         if self.port is None:
             if MIDI_DEBUG_LOGGING:
                 print(f"[MIDI DEBUG] Skipping play_note because port is None. note={note}")
+            self.previous_note = note
             return
         message_list = self.prepare_midi_messages(note)
         if MIDI_DEBUG_LOGGING:
@@ -1405,8 +1194,9 @@ class GloveVisual:
 
 
 class Visualizer:
-    def __init__(self, glove_pairs):
+    def __init__(self, glove_pairs, camera_feeder: 'CameraPositionFeeder | None' = None):
         self.glove_pairs = glove_pairs
+        self.camera_feeder = camera_feeder
         # Create canvas sized to 75% of the screen (if available) for a larger visualization area
         try:
             import tkinter as _tk
@@ -1420,49 +1210,23 @@ class Visualizer:
             target_size = (int(0.75 * 1920), int(0.75 * 1280))
 
         self.canvas = scene.SceneCanvas(keys='interactive', show=True, size=target_size)
-        self.grid = self.canvas.central_widget.add_grid()
-        self.view_pairs = []
+        self.view = self.canvas.central_widget.add_view(border_color='white')
+        self.view.camera = scene.cameras.TurntableCamera()
+        visuals.GridLines(scale=(0.25, 0.25), color=(0.25, 0.25, 0.25, 1.0), parent=self.view.scene)
+        visuals.XYZAxis(parent=self.view.scene)
         self.hand_meshes = {}
 
-        for i, pair in enumerate(self.glove_pairs):
-            # Left Hand View
-            lh_view = self.grid.add_view(row=i, col=0, border_color='white')
-            lh_view.camera = scene.cameras.TurntableCamera()
-            pair.left_hand.visual = GloveVisual(axis=visuals.XYZAxis(parent=lh_view.scene),
-                                                parent_scene=lh_view.scene)
-
-            # Right Hand View
-            rh_view = self.grid.add_view(row=i, col=1, border_color='white')
-            rh_view.camera = scene.cameras.TurntableCamera()
-            pair.right_hand.visual = GloveVisual(axis=visuals.XYZAxis(parent=rh_view.scene),
-                                                 parent_scene=rh_view.scene)
-            lh_view.camera.link(rh_view.camera)
-            if PERFORMANCE_MODE:
-                self.view_pairs.append((rh_view, lh_view))
-            else:
-                self.view_pairs.append((lh_view, rh_view))
+        for pair in self.glove_pairs:
+            pair.left_hand.visual = GloveVisual(
+                axis=visuals.XYZAxis(parent=self.view.scene),
+                parent_scene=self.view.scene,
+            )
+            pair.right_hand.visual = GloveVisual(
+                axis=visuals.XYZAxis(parent=self.view.scene),
+                parent_scene=self.view.scene,
+            )
 
         self._setup_hand_meshes()
-        if SHOWING_ANCHORS:
-            # Add anchor visuals (small dots) from hardcoded anchor positions.
-            # Represent anchors as small spheres/markers ~5cm visually. Use Markers for simplicity.
-            try:
-                for i, pair in enumerate(self.glove_pairs):
-                    if not pair.left_hand.anchor_positions:
-                        continue
-                    lh_view, rh_view = self.view_pairs[i]
-                    # Build ordered positions array
-                    anchor_items = sorted(pair.left_hand.anchor_positions.items())
-                    positions = np.array([pos for (_, pos) in anchor_items], dtype=np.float32) * POSITION_SCALE
-                    if positions.size == 0:
-                        continue
-                    # Create markers for left and right views so anchors are visible in both
-                    anchor_markers_l = scene.visuals.Markers(parent=lh_view.scene)
-                    anchor_markers_l.set_data(positions, face_color=(1, 0, 0, 1), size=20)
-                    anchor_markers_r = scene.visuals.Markers(parent=rh_view.scene)
-                    anchor_markers_r.set_data(positions, face_color=(1, 0, 0, 1), size=20)
-            except Exception as e:
-                print(f"Could not create anchor visuals: {e}")
 
         self.timer = Timer('auto', connect=self.update, start=True)
         self.canvas.events.close.connect(self.on_close)
@@ -1473,21 +1237,20 @@ class Visualizer:
             return
 
         vertices, faces, _normals, _texcoords = read_mesh(HAND_OBJ_PATH)
-        lh_view, rh_view = self.view_pairs[0]
         self.hand_meshes["LEFT"] = scene.visuals.Mesh(
             vertices=vertices,
             faces=faces,
             color=(0.25, 0.75, 0.95, 0.80),
-            shading="smooth",
-            parent=lh_view.scene,
+            shading=None,
+            parent=self.view.scene,
         )
         self.hand_meshes["LEFT"].transform = MatrixTransform()
         self.hand_meshes["RIGHT"] = scene.visuals.Mesh(
             vertices=vertices,
             faces=faces,
             color=(0.95, 0.45, 0.25, 0.80),
-            shading="smooth",
-            parent=rh_view.scene,
+            shading=None,
+            parent=self.view.scene,
         )
         self.hand_meshes["RIGHT"].transform = MatrixTransform()
 
@@ -1504,6 +1267,8 @@ class Visualizer:
 
     def on_close(self, event):
         self.timer.stop()
+        if self.camera_feeder is not None:
+            self.camera_feeder.stop()
         for pair in self.glove_pairs:
             pair.stop()
         if self.glove_pairs:
@@ -1512,6 +1277,8 @@ class Visualizer:
         app.quit()
 
     def update(self, event):
+        if self.camera_feeder is not None:
+            self.camera_feeder.update()
         for pair in self.glove_pairs:
             left_hand = pair.left_hand
             right_hand = pair.right_hand
@@ -1538,100 +1305,234 @@ class Visualizer:
 
 # region ======================= Main Application =======================
 
-def perform_auto_calibration(reader: ThreadedMultiDeviceReader) -> dict[int, np.ndarray]:
-    """
-    Waits for calibration packets from anchors and calculates their 3D positions.
-    Returns a dictionary of anchor positions {anchor_id: np.ndarray([x, y, z])}.
-    """
-    print(f"\n{'=' * 60}")
-    print("AUTO-CALIBRATION MODE")
-    print(f"Waiting for {NUM_UWB_ANCHORS} UWB anchors to calibrate...")
-    print(f"{'=' * 60}\n")
+def _load_camera_modules():
+    root_dir = Path(__file__).resolve().parent
+    camera_tests_dir = root_dir / "camera_tests"
+    four_camera_dir = camera_tests_dir / "4_camera_tests"
+    for path in (camera_tests_dir, four_camera_dir, root_dir):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
 
-    # Collect all pairwise distances from calibration packets
-    distances = {}
-    required_measurements = NUM_UWB_ANCHORS * (NUM_UWB_ANCHORS - 1) // 2
+    import mocap_tracker as mocap
+    import four_camera_shared as four_shared
+    return mocap, four_shared
 
-    while len(distances) < required_measurements:
-        try:
-            cal_data = reader.calibration_queue.get(timeout=30.0)
-            # Use a sorted tuple as key to handle (1,2) and (2,1) as the same measurement
-            key = tuple(sorted((cal_data.source_anchor, cal_data.dest_anchor)))
-            if key not in distances:
-                distances[key] = cal_data.distance
-                print(
-                    f"  [{len(distances)}/{required_measurements}] Anchor {cal_data.source_anchor} -> {cal_data.dest_anchor}: {cal_data.distance:.3f}m")
-        except queue.Empty:
-            print("Calibration timeout! Make sure all anchors are powered on and sending data.")
-            raise TimeoutError("Auto-calibration failed: timeout waiting for anchor data")
 
-    print(f"\n{'=' * 60}")
-    print("Calibration complete! Calculating anchor positions...")
-    print(f"{'=' * 60}\n")
+class CameraPositionFeeder:
+    def __init__(self, glove_pair: GlovePair, mode: int = CAMERA_MODE):
+        if mode not in (2, 4):
+            raise ValueError("CAMERA_MODE must be 2 or 4")
+        self.glove_pair = glove_pair
+        self.mode = int(mode)
+        self.mocap, self.four_shared = _load_camera_modules()
+        self.args = self._build_args()
+        self.stop_event = None
+        self.workers = []
+        self.calibrations = {}
+        self.tracker = None
+        self.triangulator = None
+        self.display_track_ids: list[int] = []
+        self.last_processed_frame_numbers: dict[int, int] = {}
 
-    # Calculate anchor positions from the collected distances
-    anchor_positions = calculate_anchor_positions_from_distances(distances)
+    def _build_args(self):
+        parser = self.mocap.build_arg_parser()
+        args = parser.parse_args([])
+        if self.mode == 4:
+            args.cameras = list(self.four_shared.CAMERA_IDS)
+            args.calibration = str(self.four_shared.default_calibration_path())
+            args.front_cameras = tuple(self.four_shared.FRONT_CAMERA_IDS)
+            args.top_cameras = tuple(self.four_shared.TOP_CAMERA_IDS)
+            args.fusion_y_tolerance = self.four_shared.DEFAULT_FUSION_Y_TOLERANCE_M
+            args.max_fused_reprojection_error = self.four_shared.DEFAULT_MAX_FUSED_REPROJECTION_ERROR_PX
+            args.max_layout_measurements = self.four_shared.DEFAULT_TRACKED_POINT_COUNT
+            args.min_measurement_separation = self.four_shared.DEFAULT_MIN_MEASUREMENT_SEPARATION_M
+            args.pairing_track_bias_distance = self.four_shared.DEFAULT_PAIRING_TRACK_BIAS_DISTANCE_M
+        else:
+            args.cameras = list(TWO_CAMERA_IDS)
+            calibration_path = TWO_CAMERA_ALIGNED_CALIBRATION_JSON
+            if not calibration_path.exists():
+                calibration_path = TWO_CAMERA_CALIBRATION_JSON
+            args.calibration = str(calibration_path)
+        args.no_preview = True
+        args.tracked_point_count = 2
+        return args
 
-    for anchor_id, pos in sorted(anchor_positions.items()):
-        print(f"  Anchor {anchor_id}: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) m")
+    def start(self) -> bool:
+        if self.mocap.cv2 is None:
+            print("OpenCV is required for camera mocap. Install it with: python -m pip install opencv-python")
+            return False
 
-    print(f"\n{'=' * 60}\n")
-    reader.calibration_mode = False
-    return anchor_positions
+        self.calibrations = self.four_shared.load_calibrations(self.args, f"{self.mode}cam jazzhands")
+        self.stop_event, self.workers = self.four_shared.start_threaded_cameras(
+            self.args,
+            list(self.args.cameras),
+            build_masks=False,
+            label=f"{self.mode}cam jazzhands",
+        )
+        self.four_shared.wait_for_open_attempts(self.workers)
+        snapshots = self.four_shared.collect_snapshots(self.workers)
+        if not self.four_shared.any_camera_open(snapshots) and self.four_shared.all_open_attempts_done(snapshots):
+            print(f"[{self.mode}cam jazzhands] no cameras opened")
+            self.stop()
+            return False
 
+        self.tracker = self.mocap.MarkerTracker(
+            max_match_distance_m=self.args.track_distance,
+            max_missing_frames=self.args.max_missing_frames,
+            min_confirmed_hits=self.args.track_confirmation_hits,
+            max_tentative_missing_frames=self.args.tentative_max_missing_frames,
+            duplicate_track_distance_m=self.args.duplicate_track_distance,
+            velocity_damping=self.args.velocity_damping,
+            stationary_distance_m=self.args.stationary_distance,
+            max_prediction_dt=self.args.max_prediction_dt,
+        )
+        if self.mode == 2:
+            self.triangulator = self.mocap.MultiCameraTriangulator(
+                self.calibrations,
+                self.args.max_reprojection_error,
+                self.args.cluster_distance,
+                self.args.room_bounds,
+            )
+        print(f"[{self.mode}cam jazzhands] camera position feeder ready")
+        return True
+
+    def stop(self):
+        if self.stop_event is not None and self.workers:
+            self.four_shared.stop_threaded_cameras(self.stop_event, self.workers)
+        self.stop_event = None
+        self.workers = []
+
+    def update(self):
+        if self.tracker is None:
+            return
+        timestamp = time.time()
+        snapshots = self.four_shared.collect_snapshots(self.workers)
+        if not self._has_new_camera_data(snapshots):
+            return
+        self._mark_camera_data_processed(snapshots)
+
+        observations_by_camera = self.four_shared.observations_from_snapshots(snapshots)
+        measurements = self._measurements(observations_by_camera, timestamp)
+        tracks = self.tracker.update(measurements, timestamp)
+        live_tracks = [track for track in tracks if track.confirmed and track.missing_frames == 0]
+        selected_tracks = self._select_tracks(live_tracks)
+        self._feed_tracks(selected_tracks, timestamp)
+
+    def _measurements(self, observations_by_camera, timestamp: float):
+        if self.mode == 4:
+            measurements, _diagnostics = self.four_shared.fuse_layout_measurements(
+                observations_by_camera,
+                self.calibrations,
+                tuple(self.args.front_cameras),
+                tuple(self.args.top_cameras),
+                self.args.room_bounds,
+                self.args.max_reprojection_error,
+                self.args.fusion_y_tolerance,
+                self.args.max_fused_reprojection_error,
+                self.args.max_layout_measurements,
+                self.args.min_measurement_separation,
+                self._pairing_reference_positions(timestamp),
+                self.args.pairing_track_bias_distance,
+            )
+            return measurements
+        return self.triangulator.triangulate(observations_by_camera)
+
+    def _pairing_reference_positions(self, timestamp: float) -> list[np.ndarray]:
+        tracks_by_id = {
+            track.track_id: track
+            for track in self.tracker.tracks
+            if track.confirmed and track.missing_frames <= self.args.max_missing_frames
+        }
+        ordered_tracks = [
+            tracks_by_id[track_id]
+            for track_id in self.display_track_ids
+            if track_id in tracks_by_id
+        ]
+        ordered_ids = {track.track_id for track in ordered_tracks}
+        ordered_tracks.extend(
+            track for track in sorted(tracks_by_id.values(), key=lambda item: item.track_id)
+            if track.track_id not in ordered_ids
+        )
+        return [self.tracker._predicted_position(track, timestamp) for track in ordered_tracks[:2]]
+
+    def _select_tracks(self, live_tracks) -> list:
+        live_by_id = {track.track_id: track for track in live_tracks}
+        selected_ids = [track_id for track_id in self.display_track_ids if track_id in live_by_id][:2]
+        for track in sorted(live_tracks, key=lambda item: item.track_id):
+            if len(selected_ids) >= 2:
+                break
+            if track.track_id not in selected_ids:
+                selected_ids.append(track.track_id)
+        self.display_track_ids = selected_ids
+        return [live_by_id[track_id] for track_id in selected_ids]
+
+    def _feed_tracks(self, tracks, timestamp: float):
+        if not tracks:
+            return
+        axis = int(CAMERA_HAND_SIDE_AXIS)
+        ordered = sorted(tracks, key=lambda track: float(track.position[axis]))
+        assignments = []
+        if len(ordered) == 1:
+            device_id = 1 if float(ordered[0].position[axis]) < 0.0 else 2
+            assignments.append((device_id, ordered[0]))
+        else:
+            assignments.append((1, ordered[0]))
+            assignments.append((2, ordered[-1]))
+
+        for device_id, track in assignments:
+            self.glove_pair.update_camera_position(
+                device_id,
+                np.asarray(track.position, dtype=np.float64) * CAMERA_POSITION_SCALE,
+                timestamp,
+            )
+
+    def _has_new_camera_data(self, snapshots) -> bool:
+        for camera_id, snapshot in snapshots.items():
+            if snapshot.frame_number <= 0:
+                continue
+            if self.last_processed_frame_numbers.get(camera_id) != snapshot.frame_number:
+                return True
+        return False
+
+    def _mark_camera_data_processed(self, snapshots) -> None:
+        for camera_id, snapshot in snapshots.items():
+            self.last_processed_frame_numbers[camera_id] = snapshot.frame_number
 
 def main():
     """Initializes and runs the main application."""
+    maybe_run_two_camera_calibration()
+
     # Create MIDI Object
     daw_interface = DawInterface(port=None)
 
     # Create reader object
     reader = ThreadedMultiDeviceReader()
-    for i, port in enumerate(COM_PORTS, start=1):
+    serial_ports = discover_serial_ports()
+    if not serial_ports:
+        print("No serial receiver ports were found. Connect the ESP32 receiver and try again.")
+    for i, port in enumerate(serial_ports, start=1):
         if not reader.add_device(relay_id=i, port=port):
             print(f"Could not connect to device on {port}. Please check connection.")
 
     reader.start()
+    daw_interface.haptics = HapticsController(
+        enabled=ENABLE_HAPTICS,
+        send_func=reader.send_haptics_command,
+    )
 
-    # Determine anchor positions
-    anchor_positions = {}
-    if MANUAL_ANCHOR_POSITIONS is not None:
-        print("Using manual anchor positions (skipping auto-calibration)")
-        for i, pos in enumerate(MANUAL_ANCHOR_POSITIONS, start=1):
-            anchor_positions[i] = np.array(pos)
-            print(f"  Anchor {i}: {pos}")
-    elif MANUAL_ANCHOR_DISTANCES is not None:
-        print("Using manual anchor distances")
-        anchor_positions = calculate_anchor_positions_from_distances(MANUAL_ANCHOR_DISTANCES)
-        for anchor_id, pos in anchor_positions.items():
-            print(f"  Anchor {anchor_id}: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) m")
-    else:
-        # Auto-calibration mode
-        anchor_positions = perform_auto_calibration(reader)
-
-    # Create glove pairs with anchor positions
+    # Create glove pairs. Positions should be supplied from camera triangulation
+    # through GlovePair.update_camera_position(...).
     glove_pairs = []
     if 1 in reader.processing_queues:
-        def single_correction(device_id: int, correction: np.ndarray, MultiReader: ThreadedMultiDeviceReader = reader,
-                              relay_id: int = 1):
-            MultiReader.send_correction(relay_id, device_id, correction)
-            print(f"Correction sent to device {device_id} on relay {relay_id}: {correction}")
-
         left_hand = LeftHand(
             device_id=1,
             active_area_x_subsections=3,
-            active_area_y_subsections=12,
-            anchor_positions=anchor_positions,
-            triangulate_func=multilaterate_3d_wls,
-            single_correction_func=single_correction
+            active_area_y_subsections=12
         )
         right_hand = RightHand(
             device_id=2,
             active_area_x_subsections=5,
-            active_area_y_subsections=8,
-            anchor_positions=anchor_positions,
-            triangulate_func=multilaterate_3d_wls,
-            single_correction_func=single_correction
+            active_area_y_subsections=8
         )
 
         glove_pairs.append(
@@ -1648,12 +1549,21 @@ def main():
     for pair in glove_pairs:
         pair.start()
 
+    camera_feeder = None
+    if glove_pairs:
+        try:
+            camera_feeder = CameraPositionFeeder(glove_pairs[0], CAMERA_MODE)
+        except ImportError as error:
+            print(f"Camera integration disabled because a camera dependency is missing: {error}")
+        if camera_feeder is not None and not camera_feeder.start():
+            camera_feeder = None
+
     print("\n" + "=" * 60)
     print("SYSTEM READY")
     print("=" * 60)
-    print("System running. Close the visualization window to stop.\n")
+    print("System running in 2-camera mode. Close the visualization window to stop.\n")
 
-    visualizer = Visualizer(glove_pairs)
+    visualizer = Visualizer(glove_pairs, camera_feeder=camera_feeder)
     app.run()
 
     print("System stopped.")

@@ -69,11 +69,12 @@ CARBON_RADIUS_CM = 2.2 / 2.0
 SMALL_ATOM_RADIUS_CM = 1.6 / 2.0
 LARGE_ATOM_RADIUS_CM = 2.2 / 2.0
 TARGET_SURFACE_GAP_CM = {
-    # Measured surface of center carbon to surface of outer atom.
-    "short_small": 8.9,
-    "short_large": 7.5,
-    "long_small": 13.9,
-    "long_large": 11.3,
+    # Measured surface of center carbon to surface of outer atom for the
+    # current 3D-printed calibration target.
+    "short_small": 7.5,
+    "short_large": 9.0,
+    "long_small": 11.5,
+    "long_large": 14.0,
 }
 
 TARGET_DIRECTIONS = {

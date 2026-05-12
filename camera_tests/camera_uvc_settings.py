@@ -18,7 +18,7 @@ from pygrabber.dshow_core import ICreateDevEnum, qedit
 from pygrabber.dshow_ids import DeviceCategories, clsids
 
 # To apply run the following command
-# .\.venv\Scripts\python.exe .\camera_tests\camera_uvc_settings.py --apply --camera-ids 1,2
+# .\.venv\Scripts\python.exe .\camera_tests\camera_uvc_settings.py --apply --camera-ids 0,2
 
 AUTO_FLAG = 0x0001
 MANUAL_FLAG = 0x0002
@@ -28,6 +28,7 @@ UVC_SETTINGS_JSON_PATH = Path(__file__).resolve().with_name("camera_uvc_settings
 # Keep camera capture code using OpenCV indexes, but write UVC settings by these
 # names/serials before the camera streams open.
 CAMERA_UVC_IDENTITIES = {
+    0: {"friendly_name": "Vertical_plane_camera_1", "serial": "UC001"},
     1: {"friendly_name": "Vertical_plane_camera_1", "serial": "UC001"},
     2: {"friendly_name": "Vertical_plane_camera_2", "serial": "UC002"},
     3: {"friendly_name": "Vertical_plane_camera_3", "serial": "UC003"},
@@ -36,59 +37,22 @@ CAMERA_UVC_IDENTITIES = {
 
 # Values match the property-page style controls. Use None for controls you do
 # not want Python to touch. auto=True means the Auto checkbox is enabled.
+CAMERA_0_UVC_SETTINGS = {
+    "brightness": {"value": 62, "auto": False},
+    "contrast": {"value": 28, "auto": False},
+    "hue": {"value": 0, "auto": False},
+    "saturation": {"value": 64, "auto": False},
+    "sharpness": {"value": 3, "auto": False},
+    "gamma": {"value": 100, "auto": False},
+    "white_balance": {"value": 4600, "auto": True},
+    "backlight_compensation": {"value": 2, "auto": False},
+    "gain": {"value": 0, "auto": False},
+    "powerline_frequency": {"value": 2, "auto": False},
+    "exposure": {"value": -11, "auto": False},
+}
 CAMERA_UVC_SETTINGS = {
-    1: {
-        "brightness": {"value": 45, "auto": False},
-        "contrast": {"value": 64, "auto": False},
-        "hue": {"value": 0, "auto": False},
-        "saturation": {"value": 64, "auto": False},
-        "sharpness": {"value": 3, "auto": False},
-        "gamma": {"value": 72, "auto": False},
-        "white_balance": {"value": 4600, "auto": True},
-        "backlight_compensation": {"value": 2, "auto": False},
-        "gain": {"value": 0, "auto": False},
-        "powerline_frequency": {"value": 2, "auto": False},
-        "exposure": {"value": -8, "auto": False},
-    },
-    2: {
-        "brightness": {"value": 45, "auto": False},
-        "contrast": {"value": 64, "auto": False},
-        "hue": {"value": 0, "auto": False},
-        "saturation": {"value": 64, "auto": False},
-        "sharpness": {"value": 3, "auto": False},
-        "gamma": {"value": 72, "auto": False},
-        "white_balance": {"value": 4600, "auto": True},
-        "backlight_compensation": {"value": 2, "auto": False},
-        "gain": {"value": 0, "auto": False},
-        "powerline_frequency": {"value": 2, "auto": False},
-        "exposure": {"value": -8, "auto": False},
-    },
-    3: {
-        "brightness": {"value": 45, "auto": False},
-        "contrast": {"value": 64, "auto": False},
-        "hue": {"value": 0, "auto": False},
-        "saturation": {"value": 64, "auto": False},
-        "sharpness": {"value": 3, "auto": False},
-        "gamma": {"value": 72, "auto": False},
-        "white_balance": {"value": 4600, "auto": True},
-        "backlight_compensation": {"value": 2, "auto": False},
-        "gain": {"value": 0, "auto": False},
-        "powerline_frequency": {"value": 2, "auto": False},
-        "exposure": {"value": -8, "auto": False},
-    },
-    4: {
-        "brightness": {"value": 45, "auto": False},
-        "contrast": {"value": 64, "auto": False},
-        "hue": {"value": 0, "auto": False},
-        "saturation": {"value": 64, "auto": False},
-        "sharpness": {"value": 3, "auto": False},
-        "gamma": {"value": 72, "auto": False},
-        "white_balance": {"value": 4600, "auto": True},
-        "backlight_compensation": {"value": 2, "auto": False},
-        "gain": {"value": 0, "auto": False},
-        "powerline_frequency": {"value": 2, "auto": False},
-        "exposure": {"value": -8, "auto": False},
-    },
+    camera_id: copy.deepcopy(CAMERA_0_UVC_SETTINGS)
+    for camera_id in (0, 1, 2, 3, 4)
 }
 
 LIVE_UVC_CONTROL_NAMES = [

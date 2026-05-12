@@ -8,12 +8,18 @@ import serial, struct, time, threading  # type: ignore[import-untyped]
 import numpy as np
 from dataclasses import dataclass, field
 from vispy import app, scene  # type: ignore[import-untyped]
+from haptics_controller import HapticsController
 
 # from Visualization_Tests import Accel_Filtering_Test as vp  # import our own vispy for easier setup
 
 # Definition of constants
 COM_PORTS: list[str] = ["/dev/cu.usbserial-023B6AC7",  # Board 3
                         "/dev/cu.usbserial-023B6B29", ]  # Board 4
+ENABLE_HAPTICS: bool = True
+HAPTICS_PORT: str | None = None
+HAPTICS_BAUD: int = 115200
+HAPTICS_NOTE_INTENSITY: int = 150
+HAPTICS_NOTE_DURATION_MS: int = 55
 NUMBER_OF_DEVICES: int = 2
 DISTANCE_BETWEEN_UWB_ANCHORS: float = 10  # meters
 TIMEOUT: float = 0  # Non-Blocking
@@ -922,7 +928,8 @@ class Glove:
 class LeftHand(Glove):
     """Left-hand specific methods and data in addition to regular glove data"""
     device_id: int
-    current_note: int = field(init=False)
+    current_note: int = 0
+    previous_note: int | None = 0
     current_octave: int = field(init=False, default=4)
     # pitch: int = self.current_note + self.current_octave * 12
 
@@ -943,6 +950,7 @@ class GlovePair:
     integration_thread: threading.Thread = field(init=False)
     left_hand: LeftHand = field(init=False)
     right_hand: RightHand = field(init=False)
+    haptics: HapticsController = field(default_factory=lambda: HapticsController(HAPTICS_PORT, HAPTICS_BAUD, ENABLE_HAPTICS))
     running: bool = field(init=False, default=False)
 
     def __post_init__(self):
@@ -979,8 +987,14 @@ class GlovePair:
         match packet.data.device_number % 2:
             case 1:
                 self.left_hand.update_values(packet)
+                self._maybe_pulse_note_change(self.left_hand)
             case 2:
                 self.right_hand.update_values(packet)
+
+    def _maybe_pulse_note_change(self, hand: LeftHand) -> None:
+        if hand.current_note != hand.previous_note:
+            self.haptics.pulse("LEFT", HAPTICS_NOTE_INTENSITY, HAPTICS_NOTE_DURATION_MS)
+            hand.previous_note = hand.current_note
 
     def main_logic(self):  # TODO: see if we should do it this way
         """Does all the main updating, which includes:

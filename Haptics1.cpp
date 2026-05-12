@@ -1,30 +1,26 @@
 /*
-==================== SETUP ====================
+Serial haptics receiver for Jazz Hands.
 
-WIRING (ESP32 → DRV2605L):
-- 3.3V  → VCC
-- GND   → GND
-- GPIO21 → SDA
-- GPIO22 → SCL
+Wiring (ESP32 -> DRV2605L):
+- 3.3V  -> VCC
+- GND   -> GND
+- GPIO25 -> SDA
+- GPIO26 -> SCL
 
-MOTOR:
-- Connect motor leads to OUT+ and OUT- on the driver
-
-HOW TO USE:
-- Write: motor.haptics(HAPTICS_ON, intensity);  = turn ON 
-- Write: motor.haptics(HAPTICS_OFF);            = turn OFF 
-
-INTENSITY:
-- Range: 0–255
-- Example: motor.haptics(HAPTICS_ON, 150); 
-
-======================================================
+Serial command:
+P,<HAND>,<INTENSITY>,<DURATION_MS>\n
+Example:
+P,LEFT,150,55
 */
 
 #include <Wire.h>
 
-#define HAPTICS_ON  true
+#define HAPTICS_ON true
 #define HAPTICS_OFF false
+
+const uint32_t SERIAL_BAUD = 115200;
+const int HAPTICS_SDA_PIN = 25;
+const int HAPTICS_SCL_PIN = 26;
 
 class Haptics {
   private:
@@ -40,35 +36,65 @@ class Haptics {
   public:
     void begin(int sdaPin = 21, int sclPin = 22) {
       Wire.begin(sdaPin, sclPin);
-
-      writeReg(0x01, 0x05); // RTP mode (sustained control)
+      writeReg(0x01, 0x05); // RTP mode
       writeReg(0x1A, 0x80); // LRA motor mode
-
-      haptics(HAPTICS_OFF); // start off
+      haptics(HAPTICS_OFF);
     }
 
     void haptics(bool state, uint8_t strength = 127) {
-      // state: ON/OFF
-      // strength: vibration intensity (0–255)
-
-      if (state == HAPTICS_ON) {
-        writeReg(0x02, strength); // apply intensity
-      } else {
-        writeReg(0x02, 0);        // stop vibration
-      }
+      writeReg(0x02, state == HAPTICS_ON ? strength : 0);
     }
 };
 
 Haptics motor;
 
+String serialLine;
+uint32_t pulseEndMs = 0;
+
+void startPulse(uint8_t intensity, uint16_t durationMs) {
+  motor.haptics(HAPTICS_ON, intensity);
+  pulseEndMs = millis() + durationMs;
+}
+
+void handleCommand(const String &line) {
+  if (!line.startsWith("P,")) {
+    return;
+  }
+
+  int firstComma = line.indexOf(',');
+  int secondComma = line.indexOf(',', firstComma + 1);
+  int thirdComma = line.indexOf(',', secondComma + 1);
+  if (firstComma < 0 || secondComma < 0 || thirdComma < 0) {
+    return;
+  }
+
+  int intensity = line.substring(secondComma + 1, thirdComma).toInt();
+  int durationMs = line.substring(thirdComma + 1).toInt();
+  intensity = constrain(intensity, 0, 255);
+  durationMs = constrain(durationMs, 1, 1000);
+  startPulse((uint8_t)intensity, (uint16_t)durationMs);
+}
+
 void setup() {
-  motor.begin();
+  Serial.begin(SERIAL_BAUD);
+  motor.begin(HAPTICS_SDA_PIN, HAPTICS_SCL_PIN);
+  serialLine.reserve(64);
 }
 
 void loop() {
-  motor.haptics(HAPTICS_ON, 150);
-  delay(3000);
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      serialLine.trim();
+      handleCommand(serialLine);
+      serialLine = "";
+    } else if (c != '\r' && serialLine.length() < 63) {
+      serialLine += c;
+    }
+  }
 
-  motor.haptics(HAPTICS_OFF);
-  delay(3000);
+  if (pulseEndMs != 0 && (int32_t)(millis() - pulseEndMs) >= 0) {
+    motor.haptics(HAPTICS_OFF);
+    pulseEndMs = 0;
+  }
 }

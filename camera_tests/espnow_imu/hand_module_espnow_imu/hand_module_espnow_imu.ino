@@ -7,7 +7,7 @@
 // Flash one hand at a time. Change this one setting before uploading.
 #define LEFT_HAND 1
 #define RIGHT_HAND 2
-#define HAND_TO_FLASH LEFT_HAND
+#define HAND_TO_FLASH RIGHT_HAND
 
 #if HAND_TO_FLASH == LEFT_HAND
 const uint8_t HAND_DEVICE_ID = 1;
@@ -20,17 +20,20 @@ const char HAND_NAME[] = "RIGHT";
 #endif
 
 const uint16_t PACKET_HEADER = 0xAAAA;
+const uint16_t HAPTICS_COMMAND_HEADER = 0xCC33;
 const uint8_t ESPNOW_WIFI_CHANNEL = 11;
 const uint32_t SEND_RATE_HZ = 120;
 const uint32_t SEND_PERIOD_US = 1000000UL / SEND_RATE_HZ;
 const uint32_t IMU_REPORT_INTERVAL_US = 1000000UL / SEND_RATE_HZ;
 const uint32_t IMU_DATA_STALE_US = 100000UL;
 
-uint8_t RECEIVER_MAC[6] = {0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08};
+uint8_t RECEIVER_MAC[6] = {0x34, 0x98, 0x7A, 0x72, 0x93, 0xD4};
 
 const int SDA_PIN = 21;
 const int SCL_PIN = 22;
 const int BUTTON_PIN = 23;
+const int HAPTICS_SDA_PIN = 25;
+const int HAPTICS_SCL_PIN = 26;
 const int BNO08X_RESET = -1;
 const uint8_t BNO08X_I2C_ADDRESS = 0x4A;
 
@@ -62,10 +65,19 @@ typedef struct __attribute__((packed)) {
   uint8_t error_handler;
 } hand_imu_packet_t;
 
+typedef struct __attribute__((packed)) {
+  uint16_t header;
+  uint8_t device_id;
+  uint8_t intensity;
+  uint16_t duration_ms;
+} haptics_command_t;
+
 static_assert(sizeof(hand_imu_packet_t) == 42, "Unexpected hand_imu_packet_t size");
+static_assert(sizeof(haptics_command_t) == 6, "Unexpected haptics_command_t size");
 
 Adafruit_BNO08x bno08x(BNO08X_RESET);
 sh2_SensorValue_t sensor_value;
+TwoWire hapticsWire = TwoWire(1);
 
 hand_imu_packet_t packet = {};
 uint32_t sequence_number = 0;
@@ -79,10 +91,60 @@ bool last_send_ok = true;
 float filtered_accel_x = 0.0f;
 float filtered_accel_y = 0.0f;
 float filtered_accel_z = 0.0f;
+uint32_t haptics_pulse_end_ms = 0;
+
+class HapticsDriver {
+ public:
+  void begin(TwoWire &wire, int sda_pin, int scl_pin) {
+    wire_ = &wire;
+    wire_->begin(sda_pin, scl_pin);
+    writeReg(0x01, 0x05);
+    writeReg(0x1A, 0x80);
+    setStrength(0);
+  }
+
+  void setStrength(uint8_t strength) {
+    writeReg(0x02, strength);
+  }
+
+ private:
+  TwoWire *wire_ = nullptr;
+
+  void writeReg(uint8_t reg, uint8_t value) {
+    if (wire_ == nullptr) {
+      return;
+    }
+    wire_->beginTransmission(0x5A);
+    wire_->write(reg);
+    wire_->write(value);
+    wire_->endTransmission();
+  }
+};
+
+HapticsDriver haptics;
 
 void onDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
   (void)tx_info;
   last_send_ok = (status == ESP_NOW_SEND_SUCCESS);
+}
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  (void)info;
+  if (len != sizeof(haptics_command_t)) {
+    return;
+  }
+
+  haptics_command_t command;
+  memcpy(&command, data, sizeof(command));
+  if (command.header != HAPTICS_COMMAND_HEADER) {
+    return;
+  }
+  if (command.device_id != HAND_DEVICE_ID) {
+    return;
+  }
+
+  haptics.setStrength(command.intensity);
+  haptics_pulse_end_ms = millis() + command.duration_ms;
 }
 
 void setReports() {
@@ -107,6 +169,7 @@ void setupEspNow() {
   }
 
   esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataRecv);
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, RECEIVER_MAC, 6);
@@ -147,6 +210,7 @@ void setup() {
   packet.quat_w = 1.0f;
 
   setupImu();
+  haptics.begin(hapticsWire, HAPTICS_SDA_PIN, HAPTICS_SCL_PIN);
   setupEspNow();
 
   Serial.print("ESP-NOW IMU hand module ready: ");
@@ -231,4 +295,8 @@ void sendPacketIfDue() {
 void loop() {
   updateImu();
   sendPacketIfDue();
+  if (haptics_pulse_end_ms != 0 && static_cast<int32_t>(millis() - haptics_pulse_end_ms) >= 0) {
+    haptics.setStrength(0);
+    haptics_pulse_end_ms = 0;
+  }
 }

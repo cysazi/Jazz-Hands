@@ -1,92 +1,155 @@
-# Jazz-Hands
-E-SONIC glove-based musical instrument
-## Planned UWB Locations
-2D plane of our performance
-{X} = UWB,    * = glove 
-```
-{X} - - - - - Known Distance - - - - {X}
+# Jazz Hands
 
-          ____           ____
-         |  * |         | *  |
-         |____|         |____|
+Jazz Hands is a glove-based musical instrument. The current runtime is centered on:
 
-```
-___
-# Box Initialization plans
-* Upon first button press, set that position as the origin
-```
+- 2-camera IR mocap for hand position
+- ESP32 IMU packets for glove rotation and button state
+- MIDI output for note playback
+- optional haptic pulses on note changes
+- a VisPy visualizer for live feedback
 
+The current goal is independence: if you run `JazzHandsKalman.py`, the system should guide startup from one entrypoint.
 
-                     x
-            
-            
-```
-* Upon button release, set that as the boundary of the box
-```
-          
-         _ _ _ _ _ _ _ _ _ _ _ _ _
-         |                       |
-         |                       |
-         |                       |
-         |            x--------> |
-         |                       |
-         |                       |
-         |                       |
-         - - - - - - - - - - - - - 
-         
-```
-* Therefore, we draw the box from the centre to the midpoint of the side of the square
+## Current Architecture
 
+Right now, the main runtime is [JazzHandsKalman.py](./JazzHandsKalman.py).
 
+It does the following:
 
-# Main Workflow:
-## 1. Get a packet
+1. Applies saved UVC settings for cameras 1 and 2.
+2. Prompts: `Do you want to initiate calibration?`
+3. If you answer `yes`, it launches:
+   - 2-camera pose calibration
+   - movement-based world-axis alignment
+4. Opens the serial IMU receiver.
+   - if `COM_PORTS` is left empty, Jazz Hands auto-detects likely ESP32 serial ports
+5. Starts the 2-camera mocap feed.
+6. Maps glove motion to note and control data.
+7. Sends MIDI and optional haptic pulses.
+8. Opens the live visualizer.
 
-## 2. Update glove values
+## Hand Responsibilities
 
-## 3. Do logic with position to find pitch using simple ratios
+- Right hand:
+  - controls the played note
+  - controls attack
+  - controls stereo position
+  - controls instrument cycling gestures
+  - triggers note-change haptics
+- Left hand:
+  - controls volume
+  - controls reverb mode
+  - can move the octave down
+- Right-hand button:
+  - moves the octave up
 
-```
-          
-          _ _ _ _ _ _ _ _ _ _ _ _ _
-          |      |                |
-          |      |     20% x      |
-          |------x----------------|
-          |      |                |
-          |      | 65% y          |
-          |      |                |
-          |      |                |
-          - - - - - - - - - - - - - 
-          
+## Running The System
+
+From the repo root:
+
+```powershell
+python .\JazzHandsKalman.py
 ```
 
-## 4. send to VisPy
+Startup behavior:
 
-## 5. send to MIDI
-# Important Info!
-## Arduino IDE setup guide
-### Board Setting
-The esp32 board library has examples for ESP_NOW (both broadcast master and slave)
-* Go to boards manager and download `esp32` by `Expressif Systems`
-  * Set your board to `ESP 32 Dev Module` (IMPORTANT, found out the hard way that other esp32 modules won't work the same)
-### Component Libraries
-All the libraries have great examples!
-#### BNO085
-Wiring can be found in this pdf: [Adafruit BNO085 User Guide](https://cdn-learn.adafruit.com/downloads/pdf/adafruit-9-dof-orientation-imu-fusion-breakout-bno085.pdf)
-* Download `Adafruit BNO08x` by `Adafruit`
-* I think all you need to include are `<Wire.h>` and `<Adafruit_BNO08x.h>`
-#### UWB (DW1000)
-No Wiring because we got an integrated UWB + ESP32n board (yay!)
-* Library is a .zip library found here: [Makerfabs GitHub](https://github.com/Makerfabs/Makerfabs-ESP32-UWB/blob/main/mf_DW1000.zip)
-* Download `mf_DW10000.zip` then include it in Arduino IDE using `Sketch > Include Library > Add .ZIP Library`
-## ESP 32 Info
-### Mac Addresses
-| # | ESP32 Serial Address (MacOS)  | ESP-NOW Mac Address |  UWB Address              | UWB Delay|
-|---|-------------------------------|---------------------|---------------------------|----------|
-| 1 | /dev/cu.usbserial-023B6AB4    | 34:98:7A:74:39:00   |                           |          |
-| 2 | /dev/cu.usbserial-023B6B01    | 34:98:7A:73:75:B8   |                           |  16533   |
-| 3 | /dev/cu.usbserial-023B6AC7    | 34:98:7A:73:93:14   |                           |          |
-| 4 | /dev/cu.usbserial-023B6B29    | 08:F9:E0:92:C0:08   |  84:00:5B:D5:A9:9A:44:44 |   16526  |
-| A1 | /dev/cu.usbserial-023BB305 | 34:98:7A:72:93:D4 | 84:00:5B:D5:A9:9A:11:11 | 16537 |
-| A2 |/dev/cu.usbserial-023BB2B5 | 34:98:7A:72:B0:10 | 84:00:5B:D5:A9:9A:22:22 | 16536 |
-| A3 | /dev/cu.usbserial-023BB2E3 | 64:B7:08:35:3C:38 | 84:00:5B:D5:A9:9A:33:33 | 16533 |
+- Saved 2-camera settings are applied automatically from `camera_tests/camera_uvc_settings_values.json`.
+- You will be asked whether to initiate calibration.
+- If you answer `no`, Jazz Hands will reuse the latest saved calibration files.
+- If you answer `yes`, Jazz Hands will walk through the full 2-camera calibration flow before starting the runtime.
+
+## Calibration Flow
+
+When calibration is requested, Jazz Hands launches the existing camera tools in this order:
+
+1. `camera_tests/camera_uvc_settings.py --apply`
+2. `camera_tests/calibrate_mocap_cameras.py`
+3. `camera_tests/mocap_movement_alignment.py`
+
+The saved files are:
+
+- raw camera calibration: `camera_tests/mocap_calibration.json`
+- aligned runtime calibration: `camera_tests/mocap_calibration_aligned.json`
+
+The runtime prefers the aligned calibration file.
+
+## Haptics
+
+Haptics are controlled in Python by [haptics_controller.py](./haptics_controller.py) and on the ESP32 by [Haptics1.cpp](./Haptics1.cpp).
+
+Behavior:
+
+- A short pulse is triggered when the right-hand note changes.
+- This now uses the receiver path: `Python -> receiver ESP32 -> ESP-NOW -> target hand module`.
+- The pulse is available for note preview too, not only while MIDI is actively playing.
+- This is controlled by the boolean in `JazzHandsKalman.py`:
+
+```python
+ENABLE_NOTE_HAPTICS = True
+```
+
+If you want the system to run without note pulses, set that value to `False`.
+
+### Haptics Wiring
+
+Current haptics firmware assumes:
+
+- `GPIO25` -> SDA
+- `GPIO26` -> SCL
+
+This is intentional because the glove currently uses:
+
+- `GPIO21` and `GPIO22` for the IMU I2C bus
+- `GPIO23` for the glove button
+
+### Receiver And Hand Firmware
+
+The newer ESP-NOW firmware pair under `camera_tests/espnow_imu/` is now the intended path for haptics integration:
+
+- `receiver_espnow_imu/receiver_espnow_imu.ino`
+  - forwards IMU packets to Python
+  - accepts binary haptics commands from Python over USB serial
+  - relays those commands back to the gloves over ESP-NOW
+- `hand_module_espnow_imu/hand_module_espnow_imu.ino`
+  - sends IMU packets to the receiver
+  - receives haptics commands from the receiver
+  - drives the local haptics motor on the glove
+
+The receiver currently includes placeholder left/right glove MAC addresses that should be replaced before flashing real hardware.
+
+## Important Files
+
+- `JazzHandsKalman.py`
+  - main entrypoint
+- `haptics_controller.py`
+  - Python serial haptics driver
+- `Haptics1.cpp`
+  - ESP32 haptics firmware
+- `camera_tests/camera_uvc_settings.py`
+  - applies saved UVC camera settings
+- `camera_tests/calibrate_mocap_cameras.py`
+  - 2-camera pose calibration
+- `camera_tests/mocap_movement_alignment.py`
+  - world-axis alignment
+
+## Dependencies
+
+At minimum, the current runtime expects:
+
+- Python
+- `numpy`
+- `pyserial`
+- `vispy`
+- a VisPy GUI backend such as `PyQt6`
+- `mido`
+- an RTMidi backend for MIDI output
+- `opencv-python` for camera mocap
+
+## Current Focus
+
+The repo still contains older experiments for UWB, sound, visualization, and 4-camera work, but the active focus is:
+
+- make `JazzHandsKalman.py` the single launch point
+- keep the runtime solid on 2 cameras first
+- keep haptics tied to played-note feedback
+- return to 4-camera support after the 2-camera path is stable

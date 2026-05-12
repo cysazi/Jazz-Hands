@@ -12,7 +12,9 @@ import argparse
 import atexit
 import math
 import os
+import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -20,6 +22,8 @@ from vispy import app, scene
 from vispy.app import Timer
 from vispy.io import read_mesh
 from vispy.visuals.transforms import MatrixTransform
+
+from haptics_controller import HapticsController
 
 try:
     import mido
@@ -43,6 +47,11 @@ MIDI_BASE_NOTE = 60
 MIDI_VELOCITY = 96
 HAND_MIDI_CHANNELS_1_BASED = {"LEFT": 1, "RIGHT": 1}
 DEFAULT_MAX_MIDI_CHANNEL = 4
+ENABLE_HAPTICS = True
+HAPTICS_PORT: str | None = None
+HAPTICS_BAUD = 115200
+HAPTICS_NOTE_INTENSITY = 150
+HAPTICS_NOTE_DURATION_MS = 55
 
 POSITION_SCALE = 1.0
 MODEL_SCALE = 0.02
@@ -64,6 +73,24 @@ VELOCITY_STEP_MAX = 5.0
 ANGULAR_STEP_DELTA = 0.1
 ANGULAR_STEP_MIN = 0.1
 ANGULAR_STEP_MAX = 10.0
+STATUS_UPDATE_INTERVAL_SECONDS = 0.10
+INSTRUMENT_CYCLE = (
+    "Synth",
+    "Violin",
+    "Horn",
+    "Instrument4",
+    "Instrument5",
+    "Instrument6",
+    "Instrument7",
+    "Instrument8",
+    "Instrument9",
+)
+GESTURE_ROLL_ANGLE_THRESHOLD_DEG = 100.0
+GESTURE_ACCEL_SPIKE_THRESHOLD_MPS2 = 3.0
+GESTURE_ROLL_DELTA_THRESHOLD_DEG = 40.0
+GESTURE_ROLL_RATE_THRESHOLD_DPS = 360.0
+GESTURE_WINDOW_MS = 220
+GESTURE_COOLDOWN_MS = 300
 
 FRAME_MAP = np.array(
     [
@@ -122,6 +149,8 @@ class HandRuntimeState:
         default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
     )
     velocity: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    acceleration: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    rotation_euler: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
     button_pressed: bool = False
     last_button_pressed: bool = False
     drawing: bool = False
@@ -131,12 +160,16 @@ class HandRuntimeState:
     play_side_sign: float = -1.0
     is_on_play_side: bool = False
     active_note_index: int | None = None
+    preview_note_index: int | None = None
     last_note_name: str = "inactive"
     last_inside: bool = False
     last_offset: float = 0.0
     last_u_pct: float = 0.0
     last_v_pct: float = 0.0
     tracking_active: bool = True
+    volume_value: int = 0
+    attack_value: int = 0
+    reverb_value: int = 0
 
 
 def configure_vispy_backend() -> str:
@@ -152,6 +185,10 @@ def configure_vispy_backend() -> str:
 def clamp_midi_channel_1_based(value: int, max_channel: int = 16) -> int:
     upper = int(np.clip(int(max_channel), 1, 16))
     return int(np.clip(int(value), 1, upper))
+
+
+def normalize_midi_port_name(name: str) -> str:
+    return re.sub(r"\s+\d+$", "", str(name).strip()).lower()
 
 
 def normalize_quat(q: np.ndarray) -> np.ndarray:
@@ -201,6 +238,9 @@ class DualHandFLStudioVisualizer:
         midi_velocity: int = MIDI_VELOCITY,
         midi_channels_1_based: dict[str, int] | None = None,
         max_midi_channel: int = DEFAULT_MAX_MIDI_CHANNEL,
+        enable_haptics: bool = ENABLE_HAPTICS,
+        haptics_port: str | None = HAPTICS_PORT,
+        haptics_baud: int = HAPTICS_BAUD,
         require_inside_plane_to_play: bool = False,
         keyboard_buttons_enabled: bool = True,
         controlled_hand_label: str = "LEFT",
@@ -215,6 +255,7 @@ class DualHandFLStudioVisualizer:
         self.midi_output_hint = str(midi_output_hint)
         self.midi_base_note = int(np.clip(midi_base_note, 0, 127))
         self.midi_velocity = int(np.clip(midi_velocity, 1, 127))
+        self.haptics = HapticsController(haptics_port, haptics_baud, enable_haptics)
         self.max_midi_channel = int(np.clip(int(max_midi_channel), 1, 16))
         channels = midi_channels_1_based or HAND_MIDI_CHANNELS_1_BASED
         self.midi_channels = {
@@ -240,15 +281,16 @@ class DualHandFLStudioVisualizer:
             "LEFT": np.zeros(3, dtype=np.float64),
             "RIGHT": np.zeros(3, dtype=np.float64),
         }
+        self.last_status_update_time = 0.0
 
         self.canvas = scene.SceneCanvas(
             keys="interactive",
             show=show,
             bgcolor="black",
-            size=(1100, 800),
+            size=(1280, 800),
             title="Jazz Hands FL Studio Debug Visualizer",
         )
-        self.view = self.canvas.central_widget.add_view()
+        self.view = self.canvas.central_widget.add_view(border_color=(0.2, 0.2, 0.2, 1.0))
         self.view.camera = scene.cameras.TurntableCamera(
             fov=45,
             distance=3.0,
@@ -258,7 +300,7 @@ class DualHandFLStudioVisualizer:
         )
         scene.visuals.GridLines(scale=(0.25, 0.25), color=(0.25, 0.25, 0.25, 1.0), parent=self.view.scene)
         scene.visuals.XYZAxis(width=2, parent=self.view.scene)
-        self._add_axis_labels()
+        self._add_axis_labels(self.view)
         self.hand_meshes = {}
         self._setup_hand_meshes()
         self.plane_meshes: dict[str, object] = {}
@@ -277,6 +319,12 @@ class DualHandFLStudioVisualizer:
         self.midi_out = None
         self.midi_output_name: str | None = None
         self.active_midi_notes: dict[str, int | None] = {"LEFT": None, "RIGHT": None}
+        self.current_volume_value = 0
+        self.current_attack_value = self.midi_velocity
+        self.current_reverb_value = 0
+        self.right_roll_samples: deque[tuple[int, float]] = deque(maxlen=10)
+        self.last_instrument_gesture_ms = -10_000
+        self.current_instrument = INSTRUMENT_CYCLE[0]
         self._setup_midi_output()
         atexit.register(self.close_midi)
 
@@ -316,6 +364,7 @@ class DualHandFLStudioVisualizer:
         state.position = new_position
         if rotation_quaternion is not None:
             state.rotation_quaternion = normalize_quat(np.asarray(rotation_quaternion, dtype=np.float64))
+            state.rotation_euler = np.array(quat_to_euler_deg(state.rotation_quaternion), dtype=np.float64)
         if button_pressed is not None:
             state.button_pressed = bool(button_pressed)
         state.tracking_active = True
@@ -324,11 +373,15 @@ class DualHandFLStudioVisualizer:
         self,
         label: str,
         rotation_quaternion: np.ndarray | tuple[float, float, float, float] | None = None,
+        acceleration: np.ndarray | tuple[float, float, float] | None = None,
         button_pressed: bool | None = None,
     ) -> None:
         state = self.hands[self._normalize_label(label)]
         if rotation_quaternion is not None:
             state.rotation_quaternion = normalize_quat(np.asarray(rotation_quaternion, dtype=np.float64))
+            state.rotation_euler = np.array(quat_to_euler_deg(state.rotation_quaternion), dtype=np.float64)
+        if acceleration is not None:
+            state.acceleration = np.asarray(acceleration, dtype=np.float64).reshape(3)
         if button_pressed is not None:
             state.button_pressed = bool(button_pressed)
 
@@ -369,10 +422,10 @@ class DualHandFLStudioVisualizer:
             raise ValueError(f"unknown hand label: {label!r}")
         return normalized
 
-    def _add_axis_labels(self) -> None:
-        scene.visuals.Text("X", color="red", font_size=18, pos=(1.25, 0, 0), parent=self.view.scene)
-        scene.visuals.Text("Y", color="green", font_size=18, pos=(0, 1.25, 0), parent=self.view.scene)
-        scene.visuals.Text("Z", color="blue", font_size=18, pos=(0, 0, 1.25), parent=self.view.scene)
+    def _add_axis_labels(self, view) -> None:
+        scene.visuals.Text("X", color="red", font_size=18, pos=(1.25, 0, 0), parent=view.scene)
+        scene.visuals.Text("Y", color="green", font_size=18, pos=(0, 1.25, 0), parent=view.scene)
+        scene.visuals.Text("Z", color="blue", font_size=18, pos=(0, 0, 1.25), parent=view.scene)
 
     def _setup_hand_meshes(self) -> None:
         colors = {
@@ -389,7 +442,7 @@ class DualHandFLStudioVisualizer:
                 vertices=vertices,
                 faces=faces,
                 color=colors[label],
-                shading="smooth",
+                shading=None,
                 parent=self.view.scene,
             )
             mesh.transform = MatrixTransform()
@@ -408,7 +461,20 @@ class DualHandFLStudioVisualizer:
             print(f"[FL visualizer MIDI] could not list MIDI outputs: {error}")
             return
 
-        target = next((name for name in output_names if self.midi_output_hint.lower() in name.lower()), None)
+        hint = str(self.midi_output_hint).strip()
+        normalized_hint = normalize_midi_port_name(hint)
+        target = next(
+            (
+                name
+                for name in output_names
+                if normalized_hint
+                and (
+                    normalized_hint in normalize_midi_port_name(name)
+                    or hint.lower() in str(name).lower()
+                )
+            ),
+            None,
+        )
         if target is None:
             print(f"[FL visualizer MIDI] output containing '{self.midi_output_hint}' not found. Available: {output_names}")
             return
@@ -422,12 +488,26 @@ class DualHandFLStudioVisualizer:
     def _send_note_on(self, note: int, channel: int) -> None:
         if self.midi_out is None:
             return
-        self.midi_out.send(mido.Message("note_on", note=int(note), velocity=self.midi_velocity, channel=int(channel)))
+        self.midi_out.send(
+            mido.Message(
+                "note_on",
+                note=int(note),
+                velocity=int(np.clip(self.current_attack_value, 1, 127)),
+                channel=int(channel),
+            )
+        )
 
     def _send_note_off(self, note: int, channel: int) -> None:
         if self.midi_out is None:
             return
         self.midi_out.send(mido.Message("note_off", note=int(note), velocity=0, channel=int(channel)))
+
+    def _send_control_change(self, control: int, value: int, channel: int) -> None:
+        if self.midi_out is None:
+            return
+        self.midi_out.send(
+            mido.Message("control_change", control=int(control), value=int(np.clip(value, 0, 127)), channel=int(channel))
+        )
 
     def _update_midi_note(self, label: str, note_index: int | None) -> None:
         desired_note = None
@@ -449,6 +529,8 @@ class DualHandFLStudioVisualizer:
             return
         for label in self.hand_labels:
             self._update_midi_note(label, None)
+        if hasattr(self, "haptics"):
+            self.haptics.close()
 
     def midi_channel_text(self) -> str:
         left_channel = self.midi_channels["LEFT"] + 1
@@ -586,9 +668,15 @@ class DualHandFLStudioVisualizer:
         for label in self.hand_labels:
             self._update_plane_state(label)
             self._update_note_state(label)
+        self._update_left_controls()
+        self._update_right_instrument_gesture()
+        for label in self.hand_labels:
             self._update_hand_visual(label)
 
-        self._update_status_text()
+        now = time.time()
+        if now - self.last_status_update_time >= STATUS_UPDATE_INTERVAL_SECONDS:
+            self.last_status_update_time = now
+            self._update_status_text()
         self.canvas.update()
 
     def _apply_keyboard_motion(self, dt: float) -> None:
@@ -662,15 +750,16 @@ class DualHandFLStudioVisualizer:
         abs_delta = np.abs(delta)
         normal_axis = int(np.argmin(abs_delta))
         plane_axes = [axis for axis in range(3) if axis != normal_axis]
-        max_extent = max(float(abs_delta[plane_axes[0]]), float(abs_delta[plane_axes[1]]), MIN_PLANE_HALF_EXTENT)
+        half_u = max(float(abs_delta[plane_axes[0]]), MIN_PLANE_HALF_EXTENT)
+        half_v = max(float(abs_delta[plane_axes[1]]), MIN_PLANE_HALF_EXTENT)
 
         return PlaneDefinition(
             center=origin.copy(),
             axis_u=plane_axes[0],
             axis_v=plane_axes[1],
             normal_axis=normal_axis,
-            half_u=max_extent,
-            half_v=max_extent,
+            half_u=half_u,
+            half_v=half_v,
         )
 
     def _infer_no_play_side_sign(
@@ -813,10 +902,92 @@ class DualHandFLStudioVisualizer:
         section_index = min(int(clamped * NOTE_SECTION_COUNT), NOTE_SECTION_COUNT - 1)
         return section_index, NOTE_NAMES[section_index], AXIS_NAMES[note_axis], clamped * 100.0
 
+    def _continuous_plane_percentages(self, state: HandRuntimeState) -> tuple[float, float, bool]:
+        if state.plane is None:
+            return 0.0, 0.0, False
+        u_pct, v_pct, inside, _offset = self._plane_position_metrics(state.position, state.plane)
+        return u_pct, v_pct, inside
+
+    def _update_left_controls(self) -> None:
+        state = self.hands["LEFT"]
+        if not state.tracking_active:
+            return
+
+        volume_roll = float(np.clip(state.rotation_euler[0], 0.0, 180.0))
+        volume_value = int(np.clip(round((volume_roll / 180.0) * 127.0), 0, 127))
+        state.volume_value = volume_value
+
+        if state.plane is not None:
+            u_pct, v_pct, inside = self._continuous_plane_percentages(state)
+            if inside and state.is_on_play_side:
+                state.reverb_value = int(np.clip(round((u_pct / 100.0) * 127.0), 0, 127))
+                state.attack_value = int(np.clip(round((v_pct / 100.0) * 127.0), 0, 127))
+
+        right_channel = self.midi_channels["RIGHT"]
+        if state.volume_value != self.current_volume_value:
+            self.current_volume_value = state.volume_value
+            self._send_control_change(101, self.current_volume_value, right_channel)
+        if state.reverb_value != self.current_reverb_value:
+            self.current_reverb_value = state.reverb_value
+            self._send_control_change(100, self.current_reverb_value, right_channel)
+        self.current_attack_value = max(1, state.attack_value)
+
+    @staticmethod
+    def _roll_delta_deg(current_roll: float, previous_roll: float) -> float:
+        delta = float(current_roll - previous_roll)
+        while delta > 180.0:
+            delta -= 360.0
+        while delta < -180.0:
+            delta += 360.0
+        return delta
+
+    def _update_right_instrument_gesture(self) -> None:
+        state = self.hands["RIGHT"]
+        if not state.tracking_active:
+            self.right_roll_samples.clear()
+            return
+
+        timestamp_ms = int(time.time() * 1000.0)
+        roll_deg = float(state.rotation_euler[0])
+        if self.right_roll_samples and timestamp_ms <= self.right_roll_samples[-1][0]:
+            return
+        self.right_roll_samples.append((timestamp_ms, roll_deg))
+        if len(self.right_roll_samples) < 2:
+            return
+
+        current_t, current_roll = self.right_roll_samples[-1]
+        window_start_t = current_t - GESTURE_WINDOW_MS
+        oldest_t, oldest_roll = self.right_roll_samples[-1]
+        for sample_t, sample_roll in self.right_roll_samples:
+            if sample_t >= window_start_t:
+                oldest_t, oldest_roll = sample_t, sample_roll
+                break
+
+        dt_ms = current_t - oldest_t
+        if dt_ms <= 0:
+            return
+
+        delta_roll = self._roll_delta_deg(current_roll, oldest_roll)
+        roll_rate_dps = delta_roll / (dt_ms / 1000.0)
+        accel_norm = float(np.linalg.norm(state.acceleration))
+        if (
+            abs(current_roll) >= GESTURE_ROLL_ANGLE_THRESHOLD_DEG
+            and accel_norm >= GESTURE_ACCEL_SPIKE_THRESHOLD_MPS2
+            and abs(delta_roll) >= GESTURE_ROLL_DELTA_THRESHOLD_DEG
+            and abs(roll_rate_dps) >= GESTURE_ROLL_RATE_THRESHOLD_DPS
+            and (current_t - self.last_instrument_gesture_ms) >= GESTURE_COOLDOWN_MS
+        ):
+            direction = 1 if roll_rate_dps > 0.0 else -1
+            current_idx = INSTRUMENT_CYCLE.index(self.current_instrument)
+            self.current_instrument = INSTRUMENT_CYCLE[(current_idx + direction) % len(INSTRUMENT_CYCLE)]
+            print(f"[FL visualizer gesture] instrument set to {self.current_instrument}")
+            self.last_instrument_gesture_ms = current_t
+
     def _update_note_state(self, label: str) -> None:
         state = self.hands[label]
         if not state.tracking_active:
             state.active_note_index = None
+            state.preview_note_index = None
             state.last_note_name = "tracking lost"
             state.is_on_play_side = False
             self._update_midi_note(label, None)
@@ -824,6 +995,7 @@ class DualHandFLStudioVisualizer:
 
         if state.plane is None:
             state.active_note_index = None
+            state.preview_note_index = None
             state.last_note_name = "inactive"
             self._update_midi_note(label, None)
             return
@@ -837,19 +1009,29 @@ class DualHandFLStudioVisualizer:
         elif play_metric >= PLAY_ENTER_THRESHOLD:
             state.is_on_play_side = True
 
-        note_index, note_name, note_axis, note_pct = self._note_section_from_position(state.position, state.plane)
-        can_play = state.is_on_play_side and (inside or not self.require_inside_plane_to_play)
-        state.active_note_index = note_index if can_play else None
-        state.last_note_name = (
-            f"{note_name} axis={note_axis} pos={note_pct:5.1f}%"
-            if can_play
-            else "inactive"
-        )
+        if label == "RIGHT":
+            note_index, note_name, note_axis, note_pct = self._note_section_from_position(state.position, state.plane)
+            if state.preview_note_index != note_index:
+                self.haptics.pulse(label, HAPTICS_NOTE_INTENSITY, HAPTICS_NOTE_DURATION_MS)
+            state.preview_note_index = note_index
+            can_play = state.is_on_play_side and (inside or not self.require_inside_plane_to_play)
+            state.active_note_index = note_index if can_play else None
+            state.last_note_name = (
+                f"{note_name} axis={note_axis} pos={note_pct:5.1f}% instrument={self.current_instrument}"
+                if can_play
+                else f"preview={note_name} instrument={self.current_instrument}"
+            )
+        else:
+            state.active_note_index = None
+            state.preview_note_index = None
+            state.last_note_name = (
+                f"vol={state.volume_value:3d} atk={state.attack_value:3d} rev={state.reverb_value:3d}"
+            )
         state.last_inside = inside
         state.last_offset = play_offset
         state.last_u_pct = u_pct
         state.last_v_pct = v_pct
-        self._update_midi_note(label, state.active_note_index)
+        self._update_midi_note(label, state.active_note_index if label == "RIGHT" else None)
 
     def _update_hand_visual(self, label: str) -> None:
         state = self.hands[label]
@@ -905,12 +1087,23 @@ class DualHandFLStudioVisualizer:
         if not self.allow_hand_switching:
             controls = f"{controls} | controls locked to {self.controlled_hand_label}"
         midi_text = self.midi_output_name if self.midi_output_name else "disconnected"
+        right_channel_1_based = self.midi_channels["RIGHT"] + 1
+        left_channel_1_based = self.midi_channels["LEFT"] + 1
         self.status_text.text = "\n".join(
             [
-                f"Controlling: {self.controlled_hand_label} | MIDI: {midi_text} | {self.midi_channel_text()}",
+                f"Controlling: {self.controlled_hand_label} | MIDI: {midi_text} | {self.midi_channel_text()} | instrument={self.current_instrument}",
                 *self.external_status_lines,
                 *lines,
-                f"move_step={self.velocity_step:.2f} rotate_step={self.rotation_step:.2f}",
+                (
+                    f"MIDI OUT: RIGHT notes ch={right_channel_1_based} base_note={self.midi_base_note} "
+                    f"velocity(from LEFT y)={self.current_attack_value}"
+                ),
+                (
+                    f"MIDI OUT: LEFT rot -> CC101={self.current_volume_value} on RIGHT ch={right_channel_1_based} | "
+                    f"LEFT x -> CC100={self.current_reverb_value} on RIGHT ch={right_channel_1_based} | "
+                    f"LEFT ch setting={left_channel_1_based}"
+                ),
+                f"move_step={self.velocity_step:.2f} rotate_step={self.rotation_step:.2f} volume={self.current_volume_value} attack={self.current_attack_value} reverb={self.current_reverb_value}",
                 controls,
             ]
         )
@@ -934,6 +1127,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--left-midi-channel", type=int, default=HAND_MIDI_CHANNELS_1_BASED["LEFT"])
     parser.add_argument("--right-midi-channel", type=int, default=HAND_MIDI_CHANNELS_1_BASED["RIGHT"])
     parser.add_argument("--max-midi-channel", type=int, default=DEFAULT_MAX_MIDI_CHANNEL)
+    parser.add_argument("--haptics-port", default=HAPTICS_PORT)
+    parser.add_argument("--haptics-baud", type=int, default=HAPTICS_BAUD)
+    parser.add_argument("--no-haptics", action="store_true")
     parser.add_argument("--require-inside-plane", action="store_true")
     parser.add_argument("--update-hz", type=float, default=120.0)
     return parser
@@ -949,6 +1145,9 @@ def main() -> int:
         midi_velocity=args.midi_velocity,
         midi_channels_1_based={"LEFT": args.left_midi_channel, "RIGHT": args.right_midi_channel},
         max_midi_channel=args.max_midi_channel,
+        enable_haptics=not args.no_haptics,
+        haptics_port=args.haptics_port,
+        haptics_baud=args.haptics_baud,
         require_inside_plane_to_play=args.require_inside_plane,
         update_hz=args.update_hz,
     )
