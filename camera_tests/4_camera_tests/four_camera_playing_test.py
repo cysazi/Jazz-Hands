@@ -129,23 +129,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--imu-plane-draw-hand",
         choices=HAND_LABELS,
         default=IMU_PLANE_DRAW_HAND_LABEL,
-        help="Only this hand module's physical button draws the plane.",
+        help="Legacy option; glove buttons now draw their own hand's plane.",
     )
     parser.add_argument(
         "--imu-channel-cycle-hand",
         choices=HAND_LABELS,
         default=IMU_CHANNEL_CYCLE_HAND_LABEL,
-        help="This hand module's physical button cycles a MIDI channel.",
+        help="Legacy option; glove buttons now control octave after planes exist.",
     )
     parser.add_argument(
         "--imu-channel-cycle-target-hand",
         choices=(*HAND_LABELS, "CONTROLLED"),
         default=IMU_CHANNEL_CYCLE_TARGET_HAND_LABEL,
-        help="Which hand channel the cycle button changes. CONTROLLED means --controlled-hand.",
+        help="Legacy option retained for CLI compatibility.",
     )
     parser.add_argument("--no-midi", action="store_true")
     parser.add_argument("--midi-output-hint", default=fl_debug.MIDI_OUTPUT_HINT)
     parser.add_argument("--midi-base-note", type=int, default=fl_debug.MIDI_BASE_NOTE)
+    parser.add_argument(
+        "--middle-note",
+        default=None,
+        help="Middle stacked plane base note as MIDI number or note name, for example C4, D3, F#4.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=two_camera_playing.normalize_scale_name,
+        default="chromatic",
+        help="Scale for note selection. Use --list-scales to see options.",
+    )
+    parser.add_argument("--list-scales", action="store_true", help="Print available scales and exit.")
     parser.add_argument("--midi-velocity", type=int, default=fl_debug.MIDI_VELOCITY)
     parser.add_argument(
         "--left-midi-channel",
@@ -209,12 +221,17 @@ class FourCameraPlayingTestApp:
 
         self.keyboard = two_camera_playing.KeyboardPoller()
         self.imu_reader: two_camera_playing.SerialImuReader | None = None
-        self.visualizer = fl_debug.DualHandFLStudioVisualizer(
+        middle_note = (
+            two_camera_playing.parse_midi_note(args.middle_note)
+            if args.middle_note is not None
+            else int(args.midi_base_note)
+        )
+        self.visualizer = two_camera_playing.GloveScalePlayingVisualizer(
             keyboard_controlled=False,
             keyboard_buttons_enabled=True,
             enable_midi=not args.no_midi,
             midi_output_hint=args.midi_output_hint,
-            midi_base_note=args.midi_base_note,
+            midi_base_note=middle_note,
             midi_velocity=args.midi_velocity,
             midi_channels_1_based={"LEFT": args.left_midi_channel, "RIGHT": args.right_midi_channel},
             max_midi_channel=args.max_midi_channel,
@@ -224,6 +241,8 @@ class FourCameraPlayingTestApp:
             update_hz=args.visualizer_hz,
             start_timer=False,
             show=True,
+            scale_name=args.scale,
+            middle_note=middle_note,
         )
         self.visualizer.canvas.events.close.connect(self.close)
         self._setup_preview_window()
@@ -397,16 +416,11 @@ class FourCameraPlayingTestApp:
         self._feed_imu_to_visualizer(set(assigned_tracks))
 
     def _feed_imu_to_visualizer(self, tracked_hand_labels: set[str]) -> None:
-        plane_draw_hand = str(self.args.imu_plane_draw_hand).upper()
-        channel_cycle_hand = str(self.args.imu_channel_cycle_hand).upper()
         now = time.time()
         for label in HAND_LABELS:
             imu_snapshot = self._imu_snapshot_for_hand(label)
-            button_pressed = False if label == plane_draw_hand else None
             if imu_snapshot is None:
-                if label == channel_cycle_hand:
-                    self.last_imu_channel_cycle_button_pressed = False
-                self.visualizer.set_hand_imu_state(label, button_pressed=button_pressed)
+                self.visualizer.set_hand_imu_state(label, button_pressed=False)
                 continue
 
             rotation_quaternion = (
@@ -414,25 +428,13 @@ class FourCameraPlayingTestApp:
                 if imu_snapshot.has_fresh_quat(self.args.imu_packet_stale_seconds)
                 else None
             )
-            if label == channel_cycle_hand:
-                channel_cycle_button_pressed = self._fresh_imu_button_pressed(
-                    label,
-                    imu_snapshot,
-                    now,
-                    tracked_hand_labels,
-                    require_tracking=False,
-                )
-                if channel_cycle_button_pressed and not self.last_imu_channel_cycle_button_pressed:
-                    self.visualizer.cycle_hand_midi_channel(self._channel_cycle_target_hand(), 1)
-                self.last_imu_channel_cycle_button_pressed = channel_cycle_button_pressed
-            if label == plane_draw_hand:
-                button_pressed = self._fresh_imu_button_pressed(
-                    label,
-                    imu_snapshot,
-                    now,
-                    tracked_hand_labels,
-                    require_tracking=True,
-                )
+            button_pressed = self._fresh_imu_button_pressed(
+                label,
+                imu_snapshot,
+                now,
+                tracked_hand_labels,
+                require_tracking=True,
+            )
             self.visualizer.set_hand_imu_state(
                 label,
                 rotation_quaternion=rotation_quaternion,
@@ -599,7 +601,7 @@ class FourCameraPlayingTestApp:
             f"top_candidates={diagnostics.top_candidates} "
             f"hands={mapping} | {shared.scale_text(self.args)}"
         )
-        return [layout_line, *self._imu_status_lines()]
+        return [layout_line, f"scale: {self.visualizer.scale_status_text()}", *self._imu_status_lines()]
 
     def _imu_status_lines(self) -> list[str]:
         if self.imu_reader is None:
@@ -670,6 +672,11 @@ class FourCameraPlayingTestApp:
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.list_scales:
+        print("Available scales:")
+        for scale_name in sorted(two_camera_playing.SCALE_INTERVALS):
+            print(f"  {scale_name}")
+        return 0
     shared.apply_scaling_defaults(args)
 
     if mocap.cv2 is None:

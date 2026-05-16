@@ -78,6 +78,62 @@ IMU_MOUNTING_QUATERNION_OFFSETS = {
     "RIGHT": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float64),
 }
 ENABLE_NOTE_HAPTICS = True
+BUTTON_HOLD_CLEAR_SECONDS = 5.0
+MIN_OCTAVE_OFFSET = -4
+MAX_OCTAVE_OFFSET = 4
+STACKED_PLANE_OCTAVES = (-1, 0, 1)
+
+NOTE_TO_SEMITONE = {
+    "C": 0,
+    "B#": 0,
+    "C#": 1,
+    "DB": 1,
+    "D": 2,
+    "D#": 3,
+    "EB": 3,
+    "E": 4,
+    "FB": 4,
+    "E#": 5,
+    "F": 5,
+    "F#": 6,
+    "GB": 6,
+    "G": 7,
+    "G#": 8,
+    "AB": 8,
+    "A": 9,
+    "A#": 10,
+    "BB": 10,
+    "B": 11,
+    "CB": 11,
+}
+SEMITONE_NAMES = ("C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B")
+SCALE_INTERVALS = {
+    "chromatic": tuple(range(12)),
+    "major": (0, 2, 4, 5, 7, 9, 11),
+    "ionian": (0, 2, 4, 5, 7, 9, 11),
+    "natural-minor": (0, 2, 3, 5, 7, 8, 10),
+    "minor": (0, 2, 3, 5, 7, 8, 10),
+    "aeolian": (0, 2, 3, 5, 7, 8, 10),
+    "dorian": (0, 2, 3, 5, 7, 9, 10),
+    "phrygian": (0, 1, 3, 5, 7, 8, 10),
+    "lydian": (0, 2, 4, 6, 7, 9, 11),
+    "mixolydian": (0, 2, 4, 5, 7, 9, 10),
+    "locrian": (0, 1, 3, 5, 6, 8, 10),
+    "harmonic-minor": (0, 2, 3, 5, 7, 8, 11),
+    "melodic-minor": (0, 2, 3, 5, 7, 9, 11),
+    "harmonic-major": (0, 2, 4, 5, 7, 8, 11),
+    "double-harmonic": (0, 1, 4, 5, 7, 8, 11),
+    "hungarian-minor": (0, 2, 3, 6, 7, 8, 11),
+    "ukrainian-dorian": (0, 2, 3, 6, 7, 9, 10),
+    "neapolitan-minor": (0, 1, 3, 5, 7, 8, 11),
+    "neapolitan-major": (0, 1, 3, 5, 7, 9, 11),
+    "enigmatic": (0, 1, 4, 6, 8, 10, 11),
+    "persian": (0, 1, 4, 5, 6, 8, 11),
+    "romanian-minor": (0, 2, 3, 6, 7, 9, 10),
+    "spanish-gypsy": (0, 1, 4, 5, 7, 8, 10),
+    "altered": (0, 1, 3, 4, 6, 8, 10),
+    "whole-tone-plus": (0, 2, 4, 6, 8, 10, 11),
+}
 
 
 @dataclass
@@ -537,6 +593,425 @@ class KeyboardPoller:
         return pressed, released
 
 
+def normalize_scale_name(name: str) -> str:
+    normalized = str(name).strip().lower().replace("_", "-").replace(" ", "-")
+    if normalized not in SCALE_INTERVALS:
+        available = ", ".join(sorted(SCALE_INTERVALS))
+        raise argparse.ArgumentTypeError(f"Unknown scale {name!r}. Available: {available}")
+    return normalized
+
+
+def parse_midi_note(value: str | int) -> int:
+    if isinstance(value, int):
+        return int(np.clip(value, 0, 127))
+
+    text = str(value).strip()
+    if text.isdigit():
+        return int(np.clip(int(text), 0, 127))
+
+    note_part = text[:-1].upper()
+    octave_part = text[-1:]
+    if len(text) >= 3 and text[-2] == "-":
+        note_part = text[:-2].upper()
+        octave_part = text[-2:]
+    if note_part not in NOTE_TO_SEMITONE:
+        raise argparse.ArgumentTypeError(
+            f"Expected MIDI note number or note name like C4, F#3, Bb4; got {value!r}"
+        )
+    try:
+        octave = int(octave_part)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"Expected octave number in note name {value!r}") from error
+    return int(np.clip((octave + 1) * 12 + NOTE_TO_SEMITONE[note_part], 0, 127))
+
+
+def midi_note_name(midi_note: int) -> str:
+    note = int(np.clip(midi_note, 0, 127))
+    return f"{SEMITONE_NAMES[note % 12]}{(note // 12) - 1}"
+
+
+class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
+    def __init__(
+        self,
+        *args,
+        scale_name: str = "chromatic",
+        middle_note: int = fl_debug.MIDI_BASE_NOTE,
+        button_hold_clear_seconds: float = BUTTON_HOLD_CLEAR_SECONDS,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.scale_name = normalize_scale_name(scale_name)
+        self.scale_intervals = SCALE_INTERVALS[self.scale_name]
+        self.initial_midi_base_note = int(np.clip(middle_note, 0, 127))
+        self.midi_base_note = self.initial_midi_base_note
+        self.octave_offset = 0
+        self.button_hold_clear_seconds = max(float(button_hold_clear_seconds), 0.25)
+        self.button_press_times: dict[str, float | None] = {label: None for label in self.hand_labels}
+        self.button_clear_consumed: dict[str, bool] = {label: False for label in self.hand_labels}
+        self.selected_note_offset: int | None = None
+        self.selected_note_name = "none"
+        self.stacked_plane_meshes: dict[tuple[str, int], object] = {}
+        self.stacked_plane_outlines: dict[tuple[str, int], object] = {}
+        self.stacked_plane_section_lines: dict[tuple[str, int], list[object]] = {}
+
+    @property
+    def section_count(self) -> int:
+        return len(self.scale_intervals)
+
+    def scale_status_text(self) -> str:
+        return (
+            f"{self.scale_name} middle={midi_note_name(self.midi_base_note)} "
+            f"octave={self.octave_offset:+d} selected={self.selected_note_name}"
+        )
+
+    def set_scale(self, scale_name: str) -> None:
+        self._all_midi_notes_off()
+        self.scale_name = normalize_scale_name(scale_name)
+        self.scale_intervals = SCALE_INTERVALS[self.scale_name]
+        for label in self.hand_labels:
+            state = self.hands[label]
+            if state.plane is not None:
+                self._update_plane_visuals(label, state.plane, preview=False)
+        print(f"[playing test scale] scale={self.scale_name} sections={self.section_count}")
+
+    def set_middle_note(self, middle_note: int) -> None:
+        self._all_midi_notes_off()
+        self.initial_midi_base_note = int(np.clip(middle_note, 0, 127))
+        self.octave_offset = 0
+        self.midi_base_note = self.initial_midi_base_note
+        print(f"[playing test scale] middle={midi_note_name(self.midi_base_note)} ({self.midi_base_note})")
+
+    def adjust_octave(self, delta: int) -> None:
+        next_offset = int(np.clip(self.octave_offset + int(delta), MIN_OCTAVE_OFFSET, MAX_OCTAVE_OFFSET))
+        if next_offset == self.octave_offset:
+            return
+        self._update_midi_note("RIGHT", None)
+        self.octave_offset = next_offset
+        self.midi_base_note = int(np.clip(self.initial_midi_base_note + self.octave_offset * 12, 0, 127))
+        print(
+            f"[playing test scale] octave={self.octave_offset:+d} "
+            f"middle={midi_note_name(self.midi_base_note)}"
+        )
+
+    def clear_plane(self, label: str | None = None) -> None:
+        super().clear_plane(label)
+        labels = self.hand_labels if label is None else (self._normalize_label(label),)
+        for hand_label in labels:
+            for octave_index in STACKED_PLANE_OCTAVES:
+                key = (hand_label, octave_index)
+                mesh = self.stacked_plane_meshes.get(key)
+                outline = self.stacked_plane_outlines.get(key)
+                if mesh is not None:
+                    mesh.visible = False
+                if outline is not None:
+                    outline.visible = False
+                for line in self.stacked_plane_section_lines.get(key, []):
+                    line.visible = False
+            if hand_label == "LEFT":
+                self.selected_note_offset = None
+                self.selected_note_name = "none"
+            if hand_label == "RIGHT":
+                self._update_midi_note("RIGHT", None)
+
+    def _update_plane_state(self, label: str) -> None:
+        state = self.hands[label]
+        pressed_edge = state.button_pressed and not state.last_button_pressed
+        released_edge = (not state.button_pressed) and state.last_button_pressed
+        now = time.time()
+
+        if state.plane is None:
+            if pressed_edge:
+                state.drawing = True
+                state.draw_origin = state.position.copy()
+                state.is_on_play_side = False
+                state.active_note_index = None
+                self._update_midi_note(label, None)
+                print(f"[{label}] plane origin captured: {state.draw_origin}")
+
+            if state.drawing and state.button_pressed and state.draw_origin is not None:
+                definition = self._compute_debug_plane(state.draw_origin, state.position)
+                if definition is not None:
+                    self._update_plane_visuals(label, definition, preview=True)
+
+            if released_edge and state.drawing:
+                if state.draw_origin is not None:
+                    definition = self._compute_debug_plane(state.draw_origin, state.position)
+                    if definition is not None:
+                        state.plane = definition
+                        state.no_play_side_sign = -1.0
+                        state.play_side_sign = 1.0
+                        state.is_on_play_side = False
+                        state.active_note_index = None
+                        self._update_plane_visuals(label, definition, preview=False)
+                        print(
+                            f"[{label}] plane committed: center={definition.center}, "
+                            f"normal={fl_debug.AXIS_NAMES[definition.normal_axis]}"
+                        )
+                    else:
+                        print(f"[{label}] plane draw ignored: move farther before releasing button")
+                state.drawing = False
+                state.draw_origin = None
+            state.last_button_pressed = state.button_pressed
+            return
+
+        if pressed_edge:
+            self.button_press_times[label] = now
+            self.button_clear_consumed[label] = False
+
+        press_time = self.button_press_times.get(label)
+        if (
+            state.button_pressed
+            and press_time is not None
+            and not self.button_clear_consumed[label]
+            and now - press_time >= self.button_hold_clear_seconds
+        ):
+            self.clear_plane(label)
+            self.button_clear_consumed[label] = True
+            state.drawing = False
+            state.draw_origin = None
+            print(f"[{label}] plane cleared after {self.button_hold_clear_seconds:.1f}s hold")
+
+        if released_edge:
+            if not self.button_clear_consumed[label]:
+                self.adjust_octave(1 if label == "LEFT" else -1)
+            self.button_press_times[label] = None
+            self.button_clear_consumed[label] = False
+
+        state.last_button_pressed = state.button_pressed
+
+    def _stacked_plane_definition(
+        self,
+        definition: fl_debug.PlaneDefinition,
+        octave_index: int,
+    ) -> fl_debug.PlaneDefinition:
+        note_axis, note_half, _other_axis, _other_half = self._note_axis_and_half_extent(definition)
+        center = definition.center.copy()
+        center[note_axis] += float(octave_index) * (2.0 * note_half)
+        return fl_debug.PlaneDefinition(
+            center=center,
+            axis_u=definition.axis_u,
+            axis_v=definition.axis_v,
+            normal_axis=definition.normal_axis,
+            half_u=definition.half_u,
+            half_v=definition.half_v,
+        )
+
+    def _ensure_stacked_plane_visuals(self, label: str, octave_index: int) -> None:
+        key = (label, octave_index)
+        if key not in self.stacked_plane_meshes:
+            mesh = fl_debug.scene.visuals.Mesh(
+                vertices=np.zeros((4, 3), dtype=np.float32),
+                faces=fl_debug.PLANE_FACES,
+                color=(0.25, 0.85, 1.0, 0.0),
+                shading=None,
+                parent=self.view.scene,
+            )
+            mesh.visible = False
+            self.stacked_plane_meshes[key] = mesh
+
+        if key not in self.stacked_plane_outlines:
+            outline = fl_debug.scene.visuals.Line(
+                pos=np.zeros((2, 3), dtype=np.float32),
+                color=(0.75, 0.95, 1.0, 0.0),
+                width=2,
+                method="gl",
+                parent=self.view.scene,
+            )
+            outline.visible = False
+            self.stacked_plane_outlines[key] = outline
+
+        lines = self.stacked_plane_section_lines.setdefault(key, [])
+        while len(lines) < self.section_count - 1:
+            line = fl_debug.scene.visuals.Line(
+                pos=np.zeros((2, 3), dtype=np.float32),
+                color=(0.75, 0.95, 1.0, 0.0),
+                width=1,
+                method="gl",
+                parent=self.view.scene,
+            )
+            line.visible = False
+            lines.append(line)
+
+    def _section_line_segments_for_count(
+        self,
+        definition: fl_debug.PlaneDefinition,
+        section_count: int,
+    ) -> list[np.ndarray]:
+        segments = []
+        note_axis, note_half, other_axis, other_half = self._note_axis_and_half_extent(definition)
+        axis_min = definition.center[note_axis] - note_half
+        for split_index in range(1, section_count):
+            split_ratio = split_index / section_count
+            split_coord = axis_min + split_ratio * (2.0 * note_half)
+            p0 = definition.center.copy()
+            p1 = definition.center.copy()
+            p0[note_axis] = split_coord
+            p1[note_axis] = split_coord
+            p0[other_axis] = definition.center[other_axis] - other_half
+            p1[other_axis] = definition.center[other_axis] + other_half
+            segments.append(np.array([p0, p1], dtype=np.float32))
+        return segments
+
+    def _update_plane_visuals(self, label: str, definition: fl_debug.PlaneDefinition, preview: bool) -> None:
+        colors_by_label = {
+            "LEFT": {
+                "fill": (0.30, 0.80, 1.00, 0.08 if preview else 0.16),
+                "edge": (0.45, 0.88, 1.00, 0.55 if preview else 0.9),
+                "split": (0.72, 0.93, 1.00, 0.35 if preview else 0.65),
+            },
+            "RIGHT": {
+                "fill": (1.00, 0.48, 0.32, 0.08 if preview else 0.16),
+                "edge": (1.00, 0.62, 0.45, 0.55 if preview else 0.9),
+                "split": (1.00, 0.84, 0.70, 0.35 if preview else 0.65),
+            },
+        }
+        colors = colors_by_label[label]
+
+        for octave_index in STACKED_PLANE_OCTAVES:
+            stacked = self._stacked_plane_definition(definition, octave_index)
+            self._ensure_stacked_plane_visuals(label, octave_index)
+            key = (label, octave_index)
+            alpha_scale = 1.0 if octave_index == 0 else 0.55
+            fill = (*colors["fill"][:3], colors["fill"][3] * alpha_scale)
+            edge = (*colors["edge"][:3], colors["edge"][3] * alpha_scale)
+            split = (*colors["split"][:3], colors["split"][3] * alpha_scale)
+
+            vertices = self._plane_vertices(stacked) * fl_debug.POSITION_SCALE
+            outline = np.vstack([vertices, vertices[0]])
+            self.stacked_plane_meshes[key].set_data(vertices=vertices, faces=fl_debug.PLANE_FACES, color=fill)
+            self.stacked_plane_meshes[key].visible = True
+            self.stacked_plane_outlines[key].set_data(pos=outline, color=edge)
+            self.stacked_plane_outlines[key].visible = True
+
+            segments = self._section_line_segments_for_count(stacked, self.section_count)
+            lines = self.stacked_plane_section_lines[key]
+            for index, line in enumerate(lines):
+                if index < len(segments):
+                    line.set_data(pos=segments[index] * fl_debug.POSITION_SCALE, color=split)
+                    line.visible = True
+                else:
+                    line.visible = False
+
+    def _stacked_plane_position_metrics(
+        self,
+        position: np.ndarray,
+        definition: fl_debug.PlaneDefinition,
+    ) -> tuple[float, float, bool, int]:
+        note_axis, note_half, other_axis, other_half = self._note_axis_and_half_extent(definition)
+        axis_min = definition.center[note_axis] - note_half
+        normalized = (position[note_axis] - axis_min) / (2.0 * note_half)
+        if normalized < 0.0:
+            octave_index = -1
+            local_note = normalized + 1.0
+        elif normalized >= 1.0:
+            octave_index = 1
+            local_note = normalized - 1.0
+        else:
+            octave_index = 0
+            local_note = normalized
+
+        other_min = definition.center[other_axis] - other_half
+        other_normalized = (position[other_axis] - other_min) / (2.0 * other_half)
+        inside = (
+            octave_index in STACKED_PLANE_OCTAVES
+            and 0.0 <= local_note <= 1.0
+            and 0.0 <= other_normalized <= 1.0
+        )
+        return (
+            float(np.clip(local_note, 0.0, 1.0) * 100.0),
+            float(np.clip(other_normalized, 0.0, 1.0) * 100.0),
+            inside,
+            octave_index,
+        )
+
+    def _note_offset_from_left_position(self) -> tuple[int | None, str, float, int]:
+        state = self.hands["LEFT"]
+        if not state.tracking_active or state.plane is None:
+            return None, "none", 0.0, 0
+        note_pct, _other_pct, inside, octave_index = self._stacked_plane_position_metrics(state.position, state.plane)
+        note_axis, _note_half, _other_axis, _other_half = self._note_axis_and_half_extent(state.plane)
+        section_index = min(int((note_pct / 100.0) * self.section_count), self.section_count - 1)
+        semitone_offset = self.scale_intervals[section_index] + (12 * octave_index)
+        midi_note = int(np.clip(self.midi_base_note + semitone_offset, 0, 127))
+        note_name = midi_note_name(midi_note)
+        if not inside and self.require_inside_plane_to_play:
+            return None, f"outside {note_name}", note_pct, octave_index
+        return semitone_offset, f"{note_name} {fl_debug.AXIS_NAMES[note_axis]}={note_pct:5.1f}%", note_pct, octave_index
+
+    def _update_note_state(self, label: str) -> None:
+        if label == "LEFT":
+            note_offset, note_name, note_pct, octave_index = self._note_offset_from_left_position()
+            state = self.hands["LEFT"]
+            if note_offset is not None and state.preview_note_index != note_offset:
+                self.haptics.pulse("LEFT", fl_debug.HAPTICS_NOTE_INTENSITY, fl_debug.HAPTICS_NOTE_DURATION_MS)
+            self.selected_note_offset = note_offset
+            self.selected_note_name = note_name
+            state.active_note_index = None
+            state.preview_note_index = note_offset
+            state.last_note_name = f"select={note_name} oct={octave_index:+d}"
+            state.last_inside = note_offset is not None
+            state.last_u_pct = note_pct
+            self._update_midi_note("LEFT", None)
+            return
+
+        state = self.hands["RIGHT"]
+        if not state.tracking_active:
+            state.active_note_index = None
+            state.preview_note_index = None
+            state.last_note_name = "tracking lost"
+            state.is_on_play_side = False
+            self._update_midi_note("RIGHT", None)
+            return
+
+        if state.plane is None:
+            state.active_note_index = None
+            state.preview_note_index = None
+            state.last_note_name = "inactive"
+            self._update_midi_note("RIGHT", None)
+            return
+
+        _note_pct, other_pct, inside, octave_index = self._stacked_plane_position_metrics(state.position, state.plane)
+        play_offset = float(state.position[0] - state.plane.center[0])
+        if state.is_on_play_side:
+            if play_offset <= fl_debug.PLAY_EXIT_THRESHOLD:
+                state.is_on_play_side = False
+        elif play_offset >= fl_debug.PLAY_ENTER_THRESHOLD:
+            state.is_on_play_side = True
+
+        can_play = (
+            self.selected_note_offset is not None
+            and state.is_on_play_side
+            and (inside or not self.require_inside_plane_to_play)
+        )
+        state.active_note_index = self.selected_note_offset if can_play else None
+        state.preview_note_index = self.selected_note_offset
+        state.last_note_name = (
+            f"PLAY {self.selected_note_name}"
+            if can_play
+            else f"ready={self.selected_note_name} trigger_oct={octave_index:+d}"
+        )
+        state.last_inside = inside
+        state.last_offset = play_offset
+        state.last_u_pct = other_pct
+        self._update_midi_note("RIGHT", state.active_note_index)
+
+    def _update_left_controls(self) -> None:
+        state = self.hands["LEFT"]
+        if not state.tracking_active:
+            return
+
+        volume_roll = float(np.clip(state.rotation_euler[0], 0.0, 180.0))
+        volume_value = int(np.clip(round((volume_roll / 180.0) * 127.0), 0, 127))
+        state.volume_value = volume_value
+        self.current_attack_value = self.midi_velocity
+
+        right_channel = self.midi_channels["RIGHT"]
+        if state.volume_value != self.current_volume_value:
+            self.current_volume_value = state.volume_value
+            self._send_control_change(101, self.current_volume_value, right_channel)
+            self._send_control_change(7, self.current_volume_value, right_channel)
+
+
 def detect_markers_and_mask(
     frame: np.ndarray,
     settings: mocap.DetectionSettings,
@@ -769,23 +1244,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--imu-plane-draw-hand",
         choices=HAND_LABELS,
         default=IMU_PLANE_DRAW_HAND_LABEL,
-        help="Only this hand module's physical button draws the plane.",
+        help="Legacy option; glove buttons now draw their own hand's plane.",
     )
     parser.add_argument(
         "--imu-channel-cycle-hand",
         choices=HAND_LABELS,
         default=IMU_CHANNEL_CYCLE_HAND_LABEL,
-        help="This hand module's physical button cycles a MIDI channel.",
+        help="Legacy option; glove buttons now control octave after planes exist.",
     )
     parser.add_argument(
         "--imu-channel-cycle-target-hand",
         choices=(*HAND_LABELS, "CONTROLLED"),
         default=IMU_CHANNEL_CYCLE_TARGET_HAND_LABEL,
-        help="Which hand channel the cycle button changes. CONTROLLED means --controlled-hand.",
+        help="Legacy option retained for CLI compatibility.",
     )
     parser.add_argument("--no-midi", action="store_true")
     parser.add_argument("--midi-output-hint", default=fl_debug.MIDI_OUTPUT_HINT)
     parser.add_argument("--midi-base-note", type=int, default=fl_debug.MIDI_BASE_NOTE)
+    parser.add_argument(
+        "--middle-note",
+        default=None,
+        help="Middle stacked plane base note as MIDI number or note name, for example C4, D3, F#4.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=normalize_scale_name,
+        default="chromatic",
+        help="Scale for note selection. Use --list-scales to see options.",
+    )
+    parser.add_argument("--list-scales", action="store_true", help="Print available scales and exit.")
     parser.add_argument("--midi-velocity", type=int, default=fl_debug.MIDI_VELOCITY)
     parser.add_argument(
         "--left-midi-channel",
@@ -873,12 +1360,13 @@ class MocapPlayingTestApp:
             for source in self.sources
         ]
 
-        self.visualizer = fl_debug.DualHandFLStudioVisualizer(
+        middle_note = parse_midi_note(args.middle_note) if args.middle_note is not None else int(args.midi_base_note)
+        self.visualizer = GloveScalePlayingVisualizer(
             keyboard_controlled=False,
             keyboard_buttons_enabled=True,
             enable_midi=not args.no_midi,
             midi_output_hint=args.midi_output_hint,
-            midi_base_note=args.midi_base_note,
+            midi_base_note=middle_note,
             midi_velocity=args.midi_velocity,
             midi_channels_1_based={"LEFT": args.left_midi_channel, "RIGHT": args.right_midi_channel},
             max_midi_channel=args.max_midi_channel,
@@ -889,6 +1377,8 @@ class MocapPlayingTestApp:
             update_hz=args.visualizer_hz,
             start_timer=False,
             show=True,
+            scale_name=args.scale,
+            middle_note=middle_note,
         )
         self.visualizer.canvas.events.close.connect(self.close)
 
@@ -1254,16 +1744,11 @@ class MocapPlayingTestApp:
         self._feed_imu_to_visualizer(set(assigned_tracks))
 
     def _feed_imu_to_visualizer(self, tracked_hand_labels: set[str]) -> None:
-        plane_draw_hand = str(self.args.imu_plane_draw_hand).upper()
-        channel_cycle_hand = str(self.args.imu_channel_cycle_hand).upper()
         now = time.time()
         for label in HAND_LABELS:
             imu_snapshot = self._imu_snapshot_for_hand(label)
-            button_pressed = False if label == plane_draw_hand else None
             if imu_snapshot is None:
-                if label == channel_cycle_hand:
-                    self.last_imu_channel_cycle_button_pressed = False
-                self.visualizer.set_hand_imu_state(label, button_pressed=button_pressed)
+                self.visualizer.set_hand_imu_state(label, button_pressed=False)
                 continue
 
             rotation_quaternion = (
@@ -1271,25 +1756,13 @@ class MocapPlayingTestApp:
                 if imu_snapshot.has_fresh_quat(self.args.imu_packet_stale_seconds)
                 else None
             )
-            if label == channel_cycle_hand:
-                channel_cycle_button_pressed = self._fresh_imu_button_pressed(
-                    label,
-                    imu_snapshot,
-                    now,
-                    tracked_hand_labels,
-                    require_tracking=False,
-                )
-                if channel_cycle_button_pressed and not self.last_imu_channel_cycle_button_pressed:
-                    self.visualizer.cycle_hand_midi_channel(self._channel_cycle_target_hand(), 1)
-                self.last_imu_channel_cycle_button_pressed = channel_cycle_button_pressed
-            if label == plane_draw_hand:
-                button_pressed = self._fresh_imu_button_pressed(
-                    label,
-                    imu_snapshot,
-                    now,
-                    tracked_hand_labels,
-                    require_tracking=True,
-                )
+            button_pressed = self._fresh_imu_button_pressed(
+                label,
+                imu_snapshot,
+                now,
+                tracked_hand_labels,
+                require_tracking=True,
+            )
             self.visualizer.set_hand_imu_state(
                 label,
                 rotation_quaternion=rotation_quaternion,
@@ -1445,7 +1918,9 @@ class MocapPlayingTestApp:
         if force or timestamp - self.last_visualizer_update_time >= interval:
             self.last_visualizer_update_time = timestamp
             self._feed_imu_to_visualizer(self.last_tracked_hand_labels)
-            self.visualizer.set_external_status(self._imu_status_lines())
+            self.visualizer.set_external_status(
+                [f"scale: {self.visualizer.scale_status_text()}", *self._imu_status_lines()]
+            )
             self.visualizer.update(None)
 
     def _print_status(
@@ -1529,6 +2004,11 @@ class MocapPlayingTestApp:
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.list_scales:
+        print("Available scales:")
+        for scale_name in sorted(SCALE_INTERVALS):
+            print(f"  {scale_name}")
+        return 0
     combined.apply_scaling_defaults(args)
 
     if mocap.cv2 is None:

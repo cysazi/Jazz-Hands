@@ -27,13 +27,13 @@ const uint32_t SEND_PERIOD_US = 1000000UL / SEND_RATE_HZ;
 const uint32_t IMU_REPORT_INTERVAL_US = 1000000UL / SEND_RATE_HZ;
 const uint32_t IMU_DATA_STALE_US = 100000UL;
 
-uint8_t RECEIVER_MAC[6] = {0x34, 0x98, 0x7A, 0x72, 0x93, 0xD4};
+uint8_t RECEIVER_MAC[6] = {0x34, 0x98, 0x7A, 0x74, 0x39, 0x00};
 
-const int SDA_PIN = 21;
-const int SCL_PIN = 22;
-const int BUTTON_PIN = 23;
-const int HAPTICS_SDA_PIN = 25;
-const int HAPTICS_SCL_PIN = 26;
+const int SDA_PIN = 25;
+const int SCL_PIN = 26;
+const int BUTTON_PIN = 34;
+const int HAPTICS_SDA_PIN = 33;
+const int HAPTICS_SCL_PIN = 32;
 const int BNO08X_RESET = -1;
 const uint8_t BNO08X_I2C_ADDRESS = 0x4A;
 
