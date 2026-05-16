@@ -7,7 +7,7 @@
 // Flash one hand at a time. Change this one setting before uploading.
 #define LEFT_HAND 1
 #define RIGHT_HAND 2
-#define HAND_TO_FLASH RIGHT_HAND
+#define HAND_TO_FLASH LEFT_HAND
 
 #if HAND_TO_FLASH == LEFT_HAND
 const uint8_t HAND_DEVICE_ID = 1;
@@ -31,7 +31,7 @@ uint8_t RECEIVER_MAC[6] = {0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08};
 
 const int SDA_PIN = 25;
 const int SCL_PIN = 26;
-const int BUTTON_PIN = 34;
+const int BUTTON_PIN = 15;
 const int HAPTICS_SDA_PIN = 33;
 const int HAPTICS_SCL_PIN = 32;
 const int BNO08X_RESET = -1;
@@ -92,6 +92,20 @@ float filtered_accel_x = 0.0f;
 float filtered_accel_y = 0.0f;
 float filtered_accel_z = 0.0f;
 uint32_t haptics_pulse_end_ms = 0;
+
+void printMacAddress(const char *label, const uint8_t *mac) {
+  Serial.print(label);
+  for (int i = 0; i < 6; ++i) {
+    if (i > 0) {
+      Serial.print(":");
+    }
+    if (mac[i] < 16) {
+      Serial.print("0");
+    }
+    Serial.print(mac[i], HEX);
+  }
+  Serial.println();
+}
 
 class HapticsDriver {
  public:
@@ -215,6 +229,14 @@ void setup() {
 
   Serial.print("ESP-NOW IMU hand module ready: ");
   Serial.println(HAND_NAME);
+  Serial.print("Device ID: ");
+  Serial.println(HAND_DEVICE_ID);
+  Serial.print("Button pin: GPIO");
+  Serial.println(BUTTON_PIN);
+  uint8_t station_mac[6];
+  WiFi.macAddress(station_mac);
+  printMacAddress("Hand STA MAC: ", station_mac);
+  printMacAddress("Receiver MAC: ", RECEIVER_MAC);
 }
 
 void updateImu() {

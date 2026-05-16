@@ -229,6 +229,8 @@ class SerialImuReader(threading.Thread):
         self.stop_event = stop_event
         self.lock = threading.Lock()
         self.snapshots_by_label: dict[str, ImuPacketSnapshot] = {}
+        self.packet_count_by_device_id: dict[int, int] = {}
+        self.unknown_packet_count_by_device_id: dict[int, int] = {}
         self.port_name: str | None = None
         self.serial_port = None
         self.error: str | None = None
@@ -338,8 +340,17 @@ class SerialImuReader(threading.Thread):
         if header != IMU_PACKET_HEADER:
             return
 
+        with self.lock:
+            self.packet_count_by_device_id[int(device_id)] = (
+                self.packet_count_by_device_id.get(int(device_id), 0) + 1
+            )
+
         hand_label = IMU_DEVICE_ID_TO_HAND.get(device_id)
         if hand_label is None:
+            with self.lock:
+                self.unknown_packet_count_by_device_id[int(device_id)] = (
+                    self.unknown_packet_count_by_device_id.get(int(device_id), 0) + 1
+                )
             return
 
         receive_time = time.time()
@@ -417,6 +428,8 @@ class SerialImuReader(threading.Thread):
         with self.lock:
             snapshots_by_label = dict(self.snapshots_by_label)
             packet_count = self.packet_count
+            packet_count_by_device_id = dict(self.packet_count_by_device_id)
+            unknown_packet_count_by_device_id = dict(self.unknown_packet_count_by_device_id)
         if self.error:
             return [f"imu {label}: error:{self.error}" for label in HAND_LABELS]
         if self.port_name is None:
@@ -424,6 +437,16 @@ class SerialImuReader(threading.Thread):
 
         lines = []
         now = time.time()
+        device_counts = ", ".join(
+            f"id{device_id}={count}"
+            for device_id, count in sorted(packet_count_by_device_id.items())
+        ) or "none"
+        if unknown_packet_count_by_device_id:
+            unknown_counts = ", ".join(
+                f"id{device_id}={count}"
+                for device_id, count in sorted(unknown_packet_count_by_device_id.items())
+            )
+            device_counts = f"{device_counts} unknown({unknown_counts})"
         for label in HAND_LABELS:
             snapshot = snapshots_by_label.get(label)
             if snapshot is None:
@@ -432,7 +455,10 @@ class SerialImuReader(threading.Thread):
                 detail = f"STALE packet age={(now - snapshot.receive_time) * 1000.0:.0f}ms"
             else:
                 detail = self._snapshot_status_part(snapshot, now)
-            lines.append(f"imu={self.port_name} packets={packet_count} {label}: {detail}")
+            lines.append(
+                f"imu={self.port_name} packets={packet_count} devices={device_counts} "
+                f"{label}: {detail}"
+            )
         return lines
 
     def status_text(self) -> str:
