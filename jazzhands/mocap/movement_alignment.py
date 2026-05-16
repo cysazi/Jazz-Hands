@@ -31,9 +31,9 @@ from pathlib import Path
 
 import numpy as np
 
-import mocap_tracker as mocap
-import mocap_tracker_combined_vispy as combined
-import playing_test
+from jazzhands import app as playing_test
+from jazzhands.mocap import tracker as mocap
+from jazzhands.mocap import tracker_combined_vispy as combined
 
 
 DEFAULT_OUTPUT_PATH = Path(__file__).resolve().with_name("mocap_calibration_aligned.json")

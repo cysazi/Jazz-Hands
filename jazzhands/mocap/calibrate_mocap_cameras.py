@@ -34,8 +34,9 @@ from pathlib import Path
 
 import numpy as np
 
-import multithreaded_camera_testing as camera_settings
-import mocap_tracker as mocap
+from jazzhands.mocap import camera_uvc_settings
+from jazzhands.mocap import multithreaded_camera_testing as camera_settings
+from jazzhands.mocap import tracker as mocap
 
 cv2 = mocap.cv2
 
@@ -59,6 +60,7 @@ DEFAULT_ASSIGNMENT_STABILITY_PIXELS = 35.0
 DEFAULT_STABLE_POSE_FRAMES = 4
 DEFAULT_ASSIGNMENT_MEMORY_WEIGHT = 0.04
 DEFAULT_ASSIGNMENT_SWITCH_MARGIN = 2.0
+CAMERA_SETTINGS_REAPPLY_INTERVAL_SECONDS = 0.50
 DEFAULT_AUTOFOCUS = camera_settings.AUTOFOCUS
 BLUR_KERNEL_BY_CAMERA = dict(camera_settings.BLUR_KERNEL_BY_CAMERA)
 DEFAULT_AUTO_EXPOSURE_BY_CAMERA = dict(camera_settings.AUTO_EXPOSURE_BY_CAMERA)
@@ -715,20 +717,31 @@ def open_calibration_cameras(
     auto_exposure: float | None,
     exposure: float | None,
     gain: float | None,
+    preserve_uvc_controls: bool,
 ) -> list[mocap.CameraSource]:
     sources: list[mocap.CameraSource] = []
+    configure_controls = not preserve_uvc_controls or any(
+        value is not None for value in (auto_exposure, exposure, gain)
+    )
     for camera_id in camera_ids:
         source = mocap.CameraSource(
             camera_id,
             width,
             height,
             fps,
-            camera_exposure(camera_id, exposure),
-            camera_auto_exposure(camera_id, auto_exposure),
-            camera_gain(camera_id, gain),
+            camera_exposure(camera_id, exposure) if configure_controls else None,
+            camera_auto_exposure(camera_id, auto_exposure) if configure_controls else None,
+            camera_gain(camera_id, gain) if configure_controls else None,
             configure_capture=True,
+            configure_controls=configure_controls,
         )
         if source.open():
+            if preserve_uvc_controls and not configure_controls:
+                applied = camera_uvc_settings.apply_configured_camera_settings(
+                    camera_ids=[camera_id],
+                    dry_run=False,
+                )
+                print(f"[calibration] UVC controls re-applied after camera {camera_id} open: {applied}")
             sources.append(source)
             print_camera_settings(source)
         else:
@@ -741,8 +754,14 @@ def apply_camera_settings(
     auto_exposure: float | None,
     exposure: float | None,
     gain: float | None,
+    preserve_uvc_controls: bool = False,
 ) -> None:
     if source.capture is None:
+        return
+    if preserve_uvc_controls and all(value is None for value in (auto_exposure, exposure, gain)):
+        source.capture.set(cv2.CAP_PROP_FRAME_WIDTH, source.width)
+        source.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, source.height)
+        source.capture.set(cv2.CAP_PROP_FPS, source.fps)
         return
     camera_settings.apply_camera_capture_settings(
         source.capture,
@@ -807,6 +826,7 @@ class CalibrationCameraWorker(threading.Thread):
         self.lock = threading.Lock()
         self.pose_stability = PoseStabilityState()
         self.next_pose_solve_time = 0.0
+        self.next_camera_settings_apply_time = 0.0
         self.frame_intervals: list[float] = []
         self.last_frame_time: float | None = None
         self.snapshot_data = CalibrationCameraSnapshot(
@@ -817,6 +837,17 @@ class CalibrationCameraWorker(threading.Thread):
 
     def run(self) -> None:
         while not self.stop_event.is_set():
+            timestamp = time.time()
+            if timestamp >= self.next_camera_settings_apply_time:
+                self.next_camera_settings_apply_time = timestamp + CAMERA_SETTINGS_REAPPLY_INTERVAL_SECONDS
+                apply_camera_settings(
+                    self.source,
+                    self.args.auto_exposure,
+                    self.args.exposure,
+                    self.args.gain,
+                    preserve_uvc_controls=not self.args.skip_uvc_apply,
+                )
+
             read_start = time.perf_counter()
             ok, frame = self.source.read()
             read_end = time.perf_counter()
@@ -1046,6 +1077,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--no-preview", action="store_true")
     parser.add_argument(
+        "--skip-uvc-apply",
+        action="store_true",
+        help="Do not apply saved DirectShow UVC settings before opening cameras.",
+    )
+    parser.add_argument(
         "--threaded",
         action="store_true",
         help="Read/detect/solve each camera on its own worker thread.",
@@ -1247,6 +1283,13 @@ def main() -> int:
             f"{args.top_marker_label} must have the smallest image y value "
             f"(within {args.top_marker_margin_px:.1f}px)"
         )
+    if not args.skip_uvc_apply:
+        applied = camera_uvc_settings.apply_configured_camera_settings(
+            camera_ids=args.cameras,
+            dry_run=False,
+        )
+        print(f"[calibration] UVC controls applied before open: {applied}")
+
     sources = open_calibration_cameras(
         args.cameras,
         args.width,
@@ -1255,6 +1298,7 @@ def main() -> int:
         args.auto_exposure,
         args.exposure,
         args.gain,
+        preserve_uvc_controls=not args.skip_uvc_apply,
     )
 
     if not sources:
@@ -1289,10 +1333,22 @@ def main() -> int:
         source.camera_id: 0.0 for source in sources
     }
     last_print_time = 0.0
+    next_camera_settings_apply_time = 0.0
 
     try:
         while True:
             timestamp = time.time()
+            if timestamp >= next_camera_settings_apply_time:
+                next_camera_settings_apply_time = timestamp + CAMERA_SETTINGS_REAPPLY_INTERVAL_SECONDS
+                for source in sources:
+                    apply_camera_settings(
+                        source,
+                        args.auto_exposure,
+                        args.exposure,
+                        args.gain,
+                        preserve_uvc_controls=not args.skip_uvc_apply,
+                    )
+
             latest_observations: dict[int, list[mocap.MarkerObservation]] = {}
             latest_frames: dict[int, np.ndarray] = {}
 

@@ -18,7 +18,7 @@ from pygrabber.dshow_core import ICreateDevEnum, qedit
 from pygrabber.dshow_ids import DeviceCategories, clsids
 
 # To apply run the following command
-# .\.venv\Scripts\python.exe .\camera_tests\camera_uvc_settings.py --apply --camera-ids 0,2
+# .\.venv\Scripts\python.exe .\Test_Debug_Scripts\apply_camera_settings.py --apply --camera-ids 0,2
 
 AUTO_FLAG = 0x0001
 MANUAL_FLAG = 0x0002
@@ -1123,7 +1123,7 @@ def open_live_capture(cv2: Any, device: DirectShowCameraDevice, width: int, heig
 def run_live_tuner(args: argparse.Namespace) -> int:
     import cv2
     import numpy as np
-    import multithreaded_camera_testing as camera_settings_module
+    from jazzhands.mocap import multithreaded_camera_testing as camera_settings_module
 
     camera_ids = args.camera_ids or list(camera_settings_module.CAMERA_IDS)
     devices = enumerate_video_devices()

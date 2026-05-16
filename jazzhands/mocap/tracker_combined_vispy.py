@@ -24,7 +24,7 @@ except ImportError:  # Keep --help and py_compile usable without VisPy installed
     app = None
     scene = None
 
-import mocap_tracker as mocap
+from jazzhands.mocap import tracker as mocap
 
 
 # Set this to False to use mocap_calibration.json instead.

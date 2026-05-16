@@ -20,9 +20,9 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import fl_studio_debug_visualizer as fl_debug
-import mocap_tracker as mocap
-import mocap_tracker_combined_vispy as combined
+from jazzhands.mocap import tracker as mocap
+from jazzhands.mocap import tracker_combined_vispy as combined
+from jazzhands.visualizer import fl_studio_debug_visualizer as fl_debug
 
 
 DEFAULT_PREVIEW_HZ = 15.0

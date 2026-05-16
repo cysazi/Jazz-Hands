@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import math
 import os
 import re
@@ -23,7 +24,7 @@ from vispy.app import Timer
 from vispy.io import read_mesh
 from vispy.visuals.transforms import MatrixTransform
 
-from haptics_controller import HapticsController
+from jazzhands.haptics.controller import HapticsController
 
 try:
     import mido
@@ -31,14 +32,28 @@ except ImportError:
     mido = None
 
 
-CURRENT_FILEPATH = os.path.dirname(os.path.abspath(__file__))
-RIGHT_HAND_OBJ_PATH = os.path.join(CURRENT_FILEPATH, "Visualization_Tests", "hand.obj")
-LEFT_HAND_OBJ_PATH = os.path.join(CURRENT_FILEPATH, "Visualization_Tests", "lefthand.obj")
+PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ASSET_DIR = os.path.join(PACKAGE_DIR, "assets")
+RIGHT_HAND_OBJ_PATH = os.path.join(ASSET_DIR, "hand.obj")
+LEFT_HAND_OBJ_PATH = os.path.join(ASSET_DIR, "lefthand.obj")
 HAND_OBJ_PATH = RIGHT_HAND_OBJ_PATH
 HAND_OBJ_PATHS = {
     "LEFT": LEFT_HAND_OBJ_PATH,
     "RIGHT": RIGHT_HAND_OBJ_PATH,
 }
+
+
+@contextlib.contextmanager
+def suppress_native_stderr():
+    original_stderr_fd = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(original_stderr_fd, 2)
+        os.close(original_stderr_fd)
+        os.close(devnull_fd)
 
 KEYBOARD_CONTROLLED = False
 ENABLE_MIDI = True
@@ -230,11 +245,13 @@ class HandRuntimeState:
 def configure_vispy_backend() -> str:
     for backend in ("pyqt6", "pyside6", "tkinter"):
         try:
-            app.use_app(backend)
+            with suppress_native_stderr():
+                app.use_app(backend)
             return backend
         except Exception:
             continue
-    return app.use_app().backend_name
+    with suppress_native_stderr():
+        return app.use_app().backend_name
 
 
 def clamp_midi_channel_1_based(value: int, max_channel: int = 16) -> int:
@@ -303,6 +320,31 @@ def quaternion_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         ],
         dtype=np.float64,
     )
+
+
+def quat_to_euler(q: np.ndarray) -> tuple[float, float, float]:
+    w, x, y, z = normalize_quat(q)
+
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = math.copysign(math.pi / 2.0, sinp)
+    else:
+        pitch = math.asin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return roll, pitch, yaw
+
+
+def quat_to_euler_deg(q: np.ndarray) -> tuple[float, float, float]:
+    roll, pitch, yaw = quat_to_euler(q)
+    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 
 def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
@@ -382,13 +424,14 @@ class DualHandFLStudioVisualizer:
         }
         self.last_status_update_time = 0.0
 
-        self.canvas = scene.SceneCanvas(
-            keys="interactive",
-            show=show,
-            bgcolor="black",
-            size=(1280, 800),
-            title="Jazz Hands FL Studio Debug Visualizer",
-        )
+        with suppress_native_stderr():
+            self.canvas = scene.SceneCanvas(
+                keys="interactive",
+                show=show,
+                bgcolor="black",
+                size=(1280, 800),
+                title="Jazz Hands FL Studio Debug Visualizer",
+            )
         self.view = self.canvas.central_widget.add_view(border_color=(0.2, 0.2, 0.2, 1.0))
         self.view.camera = scene.cameras.TurntableCamera(
             fov=45,
@@ -596,7 +639,8 @@ class DualHandFLStudioVisualizer:
             model_path = HAND_OBJ_PATHS[label]
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Could not find {label.lower()} hand model: {model_path}")
-            vertices, faces, _normals, _texcoords = read_mesh(model_path)
+            with suppress_native_stderr():
+                vertices, faces, _normals, _texcoords = read_mesh(model_path)
             vertices = center_mesh_vertices(vertices)
             mesh = scene.visuals.Mesh(
                 vertices=vertices,

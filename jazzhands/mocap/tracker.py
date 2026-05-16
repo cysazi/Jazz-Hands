@@ -21,8 +21,10 @@ calibration data before trusting the reported 3D positions.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -36,8 +38,27 @@ try:
 except ImportError:  # Keep --help and py_compile usable without OpenCV installed.
     cv2 = None
 
+if cv2 is not None:
+    try:
+        cv2.setLogLevel(0)
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def suppress_native_stderr():
+    original_stderr_fd = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(original_stderr_fd, 2)
+        os.close(original_stderr_fd)
+        os.close(devnull_fd)
+
 try:
-    import multithreaded_camera_testing as camera_settings
+    from jazzhands.mocap import multithreaded_camera_testing as camera_settings
 except ImportError:  # Keep this script usable if the test helper is copied alone.
     camera_settings = None
 
@@ -553,6 +574,7 @@ class CameraSource:
         auto_exposure: float | None,
         gain: float | None,
         configure_capture: bool = True,
+        configure_controls: bool = True,
     ):
         self.camera_id = camera_id
         self.width = width
@@ -562,11 +584,13 @@ class CameraSource:
         self.auto_exposure = auto_exposure
         self.gain = gain
         self.configure_capture = configure_capture
+        self.configure_controls = configure_controls
         self.capture = None
         self._last_read_error_print_time = 0.0
 
     def open(self) -> bool:
-        capture = cv2.VideoCapture(self.camera_id)
+        with suppress_native_stderr():
+            capture = cv2.VideoCapture(self.camera_id)
         if not capture.isOpened():
             capture.release()
             return False
@@ -607,23 +631,30 @@ class CameraSource:
             return
 
         if camera_settings is not None:
-            camera_settings.apply_camera_capture_settings(
-                self.capture,
-                self.camera_id,
-                width=self.width,
-                height=self.height,
-                fps=self.fps,
-                exposure=self.exposure,
-                auto_exposure=self.auto_exposure,
-                gain=self.gain,
-            )
+            if self.configure_controls:
+                camera_settings.apply_camera_capture_settings(
+                    self.capture,
+                    self.camera_id,
+                    width=self.width,
+                    height=self.height,
+                    fps=self.fps,
+                    exposure=self.exposure,
+                    auto_exposure=self.auto_exposure,
+                    gain=self.gain,
+                )
+            else:
+                self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                self.capture.set(cv2.CAP_PROP_FPS, self.fps)
             return
 
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.capture.set(cv2.CAP_PROP_FPS, self.fps)
-        self.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
+        if not self.configure_controls:
+            return
 
+        self.capture.set(cv2.CAP_PROP_AUTOFOCUS, DEFAULT_AUTOFOCUS)
         if self.auto_exposure is not None:
             self.capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(self.auto_exposure))
         if self.exposure is not None:

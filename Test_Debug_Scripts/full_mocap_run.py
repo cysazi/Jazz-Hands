@@ -23,15 +23,16 @@ from pathlib import Path
 from tkinter import ttk
 
 
-CAMERA_TESTS_DIR = Path(__file__).resolve().parent
-DEFAULT_SETTINGS_JSON = CAMERA_TESTS_DIR / "camera_uvc_settings_values.json"
-DEFAULT_CALIBRATION_JSON = CAMERA_TESTS_DIR / "mocap_calibration.json"
-DEFAULT_ALIGNED_JSON = CAMERA_TESTS_DIR / "mocap_calibration_aligned.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+MOCAP_DIR = SCRIPT_DIR.parent / "jazzhands" / "mocap"
+DEFAULT_SETTINGS_JSON = MOCAP_DIR / "camera_uvc_settings_values.json"
+DEFAULT_CALIBRATION_JSON = MOCAP_DIR / "mocap_calibration.json"
+DEFAULT_ALIGNED_JSON = MOCAP_DIR / "mocap_calibration_aligned.json"
 DEFAULT_CAMERA_IDS = "1,2"
 
-UVC_SCRIPT = CAMERA_TESTS_DIR / "camera_uvc_settings.py"
-CALIBRATION_SCRIPT = CAMERA_TESTS_DIR / "calibrate_mocap_cameras.py"
-ALIGNMENT_SCRIPT = CAMERA_TESTS_DIR / "mocap_movement_alignment.py"
+UVC_SCRIPT = SCRIPT_DIR / "apply_camera_settings.py"
+CALIBRATION_SCRIPT = SCRIPT_DIR / "calibrate_mocap_cameras.py"
+ALIGNMENT_SCRIPT = SCRIPT_DIR / "align_mocap_movement.py"
 
 
 @dataclass(slots=True)
@@ -294,7 +295,7 @@ class FullMocapRunApp:
         env["PYTHONUNBUFFERED"] = "1"
         process = subprocess.Popen(
             command,
-            cwd=str(CAMERA_TESTS_DIR),
+            cwd=str(SCRIPT_DIR),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -373,7 +374,7 @@ def run_console(args: argparse.Namespace) -> int:
         command = command_for_step(step, config)
         print(f"\n[{FullMocapRunApp.STEP_TITLES[step]}]")
         print(display_command(command))
-        completed = subprocess.run(command, cwd=str(CAMERA_TESTS_DIR))
+        completed = subprocess.run(command, cwd=str(SCRIPT_DIR))
         if completed.returncode != 0:
             return int(completed.returncode)
     return 0

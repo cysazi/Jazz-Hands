@@ -5,11 +5,11 @@
 const uint16_t PACKET_HEADER = 0xAAAA;
 const uint16_t HAPTICS_COMMAND_HEADER = 0xCC33;
 const uint8_t ESPNOW_WIFI_CHANNEL = 11;
-const uint32_t SERIAL_BAUD = 921600;
+const uint32_t SERIAL_BAUD = 115200;
 const bool DEBUG_SERIAL = false;
 
-uint8_t LEFT_GLOVE_MAC[6] = {0x34, 0x98, 0x7A, 0x74, 0x39, 0x00};
-uint8_t RIGHT_GLOVE_MAC[6] = {0x34, 0x98, 0x7A, 0x73, 0x75, 0xB8};
+uint8_t LEFT_GLOVE_MAC[6] = {0x34, 0x98, 0x7A, 0x73, 0x93, 0x14};
+uint8_t RIGHT_GLOVE_MAC[6] = {0x34, 0x98, 0x7A, 0x74, 0x39, 0x00};
 
 typedef struct __attribute__((packed)) {
   uint16_t header;

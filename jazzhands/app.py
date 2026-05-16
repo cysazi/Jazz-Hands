@@ -31,10 +31,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import fl_studio_debug_visualizer as fl_debug
-import mocap_tracker as mocap
-import mocap_tracker_combined_vispy as combined
-from haptics_controller import HapticsController
+from jazzhands.haptics.controller import HapticsController
+from jazzhands.mocap import tracker as mocap
+from jazzhands.mocap import tracker_combined_vispy as combined
+from jazzhands.visualizer import fl_studio_debug_visualizer as fl_debug
 
 
 DEFAULT_PREVIEW_HZ = 15.0
@@ -49,7 +49,7 @@ IMU_PLANE_DRAW_HAND_LABEL = "RIGHT"
 IMU_CHANNEL_CYCLE_HAND_LABEL = "LEFT"
 IMU_CHANNEL_CYCLE_TARGET_HAND_LABEL = "CONTROLLED"
 IMU_SERIAL_PORT: str | None = None
-IMU_SERIAL_BAUD = 921600
+IMU_SERIAL_BAUD = 115200
 IMU_PACKET_STALE_SECONDS = 0.25
 
 IMU_PACKET_HEADER = 0xAAAA
@@ -2001,9 +2001,9 @@ class MocapPlayingTestApp:
             mocap.cv2.destroyAllWindows()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.list_scales:
         print("Available scales:")
         for scale_name in sorted(SCALE_INTERVALS):
