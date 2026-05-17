@@ -1001,18 +1001,8 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
         if not state.tracking_active:
             return
 
-        axis_index = ROTATION_AXIS_TO_EULER_INDEX[self.left_velocity_axis]
-        velocity_angle = float(state.rotation_euler[axis_index])
-        volume_pct = self._rotation_pct(
-            velocity_angle,
-            self.left_velocity_min_degrees,
-            self.left_velocity_max_degrees,
-        )
-        if self.invert_left_velocity:
-            volume_pct = 100.0 - volume_pct
-        volume_value = int(np.clip(round((volume_pct / 100.0) * 127.0), 1, 127))
-        state.volume_value = volume_value
-        self.current_attack_value = volume_value
+        state.volume_value = 127
+        self.current_attack_value = 127
 
         right_channel = self.midi_channels["RIGHT"]
         if state.volume_value != self.current_volume_value:
@@ -1335,6 +1325,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Require the marker to stay inside the drawn plane bounds before notes play.",
     )
     parser.add_argument("--verbose-overlay", action="store_true", help="Show the full diagnostic VisPy text overlay.")
+    parser.add_argument(
+        "--performance-mode",
+        action="store_true",
+        help="Mirror the 3D visualizer for a TV/projector placed behind the performers.",
+    )
     return parser
 
 
@@ -1419,6 +1414,7 @@ class MocapPlayingTestApp:
             controlled_hand_label=args.controlled_hand,
             allow_hand_switching=False,
             verbose_overlay=args.verbose_overlay,
+            performance_mode=args.performance_mode,
             update_hz=args.visualizer_hz,
             start_timer=False,
             show=True,

@@ -60,7 +60,7 @@ KEYBOARD_CONTROLLED = False
 ENABLE_MIDI = True
 MIDI_OUTPUT_HINT = "JazzHands (A)"
 MIDI_BASE_NOTE = 60
-MIDI_VELOCITY = 96
+MIDI_VELOCITY = 127
 HAND_MIDI_CHANNELS_1_BASED = {"LEFT": 1, "RIGHT": 1}
 DEFAULT_MAX_MIDI_CHANNEL = 4
 ENABLE_HAPTICS = True
@@ -129,6 +129,7 @@ GESTURE_ROLL_DELTA_THRESHOLD_DEG = 40.0
 GESTURE_ROLL_RATE_THRESHOLD_DPS = 360.0
 GESTURE_WINDOW_MS = 220
 GESTURE_COOLDOWN_MS = 300
+NOTE_GLOW_DURATION_SECONDS = 0.55
 
 FRAME_MAP = np.array(
     [
@@ -161,10 +162,10 @@ def center_mesh_vertices(vertices: np.ndarray) -> np.ndarray:
 MODEL_OFFSET = rot_x(-90.0)
 HAND_VISUAL_OFFSETS = {
     "LEFT": np.eye(3, dtype=np.float32),
-    "RIGHT": rot_z(180.0),
+    "RIGHT": rot_x(180.0) @ rot_z(180.0),
 }
 HAND_MODEL_OFFSETS = {
-    "LEFT": rot_z(180.0),
+    "LEFT": np.eye(3, dtype=np.float32),
     "RIGHT": np.eye(3, dtype=np.float32),
 }
 
@@ -379,6 +380,7 @@ class DualHandFLStudioVisualizer:
         controlled_hand_label: str = "LEFT",
         allow_hand_switching: bool = True,
         verbose_overlay: bool = False,
+        performance_mode: bool = False,
         update_hz: float = 120.0,
         start_timer: bool = True,
         show: bool = True,
@@ -416,6 +418,7 @@ class DualHandFLStudioVisualizer:
         self.keyboard_buttons_enabled = bool(keyboard_buttons_enabled)
         self.allow_hand_switching = bool(allow_hand_switching)
         self.verbose_overlay = bool(verbose_overlay)
+        self.performance_mode = bool(performance_mode)
         self.start_timer = bool(start_timer)
 
         self.hand_labels = ("LEFT", "RIGHT")
@@ -444,15 +447,21 @@ class DualHandFLStudioVisualizer:
             )
         self.view = self.canvas.central_widget.add_view(border_color=(0.2, 0.2, 0.2, 1.0))
         self.view.camera = scene.cameras.TurntableCamera(
-            fov=45,
-            distance=3.0,
-            elevation=25.0,
-            azimuth=-35.0,
+            fov=35,
+            distance=3.3,
+            elevation=42.0,
+            azimuth=-90.0,
             center=(0, 0, 0),
         )
-        scene.visuals.GridLines(scale=(0.25, 0.25), color=(0.25, 0.25, 0.25, 1.0), parent=self.view.scene)
-        scene.visuals.XYZAxis(width=2, parent=self.view.scene)
-        self._add_axis_labels(self.view)
+        self.world_scene = scene.Node(parent=self.view.scene)
+        self.world_scene.transform = MatrixTransform()
+        if self.performance_mode:
+            transform = np.eye(4, dtype=np.float32)
+            transform[0, 0] = -1.0
+            self.world_scene.transform.matrix = transform
+        scene.visuals.GridLines(scale=(0.25, 0.25), color=(0.25, 0.25, 0.25, 1.0), parent=self.world_scene)
+        scene.visuals.XYZAxis(width=2, parent=self.world_scene)
+        self._add_axis_labels(self.world_scene)
         self.hand_meshes = {}
         self._setup_hand_meshes()
         self.plane_meshes: dict[str, object] = {}
@@ -463,19 +472,41 @@ class DualHandFLStudioVisualizer:
         self.stacked_plane_section_lines: dict[tuple[str, int], list[object]] = {}
         self.status_text = scene.visuals.Text(
             "",
-            color="white",
-            font_size=8,
-            pos=(10, 10),
-            anchor_x="left",
+            color=(1.0, 0.96, 0.78, 1.0),
+            font_size=34,
+            bold=True,
+            pos=(640, 58),
+            anchor_x="center",
             anchor_y="bottom",
             parent=self.canvas.scene,
         )
+        self.note_shadow_text = scene.visuals.Text(
+            "",
+            color=(0.3, 0.85, 1.0, 0.22),
+            font_size=42,
+            bold=True,
+            pos=(640, 56),
+            anchor_x="center",
+            anchor_y="bottom",
+            parent=self.canvas.scene,
+        )
+        self.hit_glow_mesh = scene.visuals.Mesh(
+            vertices=np.zeros((4, 3), dtype=np.float32),
+            faces=PLANE_FACES,
+            color=(0.6, 0.95, 1.0, 0.0),
+            shading=None,
+            parent=self.world_scene,
+        )
+        self.hit_glow_mesh.visible = False
+        self.last_right_can_play = False
+        self.hit_glow_start_time: float | None = None
+        self.hit_glow_definition: PlaneDefinition | None = None
 
         self.midi_out = None
         self.midi_output_name: str | None = None
         self.active_midi_notes: dict[str, int | None] = {"LEFT": None, "RIGHT": None}
         self.current_volume_value = 0
-        self.current_attack_value = self.midi_velocity
+        self.current_attack_value = 127
         self.current_reverb_value = 0
         self.current_pan_value = PAN_CENTER_VALUE
         self.current_pan_section_index: int | None = None
@@ -706,10 +737,10 @@ class DualHandFLStudioVisualizer:
             raise ValueError(f"unknown hand label: {label!r}")
         return normalized
 
-    def _add_axis_labels(self, view) -> None:
-        scene.visuals.Text("X", color="red", font_size=18, pos=(1.25, 0, 0), parent=view.scene)
-        scene.visuals.Text("Y", color="green", font_size=18, pos=(0, 1.25, 0), parent=view.scene)
-        scene.visuals.Text("Z", color="blue", font_size=18, pos=(0, 0, 1.25), parent=view.scene)
+    def _add_axis_labels(self, parent) -> None:
+        scene.visuals.Text("X", color="red", font_size=18, pos=(1.25, 0, 0), parent=parent)
+        scene.visuals.Text("Y", color="green", font_size=18, pos=(0, 1.25, 0), parent=parent)
+        scene.visuals.Text("Z", color="blue", font_size=18, pos=(0, 0, 1.25), parent=parent)
 
     def _setup_hand_meshes(self) -> None:
         colors = {
@@ -728,7 +759,7 @@ class DualHandFLStudioVisualizer:
                 faces=faces,
                 color=colors[label],
                 shading=None,
-                parent=self.view.scene,
+                parent=self.world_scene,
             )
             mesh.transform = MatrixTransform()
             self.hand_meshes[label] = mesh
@@ -954,6 +985,7 @@ class DualHandFLStudioVisualizer:
         self._update_left_controls()
         self._update_right_stereo_control()
         self._update_right_instrument_gesture()
+        self._update_hit_glow()
         for label in self.hand_labels:
             self._update_hand_visual(label)
 
@@ -1096,7 +1128,7 @@ class DualHandFLStudioVisualizer:
                 faces=PLANE_FACES,
                 color=(0.25, 0.85, 1.0, 0.0),
                 shading=None,
-                parent=self.view.scene,
+                parent=self.world_scene,
             )
             mesh.visible = False
             self.plane_meshes[label] = mesh
@@ -1107,7 +1139,7 @@ class DualHandFLStudioVisualizer:
                 color=(0.75, 0.95, 1.0, 0.0),
                 width=2,
                 method="gl",
-                parent=self.view.scene,
+                parent=self.world_scene,
             )
             outline.visible = False
             self.plane_outlines[label] = outline
@@ -1118,7 +1150,7 @@ class DualHandFLStudioVisualizer:
                 color=(0.75, 0.95, 1.0, 0.0),
                 width=1,
                 method="gl",
-                parent=self.view.scene,
+                parent=self.world_scene,
             )
             line.visible = False
             self.plane_section_lines[label].append(line)
@@ -1191,7 +1223,7 @@ class DualHandFLStudioVisualizer:
                 faces=PLANE_FACES,
                 color=(0.25, 0.85, 1.0, 0.0),
                 shading=None,
-                parent=self.view.scene,
+                parent=self.world_scene,
             )
             mesh.visible = False
             self.stacked_plane_meshes[key] = mesh
@@ -1202,7 +1234,7 @@ class DualHandFLStudioVisualizer:
                 color=(0.75, 0.95, 1.0, 0.0),
                 width=2,
                 method="gl",
-                parent=self.view.scene,
+                parent=self.world_scene,
             )
             outline.visible = False
             self.stacked_plane_outlines[key] = outline
@@ -1214,7 +1246,7 @@ class DualHandFLStudioVisualizer:
                 color=(0.75, 0.95, 1.0, 0.0),
                 width=1,
                 method="gl",
-                parent=self.view.scene,
+                parent=self.world_scene,
             )
             line.visible = False
             lines.append(line)
@@ -1479,18 +1511,8 @@ class DualHandFLStudioVisualizer:
         if not state.tracking_active:
             return
 
-        axis_index = ROTATION_AXIS_TO_EULER_INDEX[self.left_velocity_axis]
-        velocity_angle = float(state.rotation_euler[axis_index])
-        volume_pct = self._rotation_pct(
-            velocity_angle,
-            self.left_velocity_min_degrees,
-            self.left_velocity_max_degrees,
-        )
-        if self.invert_left_velocity:
-            volume_pct = 100.0 - volume_pct
-        volume_value = int(np.clip(round((volume_pct / 100.0) * 127.0), 1, 127))
-        state.volume_value = volume_value
-        self.current_attack_value = volume_value
+        state.volume_value = 127
+        self.current_attack_value = 127
 
         right_channel = self.midi_channels["RIGHT"]
         if state.volume_value != self.current_volume_value:
@@ -1587,6 +1609,7 @@ class DualHandFLStudioVisualizer:
             state.preview_note_index = None
             state.last_note_name = "tracking lost"
             state.is_on_play_side = False
+            self.last_right_can_play = False
             self._update_midi_note("RIGHT", None)
             return
 
@@ -1594,6 +1617,7 @@ class DualHandFLStudioVisualizer:
             state.active_note_index = None
             state.preview_note_index = None
             state.last_note_name = "inactive"
+            self.last_right_can_play = False
             self._update_midi_note("RIGHT", None)
             return
 
@@ -1611,6 +1635,9 @@ class DualHandFLStudioVisualizer:
             and state.is_on_play_side
             and (inside or not self.require_inside_plane_to_play)
         )
+        if can_play and not self.last_right_can_play:
+            self._trigger_note_glow(state.plane)
+        self.last_right_can_play = can_play
         state.active_note_index = self.selected_note_offset if can_play else None
         if self.selected_note_offset is not None and state.preview_note_index != self.selected_note_offset:
             self.haptics.pulse("RIGHT", HAPTICS_NOTE_INTENSITY, HAPTICS_NOTE_DURATION_MS)
@@ -1627,6 +1654,43 @@ class DualHandFLStudioVisualizer:
         self.current_pan_section_index = section_index
         self.current_pan_section_name = pan_name
         self._update_midi_note("RIGHT", state.active_note_index)
+
+    def _trigger_note_glow(self, definition: PlaneDefinition | None) -> None:
+        if definition is None:
+            return
+        self.hit_glow_definition = definition
+        self.hit_glow_start_time = time.time()
+        self._update_hit_glow()
+
+    def _update_hit_glow(self) -> None:
+        if self.hit_glow_start_time is None or self.hit_glow_definition is None:
+            self.hit_glow_mesh.visible = False
+            return
+
+        elapsed = time.time() - self.hit_glow_start_time
+        progress = elapsed / NOTE_GLOW_DURATION_SECONDS
+        if progress >= 1.0:
+            self.hit_glow_mesh.visible = False
+            self.hit_glow_start_time = None
+            return
+
+        definition = self.hit_glow_definition
+        expanded = PlaneDefinition(
+            center=definition.center.copy(),
+            axis_u=definition.axis_u,
+            axis_v=definition.axis_v,
+            normal_axis=definition.normal_axis,
+            half_u=definition.half_u * (1.08 + 0.18 * progress),
+            half_v=definition.half_v * (1.08 + 0.18 * progress),
+        )
+        vertices = self._plane_vertices(expanded) * POSITION_SCALE
+        alpha = 0.42 * (1.0 - progress) ** 1.4
+        self.hit_glow_mesh.set_data(
+            vertices=vertices,
+            faces=PLANE_FACES,
+            color=(0.62, 0.95, 1.0, alpha),
+        )
+        self.hit_glow_mesh.visible = True
 
     def _update_hand_visual(self, label: str) -> None:
         state = self.hands[label]
@@ -1716,28 +1780,10 @@ class DualHandFLStudioVisualizer:
         )
 
     def _update_compact_status_text(self) -> None:
-        midi_text = self.midi_output_name if self.midi_output_name else "MIDI off"
-        right_channel_1_based = self.midi_channels["RIGHT"] + 1
-        left = self.hands["LEFT"]
-        right = self.hands["RIGHT"]
-        left_plane = "set" if left.plane is not None else ("drawing" if left.drawing else "none")
-        right_plane = "set" if right.plane is not None else ("drawing" if right.drawing else "none")
         active_note = self.active_midi_notes["RIGHT"]
-        active_note_text = midi_note_name(active_note) if active_note is not None else "-"
-        controls = (
-            f"SPACE draw | C clear | TAB hand | velocity LEFT {self.left_velocity_axis} "
-            f"({ROTATION_AXIS_KEY_HINTS[self.left_velocity_axis]})"
-            if self.keyboard_controlled
-            else f"velocity LEFT {self.left_velocity_axis}"
-        )
-        self.status_text.text = "\n".join(
-            [
-                f"{self.scale_name} page={self.octave_offset:+d} selected={self.selected_note_name} velocity={self.current_attack_value}",
-                f"LEFT note={left.last_note_name} button={'DOWN' if left.button_pressed else 'UP'} plane={left_plane}",
-                f"RIGHT note={right.last_note_name} button={'DOWN' if right.button_pressed else 'UP'} plane={right_plane} pan={self.current_pan_value} {self.current_pan_section_name} playing={active_note_text} ch={right_channel_1_based}",
-                f"{midi_text} | {controls}",
-            ]
-        )
+        note_text = midi_note_name(active_note) if active_note is not None else ""
+        self.status_text.text = note_text
+        self.note_shadow_text.text = note_text
 
     def on_close(self, _event=None) -> None:
         self.close()
@@ -1795,6 +1841,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-haptics", action="store_true")
     parser.add_argument("--require-inside-plane", action="store_true")
     parser.add_argument("--verbose-overlay", action="store_true", help="Show the full diagnostic VisPy text overlay.")
+    parser.add_argument(
+        "--performance-mode",
+        action="store_true",
+        help="Mirror the 3D visualizer for a TV/projector placed behind the performers.",
+    )
     parser.add_argument("--update-hz", type=float, default=120.0)
     return parser
 
@@ -1825,6 +1876,7 @@ def main() -> int:
         haptics_baud=args.haptics_baud,
         require_inside_plane_to_play=args.require_inside_plane,
         verbose_overlay=args.verbose_overlay,
+        performance_mode=args.performance_mode,
         update_hz=args.update_hz,
     )
 
