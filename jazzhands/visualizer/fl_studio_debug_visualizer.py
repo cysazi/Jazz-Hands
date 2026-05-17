@@ -129,13 +129,18 @@ MIN_OCTAVE_OFFSET = -4
 MAX_OCTAVE_OFFSET = 4
 STACKED_PLANE_OCTAVES = (-1, 0, 1)
 BUTTON_HOLD_CLEAR_SECONDS = 5.0
-LEFT_VELOCITY_AXIS_DEFAULT = "pitch"
+LEFT_VELOCITY_AXIS_DEFAULT = "roll"
 LEFT_VELOCITY_MIN_DEG = -60.0
 LEFT_VELOCITY_MAX_DEG = 60.0
 ROTATION_AXIS_TO_EULER_INDEX = {
     "roll": 0,
     "pitch": 1,
     "yaw": 2,
+}
+ROTATION_AXIS_KEY_HINTS = {
+    "roll": "U/O",
+    "pitch": "I/K",
+    "yaw": "J/L",
 }
 AXIS_NAMES = ("X", "Y", "Z")
 WORLD_UP_AXIS = 2
@@ -355,6 +360,29 @@ def quat_to_euler_deg(q: np.ndarray) -> tuple[float, float, float]:
     return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 
+def euler_deg_to_quat(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+    roll = math.radians(float(roll_deg))
+    pitch = math.radians(float(pitch_deg))
+    yaw = math.radians(float(yaw_deg))
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+    return normalize_quat(
+        np.array(
+            [
+                cr * cp * cy + sr * sp * sy,
+                sr * cp * cy - cr * sp * sy,
+                cr * sp * cy + sr * cp * sy,
+                cr * cp * sy - sr * sp * cy,
+            ],
+            dtype=np.float64,
+        )
+    )
+
+
 def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
     w, x, y, z = normalize_quat(q)
     xx, yy, zz = x * x, y * y, z * z
@@ -393,6 +421,7 @@ class DualHandFLStudioVisualizer:
         keyboard_buttons_enabled: bool = True,
         controlled_hand_label: str = "LEFT",
         allow_hand_switching: bool = True,
+        verbose_overlay: bool = False,
         update_hz: float = 120.0,
         start_timer: bool = True,
         show: bool = True,
@@ -424,6 +453,7 @@ class DualHandFLStudioVisualizer:
         self.require_inside_plane_to_play = bool(require_inside_plane_to_play)
         self.keyboard_buttons_enabled = bool(keyboard_buttons_enabled)
         self.allow_hand_switching = bool(allow_hand_switching)
+        self.verbose_overlay = bool(verbose_overlay)
         self.start_timer = bool(start_timer)
 
         self.hand_labels = ("LEFT", "RIGHT")
@@ -522,11 +552,15 @@ class DualHandFLStudioVisualizer:
 
     def scale_status_text(self) -> str:
         axis_index = ROTATION_AXIS_TO_EULER_INDEX[self.left_velocity_axis]
-        left_angle = float(self.hands["LEFT"].rotation_euler[axis_index])
+        left_state = self.hands["LEFT"]
+        left_angle = float(left_state.rotation_euler[axis_index])
+        roll, pitch, yaw = (float(value) for value in left_state.rotation_euler)
         return (
             f"{self.scale_name} middle={midi_note_name(self.midi_base_note)} "
             f"octave={self.octave_offset:+d} selected={self.selected_note_name} "
-            f"velocity={self.current_attack_value} {self.left_velocity_axis}={left_angle:+.1f}deg"
+            f"velocity={self.current_attack_value} {self.left_velocity_axis}={left_angle:+.1f}deg "
+            f"left_rpy=({roll:+.1f},{pitch:+.1f},{yaw:+.1f}) "
+            f"keys={ROTATION_AXIS_KEY_HINTS[self.left_velocity_axis]}"
         )
 
     def set_scale(self, scale_name: str) -> None:
@@ -909,20 +943,10 @@ class DualHandFLStudioVisualizer:
                 state.position = state.position + state.velocity * dt
 
                 angular_velocity = self.angular_velocity_vectors[label]
-                rotation_angle = float(np.linalg.norm(angular_velocity) * dt)
-                if rotation_angle > 1e-9 and dt > 0.0:
-                    rotation_axis = angular_velocity / (rotation_angle / dt)
-                    half_angle = rotation_angle / 2.0
-                    delta_q = np.array(
-                        [
-                            math.cos(half_angle),
-                            *(rotation_axis * math.sin(half_angle)),
-                        ],
-                        dtype=np.float64,
-                    )
-                    state.rotation_quaternion = normalize_quat(
-                        quaternion_multiply(delta_q, state.rotation_quaternion)
-                    )
+                if float(np.linalg.norm(angular_velocity)) > 1e-9 and dt > 0.0:
+                    state.rotation_euler = state.rotation_euler + np.degrees(angular_velocity * dt)
+                    state.rotation_euler = ((state.rotation_euler + 180.0) % 360.0) - 180.0
+                    state.rotation_quaternion = euler_deg_to_quat(*state.rotation_euler)
             else:
                 state.velocity = np.zeros(3, dtype=np.float64)
 
@@ -1431,6 +1455,10 @@ class DualHandFLStudioVisualizer:
         self.hand_meshes[label].transform.matrix = transform
 
     def _update_status_text(self) -> None:
+        if not self.verbose_overlay:
+            self._update_compact_status_text()
+            return
+
         lines = []
         keyboard_channel_max = min(self.max_midi_channel, 9)
         channel_key_text = (
@@ -1461,7 +1489,8 @@ class DualHandFLStudioVisualizer:
         if self.keyboard_controlled:
             controls = (
                 "Keyboard ON: TAB hand, WASDQE move, IJKLUO rotate, SPACE draw, "
-                f"C clear, F flip play side, arrows adjust steps, {channel_key_text}"
+                f"C clear, F flip play side, arrows adjust steps, {channel_key_text} | "
+                f"velocity uses LEFT {self.left_velocity_axis} ({ROTATION_AXIS_KEY_HINTS[self.left_velocity_axis]})"
             )
         else:
             controls = (
@@ -1489,6 +1518,30 @@ class DualHandFLStudioVisualizer:
                 ),
                 f"move_step={self.velocity_step:.2f} rotate_step={self.rotation_step:.2f} volume={self.current_volume_value} attack={self.current_attack_value} reverb={self.current_reverb_value}",
                 controls,
+            ]
+        )
+
+    def _update_compact_status_text(self) -> None:
+        midi_text = self.midi_output_name if self.midi_output_name else "MIDI off"
+        right_channel_1_based = self.midi_channels["RIGHT"] + 1
+        left = self.hands["LEFT"]
+        right = self.hands["RIGHT"]
+        left_plane = "set" if left.plane is not None else ("drawing" if left.drawing else "none")
+        right_plane = "set" if right.plane is not None else ("drawing" if right.drawing else "none")
+        active_note = self.active_midi_notes["RIGHT"]
+        active_note_text = midi_note_name(active_note) if active_note is not None else "-"
+        controls = (
+            f"SPACE draw | C clear | TAB hand | velocity LEFT {self.left_velocity_axis} "
+            f"({ROTATION_AXIS_KEY_HINTS[self.left_velocity_axis]})"
+            if self.keyboard_controlled
+            else f"velocity LEFT {self.left_velocity_axis}"
+        )
+        self.status_text.text = "\n".join(
+            [
+                f"{self.scale_name} octave={self.octave_offset:+d} selected={self.selected_note_name} velocity={self.current_attack_value}",
+                f"LEFT note={left.last_note_name} button={'DOWN' if left.button_pressed else 'UP'} plane={left_plane}",
+                f"RIGHT note={right.last_note_name} button={'DOWN' if right.button_pressed else 'UP'} plane={right_plane} playing={active_note_text} ch={right_channel_1_based}",
+                f"{midi_text} | {controls}",
             ]
         )
 
@@ -1547,6 +1600,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--haptics-baud", type=int, default=HAPTICS_BAUD)
     parser.add_argument("--no-haptics", action="store_true")
     parser.add_argument("--require-inside-plane", action="store_true")
+    parser.add_argument("--verbose-overlay", action="store_true", help="Show the full diagnostic VisPy text overlay.")
     parser.add_argument("--update-hz", type=float, default=120.0)
     return parser
 
@@ -1576,6 +1630,7 @@ def main() -> int:
         haptics_port=args.haptics_port,
         haptics_baud=args.haptics_baud,
         require_inside_plane_to_play=args.require_inside_plane,
+        verbose_overlay=args.verbose_overlay,
         update_hz=args.update_hz,
     )
 

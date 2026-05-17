@@ -82,7 +82,7 @@ BUTTON_HOLD_CLEAR_SECONDS = 5.0
 MIN_OCTAVE_OFFSET = -4
 MAX_OCTAVE_OFFSET = 4
 STACKED_PLANE_OCTAVES = (-1, 0, 1)
-LEFT_VELOCITY_AXIS_DEFAULT = "pitch"
+LEFT_VELOCITY_AXIS_DEFAULT = "roll"
 LEFT_VELOCITY_MIN_DEG = -60.0
 LEFT_VELOCITY_MAX_DEG = 60.0
 ROTATION_AXIS_TO_EULER_INDEX = {
@@ -1375,6 +1375,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Require the marker to stay inside the drawn plane bounds before notes play.",
     )
+    parser.add_argument("--verbose-overlay", action="store_true", help="Show the full diagnostic VisPy text overlay.")
     return parser
 
 
@@ -1458,6 +1459,7 @@ class MocapPlayingTestApp:
             require_inside_plane_to_play=args.require_inside_plane,
             controlled_hand_label=args.controlled_hand,
             allow_hand_switching=False,
+            verbose_overlay=args.verbose_overlay,
             update_hz=args.visualizer_hz,
             start_timer=False,
             show=True,
