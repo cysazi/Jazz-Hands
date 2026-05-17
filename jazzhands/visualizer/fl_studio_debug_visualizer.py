@@ -1039,7 +1039,7 @@ class DualHandFLStudioVisualizer:
 
         if released_edge:
             if not self.button_clear_consumed[label]:
-                self.adjust_octave(1 if label == "LEFT" else -1)
+                self.adjust_octave(-1 if label == "LEFT" else 1)
             self.button_press_times[label] = None
             self.button_clear_consumed[label] = False
 
