@@ -82,6 +82,10 @@ BUTTON_HOLD_CLEAR_SECONDS = 5.0
 MIN_OCTAVE_OFFSET = -4
 MAX_OCTAVE_OFFSET = 4
 STACKED_PLANE_OCTAVES = (-1, 0, 1)
+LEFT_NOTE_PITCH_MIN_DEG = -60.0
+LEFT_NOTE_PITCH_MAX_DEG = 60.0
+LEFT_VOLUME_ROLL_MIN_DEG = -90.0
+LEFT_VOLUME_ROLL_MAX_DEG = 90.0
 
 NOTE_TO_SEMITONE = {
     "C": 0,
@@ -798,8 +802,6 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
             print(f"[{label}] plane cleared after {self.button_hold_clear_seconds:.1f}s hold")
 
         if released_edge:
-            if not self.button_clear_consumed[label]:
-                self.adjust_octave(1 if label == "LEFT" else -1)
             self.button_press_times[label] = None
             self.button_clear_consumed[label] = False
 
@@ -950,23 +952,28 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
             octave_index,
         )
 
-    def _note_offset_from_left_position(self) -> tuple[int | None, str, float, int]:
+    def _rotation_pct(self, value: float, min_degrees: float, max_degrees: float) -> float:
+        span = max(float(max_degrees) - float(min_degrees), 1e-6)
+        return float(np.clip((float(value) - float(min_degrees)) / span, 0.0, 1.0) * 100.0)
+
+    def _note_offset_from_left_rotation(self) -> tuple[int | None, str, float, int]:
         state = self.hands["LEFT"]
-        if not state.tracking_active or state.plane is None:
+        if not state.tracking_active:
             return None, "none", 0.0, 0
-        note_pct, _other_pct, inside, octave_index = self._stacked_plane_position_metrics(state.position, state.plane)
-        note_axis, _note_half, _other_axis, _other_half = self._note_axis_and_half_extent(state.plane)
+
+        note_pitch = float(state.rotation_euler[1])
+        note_pct = self._rotation_pct(note_pitch, LEFT_NOTE_PITCH_MIN_DEG, LEFT_NOTE_PITCH_MAX_DEG)
+        octave_index = 0
         section_index = min(int((note_pct / 100.0) * self.section_count), self.section_count - 1)
         semitone_offset = self.scale_intervals[section_index] + (12 * octave_index)
         midi_note = int(np.clip(self.midi_base_note + semitone_offset, 0, 127))
         note_name = midi_note_name(midi_note)
-        if not inside and self.require_inside_plane_to_play:
-            return None, f"outside {note_name}", note_pct, octave_index
-        return semitone_offset, f"{note_name} {fl_debug.AXIS_NAMES[note_axis]}={note_pct:5.1f}%", note_pct, octave_index
+        return semitone_offset, f"{note_name} pitch={note_pitch:+5.1f}deg {note_pct:5.1f}%", note_pct, octave_index
 
     def _update_note_state(self, label: str) -> None:
         if label == "LEFT":
-            note_offset, note_name, note_pct, octave_index = self._note_offset_from_left_position()
+            self._update_left_controls()
+            note_offset, note_name, note_pct, octave_index = self._note_offset_from_left_rotation()
             state = self.hands["LEFT"]
             if note_offset is not None and state.preview_note_index != note_offset:
                 self.haptics.pulse("LEFT", fl_debug.HAPTICS_NOTE_INTENSITY, fl_debug.HAPTICS_NOTE_DURATION_MS)
@@ -1026,10 +1033,11 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
         if not state.tracking_active:
             return
 
-        volume_roll = float(np.clip(state.rotation_euler[0], 0.0, 180.0))
-        volume_value = int(np.clip(round((volume_roll / 180.0) * 127.0), 0, 127))
+        volume_roll = float(state.rotation_euler[0])
+        volume_pct = self._rotation_pct(volume_roll, LEFT_VOLUME_ROLL_MIN_DEG, LEFT_VOLUME_ROLL_MAX_DEG)
+        volume_value = int(np.clip(round((volume_pct / 100.0) * 127.0), 1, 127))
         state.volume_value = volume_value
-        self.current_attack_value = self.midi_velocity
+        self.current_attack_value = volume_value
 
         right_channel = self.midi_channels["RIGHT"]
         if state.volume_value != self.current_volume_value:
@@ -1782,6 +1790,8 @@ class MocapPlayingTestApp:
                 if imu_snapshot.has_fresh_quat(self.args.imu_packet_stale_seconds)
                 else None
             )
+            if label == "LEFT" and rotation_quaternion is not None:
+                self.visualizer.set_hand_tracking_active(label, True)
             button_pressed = self._fresh_imu_button_pressed(
                 label,
                 imu_snapshot,

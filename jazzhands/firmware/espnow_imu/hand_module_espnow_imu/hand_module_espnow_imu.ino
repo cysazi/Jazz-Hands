@@ -28,6 +28,8 @@ const uint32_t IMU_REPORT_INTERVAL_US = 1000000UL / SEND_RATE_HZ;
 const uint32_t IMU_DATA_STALE_US = 100000UL;
 
 uint8_t RECEIVER_MAC[6] = {0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08};
+// {0x08, 0xF9, 0xE0, 0x92, 0xC0, 0x08} board 4
+// {0x34, 0x98, 0x7A, 0x74, 0x39, 0x00} board 1
 
 const int SDA_PIN = 25;
 const int SCL_PIN = 26;
@@ -36,6 +38,7 @@ const int HAPTICS_SDA_PIN = 33;
 const int HAPTICS_SCL_PIN = 32;
 const int BNO08X_RESET = -1;
 const uint8_t BNO08X_I2C_ADDRESS = 0x4A;
+const bool ALLOW_MISSING_IMU = true;
 
 const float ACCEL_FILTER_ALPHA = 0.20f;
 
@@ -47,6 +50,7 @@ const uint8_t PACKET_HAS_ERROR = 0b10000000;
 const uint8_t ERROR_ESPNOW_SEND = 0b00000001;
 const uint8_t ERROR_QUAT_STALE = 0b00000010;
 const uint8_t ERROR_ACCEL_STALE = 0b00000100;
+const uint8_t ERROR_IMU_MISSING = 0b00001000;
 
 typedef struct __attribute__((packed)) {
   uint16_t header;
@@ -87,6 +91,7 @@ uint32_t last_accel_us = 0;
 bool have_quat = false;
 bool have_accel = false;
 bool last_send_ok = true;
+bool imu_available = false;
 
 float filtered_accel_x = 0.0f;
 float filtered_accel_y = 0.0f;
@@ -197,20 +202,24 @@ void setupEspNow() {
   }
 }
 
-void setupImu() {
+bool setupImu() {
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
   delay(100);
 
   if (!bno08x.begin_I2C(BNO08X_I2C_ADDRESS, &Wire)) {
     Serial.println("Failed to find BNO085");
-    while (true) {
-      delay(100);
+    if (!ALLOW_MISSING_IMU) {
+      while (true) {
+        delay(100);
+      }
     }
+    return false;
   }
 
   Serial.println("BNO085 found");
   setReports();
+  return true;
 }
 
 void setup() {
@@ -223,12 +232,14 @@ void setup() {
   packet.device_id = HAND_DEVICE_ID;
   packet.quat_w = 1.0f;
 
-  setupImu();
+  imu_available = setupImu();
   haptics.begin(hapticsWire, HAPTICS_SDA_PIN, HAPTICS_SCL_PIN);
   setupEspNow();
 
   Serial.print("ESP-NOW IMU hand module ready: ");
   Serial.println(HAND_NAME);
+  Serial.print("IMU available: ");
+  Serial.println(imu_available ? "yes" : "no");
   Serial.print("Device ID: ");
   Serial.println(HAND_DEVICE_ID);
   Serial.print("Button pin: GPIO");
@@ -240,6 +251,10 @@ void setup() {
 }
 
 void updateImu() {
+  if (!imu_available) {
+    return;
+  }
+
   if (bno08x.wasReset()) {
     setReports();
   }
@@ -301,6 +316,9 @@ void sendPacketIfDue() {
   }
   if (!last_send_ok) {
     packet.error_handler |= ERROR_ESPNOW_SEND;
+  }
+  if (!imu_available) {
+    packet.error_handler |= ERROR_IMU_MISSING;
   }
   if (packet.error_handler != 0) {
     packet.packet_type |= PACKET_HAS_ERROR;
