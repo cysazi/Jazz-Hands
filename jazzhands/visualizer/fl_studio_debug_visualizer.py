@@ -1009,7 +1009,8 @@ class DualHandFLStudioVisualizer:
                         self._update_plane_visuals(label, definition, preview=False)
                         print(
                             f"[{label}] plane committed: center={definition.center}, "
-                            f"normal={AXIS_NAMES[definition.normal_axis]}, play side=+X"
+                            f"normal={AXIS_NAMES[definition.normal_axis]}, "
+                            f"play side=+{AXIS_NAMES[definition.normal_axis]}"
                         )
                     else:
                         print(f"[{label}] plane draw ignored: move farther before releasing SPACE")
@@ -1064,22 +1065,8 @@ class DualHandFLStudioVisualizer:
             half_v=half_v,
         )
 
-    def _compute_right_stereo_plane(self, origin: np.ndarray, current_position: np.ndarray) -> PlaneDefinition | None:
-        delta = current_position - origin
-        if float(np.linalg.norm(delta)) < MIN_DRAW_DISTANCE:
-            return None
-        return PlaneDefinition(
-            center=origin.copy(),
-            axis_u=0,
-            axis_v=WORLD_UP_AXIS,
-            normal_axis=1,
-            half_u=max(float(abs(delta[0])), MIN_PLANE_HALF_EXTENT),
-            half_v=max(float(abs(delta[WORLD_UP_AXIS])), MIN_PLANE_HALF_EXTENT),
-        )
-
     def _compute_plane_for_hand(self, label: str, origin: np.ndarray, current_position: np.ndarray) -> PlaneDefinition | None:
-        if label == "RIGHT":
-            return self._compute_right_stereo_plane(origin, current_position)
+        _ = label
         return self._compute_debug_plane(origin, current_position)
 
     def _infer_no_play_side_sign(
@@ -1100,7 +1087,7 @@ class DualHandFLStudioVisualizer:
 
     def _flip_play_side(self, label: str) -> None:
         _ = label
-        print("[FL visualizer] play side is fixed to positive X")
+        print("[FL visualizer] play side is fixed to the plane's positive normal axis")
 
     def _ensure_plane_visuals(self, label: str) -> None:
         if label not in self.plane_meshes:
