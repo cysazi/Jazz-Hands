@@ -74,8 +74,7 @@ MODEL_SCALE = 0.02
 MIDI_PAN_CONTROL = 10
 PAN_CENTER_VALUE = 64
 RIGHT_STEREO_SECTION_COUNT = 5
-RIGHT_STEREO_PAN_VALUES = (0, 32, 64, 95, 127)
-RIGHT_STEREO_SECTION_NAMES = ("hard L", "left", "center", "right", "hard R")
+RIGHT_STEREO_CENTER_DEADZONE_PERCENT = 24.0
 MIN_PLANE_HALF_EXTENT = 0.03
 MIN_DRAW_DISTANCE = 0.02
 NOTE_SECTION_COUNT = 12
@@ -1415,14 +1414,27 @@ class DualHandFLStudioVisualizer:
         axis_min = definition.center[stereo_axis] - stereo_half
         normalized = (position[stereo_axis] - axis_min) / (2.0 * stereo_half)
         stereo_pct = float(np.clip(normalized, 0.0, 1.0) * 100.0)
+        pan_percent = float(np.clip((stereo_pct - 50.0) * 2.0, -100.0, 100.0))
+        center_half_width = float(np.clip(RIGHT_STEREO_CENTER_DEADZONE_PERCENT, 0.0, 95.0))
+        if abs(pan_percent) <= center_half_width:
+            pan_value = PAN_CENTER_VALUE
+            pan_name = "center"
+        else:
+            side_amount = (abs(pan_percent) - center_half_width) / (100.0 - center_half_width)
+            if pan_percent < 0.0:
+                pan_value = int(round(PAN_CENTER_VALUE * (1.0 - side_amount)))
+                pan_name = f"L {side_amount * 100.0:.0f}%"
+            else:
+                pan_value = int(round(PAN_CENTER_VALUE + (127 - PAN_CENTER_VALUE) * side_amount))
+                pan_name = f"R {side_amount * 100.0:.0f}%"
         section_index = min(
             int((stereo_pct / 100.0) * RIGHT_STEREO_SECTION_COUNT),
             RIGHT_STEREO_SECTION_COUNT - 1,
         )
         return (
             stereo_pct,
-            int(RIGHT_STEREO_PAN_VALUES[section_index]),
-            RIGHT_STEREO_SECTION_NAMES[section_index],
+            int(np.clip(pan_value, 0, 127)),
+            pan_name,
             section_index,
         )
 
