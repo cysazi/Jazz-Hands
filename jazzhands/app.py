@@ -1281,6 +1281,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="chromatic",
         help="Scale for note selection. Use --list-scales to see options.",
     )
+    parser.add_argument(
+        "--remove-notes",
+        default="",
+        help="Comma-separated absolute note names to remove from the selected scale, for example B,E.",
+    )
+    parser.add_argument(
+        "--notes-per-plane",
+        type=int,
+        default=None,
+        help="Number of note sections shown on the left hand plane. Default is half the selected scale.",
+    )
     parser.add_argument("--list-scales", action="store_true", help="Print available scales and exit.")
     parser.add_argument("--midi-velocity", type=int, default=fl_debug.MIDI_VELOCITY)
     parser.add_argument(
@@ -1394,7 +1405,7 @@ class MocapPlayingTestApp:
         ]
 
         middle_note = parse_midi_note(args.middle_note) if args.middle_note is not None else int(args.midi_base_note)
-        self.visualizer = GloveScalePlayingVisualizer(
+        self.visualizer = fl_debug.DualHandFLStudioVisualizer(
             keyboard_controlled=False,
             keyboard_buttons_enabled=True,
             enable_midi=not args.no_midi,
@@ -1412,7 +1423,8 @@ class MocapPlayingTestApp:
             start_timer=False,
             show=True,
             scale_name=args.scale,
-            middle_note=middle_note,
+            removed_notes=args.remove_notes,
+            notes_per_plane=args.notes_per_plane,
             left_velocity_axis=args.left_velocity_axis,
             left_velocity_min_degrees=args.left_velocity_min_degrees,
             left_velocity_max_degrees=args.left_velocity_max_degrees,

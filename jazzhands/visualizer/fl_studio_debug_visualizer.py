@@ -71,6 +71,11 @@ HAPTICS_NOTE_DURATION_MS = 55
 
 POSITION_SCALE = 1.0
 MODEL_SCALE = 0.02
+MIDI_PAN_CONTROL = 10
+PAN_CENTER_VALUE = 64
+RIGHT_STEREO_SECTION_COUNT = 5
+RIGHT_STEREO_PAN_VALUES = (0, 32, 64, 95, 127)
+RIGHT_STEREO_SECTION_NAMES = ("hard L", "left", "center", "right", "hard R")
 MIN_PLANE_HALF_EXTENT = 0.03
 MIN_DRAW_DISTANCE = 0.02
 NOTE_SECTION_COUNT = 12
@@ -363,6 +368,8 @@ class DualHandFLStudioVisualizer:
         haptics_baud: int = HAPTICS_BAUD,
         require_inside_plane_to_play: bool = False,
         scale_name: str = "chromatic",
+        removed_notes: str | list[str] | tuple[str, ...] | None = None,
+        notes_per_plane: int | None = None,
         button_hold_clear_seconds: float = BUTTON_HOLD_CLEAR_SECONDS,
         left_velocity_axis: str = LEFT_VELOCITY_AXIS_DEFAULT,
         left_velocity_min_degrees: float = LEFT_VELOCITY_MIN_DEG,
@@ -387,6 +394,11 @@ class DualHandFLStudioVisualizer:
         self.scale_intervals = SCALE_INTERVALS[self.scale_name]
         self.initial_midi_base_note = self.midi_base_note
         self.octave_offset = 0
+        self.removed_note_names = self._normalize_removed_note_names(removed_notes)
+        self.removed_note_pitch_classes = {
+            NOTE_TO_SEMITONE[note_name] for note_name in self.removed_note_names
+        }
+        self.notes_per_plane_override = int(notes_per_plane) if notes_per_plane is not None else None
         self.button_hold_clear_seconds = max(float(button_hold_clear_seconds), 0.25)
         self.left_velocity_axis = str(left_velocity_axis).lower()
         self.left_velocity_min_degrees = float(left_velocity_min_degrees)
@@ -465,6 +477,9 @@ class DualHandFLStudioVisualizer:
         self.current_volume_value = 0
         self.current_attack_value = self.midi_velocity
         self.current_reverb_value = 0
+        self.current_pan_value = PAN_CENTER_VALUE
+        self.current_pan_section_index: int | None = None
+        self.current_pan_section_name = "center"
         self.button_press_times: dict[str, float | None] = {label: None for label in self.hand_labels}
         self.button_clear_consumed: dict[str, bool] = {label: False for label in self.hand_labels}
         self.selected_note_offset: int | None = None
@@ -472,6 +487,7 @@ class DualHandFLStudioVisualizer:
         self.right_roll_samples: deque[tuple[int, float]] = deque(maxlen=10)
         self.last_instrument_gesture_ms = -10_000
         self.current_instrument = INSTRUMENT_CYCLE[0]
+        self._refresh_note_layout()
         self._setup_midi_output()
         atexit.register(self.close_midi)
 
@@ -498,7 +514,65 @@ class DualHandFLStudioVisualizer:
 
     @property
     def section_count(self) -> int:
-        return len(self.scale_intervals)
+        return max(min(self.notes_per_plane, len(self.note_layout_offsets)), 1)
+
+    @property
+    def half_scale_section_count(self) -> int:
+        return max(int(math.ceil(len(self.scale_intervals) / 2.0)), 1)
+
+    def _scale_degree_offset_for_section(self, section_index: int, page_offset: int = 0) -> int:
+        absolute_index = self.note_layout_page_zero_start + int(page_offset) * self.section_count + int(section_index)
+        absolute_index = int(np.clip(absolute_index, 0, len(self.note_layout_offsets) - 1))
+        return int(self.note_layout_offsets[absolute_index])
+
+    @staticmethod
+    def _normalize_removed_note_names(removed_notes: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+        if removed_notes is None:
+            return ()
+        if isinstance(removed_notes, str):
+            raw_values = removed_notes.replace(";", ",").split(",")
+        else:
+            raw_values = list(removed_notes)
+        normalized = []
+        for raw_value in raw_values:
+            text = str(raw_value).strip().upper().replace("♯", "#").replace("♭", "B")
+            text = text.replace(" NATURAL", "").replace("-NATURAL", "").replace("_NATURAL", "")
+            if not text:
+                continue
+            if text not in NOTE_TO_SEMITONE:
+                raise ValueError(f"Unknown note to remove: {raw_value!r}")
+            normalized.append(text)
+        return tuple(dict.fromkeys(normalized))
+
+    def _allowed_pitch_classes(self) -> set[int]:
+        pitch_classes = {
+            (self.midi_base_note + int(interval)) % 12
+            for interval in self.scale_intervals
+        }
+        return pitch_classes - self.removed_note_pitch_classes
+
+    def _refresh_note_layout(self) -> None:
+        allowed_pitch_classes = self._allowed_pitch_classes()
+        if not allowed_pitch_classes:
+            allowed_pitch_classes = {self.midi_base_note % 12}
+
+        offsets = [
+            midi_note - self.midi_base_note
+            for midi_note in range(128)
+            if midi_note % 12 in allowed_pitch_classes
+        ]
+        if not offsets:
+            offsets = [0]
+        self.note_layout_offsets = tuple(offsets)
+        lower_or_equal_indices = [
+            index for index, offset in enumerate(self.note_layout_offsets) if offset <= 0
+        ]
+        middle_index = lower_or_equal_indices[-1] if lower_or_equal_indices else 0
+        default_notes_per_plane = max(int(math.ceil(len(allowed_pitch_classes) / 2.0)), 1)
+        requested_notes_per_plane = self.notes_per_plane_override or default_notes_per_plane
+        self.notes_per_plane = int(np.clip(requested_notes_per_plane, 1, len(self.note_layout_offsets)))
+        lower_count = (self.notes_per_plane - 1) // 2
+        self.note_layout_page_zero_start = int(np.clip(middle_index - lower_count, 0, len(self.note_layout_offsets) - 1))
 
     def scale_status_text(self) -> str:
         axis_index = ROTATION_AXIS_TO_EULER_INDEX[self.left_velocity_axis]
@@ -507,7 +581,8 @@ class DualHandFLStudioVisualizer:
         roll, pitch, yaw = (float(value) for value in left_state.rotation_euler)
         return (
             f"{self.scale_name} middle={midi_note_name(self.midi_base_note)} "
-            f"octave={self.octave_offset:+d} selected={self.selected_note_name} "
+            f"page={self.octave_offset:+d} selected={self.selected_note_name} "
+            f"notes/plane={self.section_count} "
             f"velocity={self.current_attack_value} {self.left_velocity_axis}={left_angle:+.1f}deg "
             f"left_rpy=({roll:+.1f},{pitch:+.1f},{yaw:+.1f}) "
             f"keys={ROTATION_AXIS_KEY_HINTS[self.left_velocity_axis]}"
@@ -517,6 +592,7 @@ class DualHandFLStudioVisualizer:
         self._all_midi_notes_off()
         self.scale_name = normalize_scale_name(scale_name)
         self.scale_intervals = SCALE_INTERVALS[self.scale_name]
+        self._refresh_note_layout()
         for label in self.hand_labels:
             state = self.hands[label]
             if state.plane is not None:
@@ -528,6 +604,7 @@ class DualHandFLStudioVisualizer:
         self.initial_midi_base_note = int(np.clip(middle_note, 0, 127))
         self.octave_offset = 0
         self.midi_base_note = self.initial_midi_base_note
+        self._refresh_note_layout()
         print(f"[FL visualizer scale] middle={midi_note_name(self.midi_base_note)} ({self.midi_base_note})")
 
     def adjust_octave(self, delta: int) -> None:
@@ -536,9 +613,8 @@ class DualHandFLStudioVisualizer:
             return
         self._update_midi_note("RIGHT", None)
         self.octave_offset = next_offset
-        self.midi_base_note = int(np.clip(self.initial_midi_base_note + self.octave_offset * 12, 0, 127))
         print(
-            f"[FL visualizer scale] octave={self.octave_offset:+d} "
+            f"[FL visualizer scale] half-scale page={self.octave_offset:+d} "
             f"middle={midi_note_name(self.midi_base_note)}"
         )
 
@@ -876,6 +952,7 @@ class DualHandFLStudioVisualizer:
             self._update_plane_state(label)
             self._update_note_state(label)
         self._update_left_controls()
+        self._update_right_stereo_control()
         self._update_right_instrument_gesture()
         for label in self.hand_labels:
             self._update_hand_visual(label)
@@ -916,13 +993,13 @@ class DualHandFLStudioVisualizer:
                 print(f"[{label}] plane origin captured: {state.draw_origin}")
 
             if state.drawing and state.button_pressed and state.draw_origin is not None:
-                definition = self._compute_debug_plane(state.draw_origin, state.position)
+                definition = self._compute_plane_for_hand(label, state.draw_origin, state.position)
                 if definition is not None:
                     self._update_plane_visuals(label, definition, preview=True)
 
             if released_edge and state.drawing:
                 if state.draw_origin is not None:
-                    definition = self._compute_debug_plane(state.draw_origin, state.position)
+                    definition = self._compute_plane_for_hand(label, state.draw_origin, state.position)
                     if definition is not None:
                         state.plane = definition
                         state.no_play_side_sign = -1.0
@@ -987,6 +1064,24 @@ class DualHandFLStudioVisualizer:
             half_v=half_v,
         )
 
+    def _compute_right_stereo_plane(self, origin: np.ndarray, current_position: np.ndarray) -> PlaneDefinition | None:
+        delta = current_position - origin
+        if float(np.linalg.norm(delta)) < MIN_DRAW_DISTANCE:
+            return None
+        return PlaneDefinition(
+            center=origin.copy(),
+            axis_u=0,
+            axis_v=WORLD_UP_AXIS,
+            normal_axis=1,
+            half_u=max(float(abs(delta[0])), MIN_PLANE_HALF_EXTENT),
+            half_v=max(float(abs(delta[WORLD_UP_AXIS])), MIN_PLANE_HALF_EXTENT),
+        )
+
+    def _compute_plane_for_hand(self, label: str, origin: np.ndarray, current_position: np.ndarray) -> PlaneDefinition | None:
+        if label == "RIGHT":
+            return self._compute_right_stereo_plane(origin, current_position)
+        return self._compute_debug_plane(origin, current_position)
+
     def _infer_no_play_side_sign(
         self,
         definition: PlaneDefinition,
@@ -1040,6 +1135,28 @@ class DualHandFLStudioVisualizer:
             )
             line.visible = False
             self.plane_section_lines[label].append(line)
+
+    def _hide_stacked_plane_visuals(self, label: str) -> None:
+        for octave_index in STACKED_PLANE_OCTAVES:
+            key = (label, octave_index)
+            mesh = self.stacked_plane_meshes.get(key)
+            outline = self.stacked_plane_outlines.get(key)
+            if mesh is not None:
+                mesh.visible = False
+            if outline is not None:
+                outline.visible = False
+            for line in self.stacked_plane_section_lines.get(key, []):
+                line.visible = False
+
+    def _hide_regular_plane_visuals(self, label: str) -> None:
+        mesh = self.plane_meshes.get(label)
+        outline = self.plane_outlines.get(label)
+        if mesh is not None:
+            mesh.visible = False
+        if outline is not None:
+            outline.visible = False
+        for line in self.plane_section_lines.get(label, []):
+            line.visible = False
 
     def _plane_vertices(self, definition: PlaneDefinition) -> np.ndarray:
         center = definition.center
@@ -1135,7 +1252,70 @@ class DualHandFLStudioVisualizer:
             segments.append(np.array([p0, p1], dtype=np.float32))
         return segments
 
+    def _right_stereo_axis_and_half_extent(self, definition: PlaneDefinition) -> tuple[int, float, int, float]:
+        if definition.axis_u == 0:
+            return definition.axis_u, definition.half_u, definition.axis_v, definition.half_v
+        if definition.axis_v == 0:
+            return definition.axis_v, definition.half_v, definition.axis_u, definition.half_u
+        if definition.axis_u != WORLD_UP_AXIS:
+            return definition.axis_u, definition.half_u, definition.axis_v, definition.half_v
+        if definition.axis_v != WORLD_UP_AXIS:
+            return definition.axis_v, definition.half_v, definition.axis_u, definition.half_u
+        return definition.axis_u, definition.half_u, definition.axis_v, definition.half_v
+
+    def _right_stereo_section_line_segments(self, definition: PlaneDefinition) -> list[np.ndarray]:
+        segments = []
+        stereo_axis, stereo_half, other_axis, other_half = self._right_stereo_axis_and_half_extent(definition)
+        stereo_min = definition.center[stereo_axis] - stereo_half
+        other_min = definition.center[other_axis] - other_half
+        for split_index in range(1, RIGHT_STEREO_SECTION_COUNT):
+            split_coord = stereo_min + (split_index / RIGHT_STEREO_SECTION_COUNT) * (2.0 * stereo_half)
+            p0 = definition.center.copy()
+            p1 = definition.center.copy()
+            p0[stereo_axis] = split_coord
+            p1[stereo_axis] = split_coord
+            p0[other_axis] = definition.center[other_axis] - other_half
+            p1[other_axis] = definition.center[other_axis] + other_half
+            segments.append(np.array([p0, p1], dtype=np.float32))
+        for split_index in range(1, RIGHT_STEREO_SECTION_COUNT):
+            split_coord = other_min + (split_index / RIGHT_STEREO_SECTION_COUNT) * (2.0 * other_half)
+            p0 = definition.center.copy()
+            p1 = definition.center.copy()
+            p0[other_axis] = split_coord
+            p1[other_axis] = split_coord
+            p0[stereo_axis] = definition.center[stereo_axis] - stereo_half
+            p1[stereo_axis] = definition.center[stereo_axis] + stereo_half
+            segments.append(np.array([p0, p1], dtype=np.float32))
+        return segments
+
+    def _update_right_plane_visuals(self, definition: PlaneDefinition, preview: bool) -> None:
+        self._hide_stacked_plane_visuals("RIGHT")
+        self._ensure_plane_visuals("RIGHT")
+        fill = (1.00, 0.48, 0.32, 0.08 if preview else 0.16)
+        edge = (1.00, 0.62, 0.45, 0.55 if preview else 0.9)
+        split = (1.00, 0.84, 0.70, 0.35 if preview else 0.65)
+
+        vertices = self._plane_vertices(definition) * POSITION_SCALE
+        outline = np.vstack([vertices, vertices[0]])
+        self.plane_meshes["RIGHT"].set_data(vertices=vertices, faces=PLANE_FACES, color=fill)
+        self.plane_meshes["RIGHT"].visible = True
+        self.plane_outlines["RIGHT"].set_data(pos=outline, color=edge)
+        self.plane_outlines["RIGHT"].visible = True
+
+        segments = self._right_stereo_section_line_segments(definition)
+        for index, line in enumerate(self.plane_section_lines["RIGHT"]):
+            if index < len(segments):
+                line.set_data(pos=segments[index] * POSITION_SCALE, color=split)
+                line.visible = True
+            else:
+                line.visible = False
+
     def _update_plane_visuals(self, label: str, definition: PlaneDefinition, preview: bool) -> None:
+        if label == "RIGHT":
+            self._update_right_plane_visuals(definition, preview)
+            return
+
+        self._hide_regular_plane_visuals(label)
         colors = {
             "LEFT": {
                 "fill": (0.30, 0.80, 1.00, 0.08 if preview else 0.16),
@@ -1232,19 +1412,63 @@ class DualHandFLStudioVisualizer:
             octave_index,
         )
 
+    def _left_note_plane_position_metrics(
+        self,
+        position: np.ndarray,
+        definition: PlaneDefinition,
+    ) -> tuple[float, float, bool, int]:
+        note_axis, note_half, other_axis, other_half = self._note_axis_and_half_extent(definition)
+        axis_min = definition.center[note_axis] - note_half
+        normalized = (position[note_axis] - axis_min) / (2.0 * note_half)
+        other_min = definition.center[other_axis] - other_half
+        other_normalized = (position[other_axis] - other_min) / (2.0 * other_half)
+        inside = 0.0 <= normalized <= 1.0 and 0.0 <= other_normalized <= 1.0
+        return (
+            float(np.clip(normalized, 0.0, 1.0) * 100.0),
+            float(np.clip(other_normalized, 0.0, 1.0) * 100.0),
+            inside,
+            self.octave_offset,
+        )
+
+    def _right_stereo_position_metrics(self, position: np.ndarray, definition: PlaneDefinition) -> tuple[float, int, str, int]:
+        stereo_axis, stereo_half, _other_axis, _other_half = self._right_stereo_axis_and_half_extent(definition)
+        axis_min = definition.center[stereo_axis] - stereo_half
+        normalized = (position[stereo_axis] - axis_min) / (2.0 * stereo_half)
+        stereo_pct = float(np.clip(normalized, 0.0, 1.0) * 100.0)
+        section_index = min(
+            int((stereo_pct / 100.0) * RIGHT_STEREO_SECTION_COUNT),
+            RIGHT_STEREO_SECTION_COUNT - 1,
+        )
+        return (
+            stereo_pct,
+            int(RIGHT_STEREO_PAN_VALUES[section_index]),
+            RIGHT_STEREO_SECTION_NAMES[section_index],
+            section_index,
+        )
+
+    @staticmethod
+    def _section_index_from_percent(percent: float, section_count: int) -> int:
+        section_count = max(int(section_count), 1)
+        normalized = float(np.clip(percent / 100.0, 0.0, 1.0))
+        if normalized <= 0.0:
+            return 0
+        if normalized >= 1.0:
+            return section_count - 1
+        return int(np.floor(np.nextafter(normalized * section_count, -np.inf)))
+
     def _note_offset_from_left_position(self) -> tuple[int | None, str, float, int]:
         state = self.hands["LEFT"]
         if not state.tracking_active or state.plane is None:
             return None, "none", 0.0, 0
-        note_pct, _other_pct, inside, octave_index = self._stacked_plane_position_metrics(state.position, state.plane)
+        note_pct, _other_pct, inside, page_offset = self._left_note_plane_position_metrics(state.position, state.plane)
         note_axis, _note_half, _other_axis, _other_half = self._note_axis_and_half_extent(state.plane)
-        section_index = min(int((note_pct / 100.0) * self.section_count), self.section_count - 1)
-        semitone_offset = self.scale_intervals[section_index] + (12 * octave_index)
+        section_index = self._section_index_from_percent(note_pct, self.section_count)
+        semitone_offset = self._scale_degree_offset_for_section(section_index, page_offset)
         midi_note = int(np.clip(self.midi_base_note + semitone_offset, 0, 127))
         note_name = midi_note_name(midi_note)
         if not inside and self.require_inside_plane_to_play:
-            return None, f"outside {note_name}", note_pct, octave_index
-        return semitone_offset, f"{note_name} {AXIS_NAMES[note_axis]}={note_pct:5.1f}%", note_pct, octave_index
+            return None, f"outside {note_name}", note_pct, page_offset
+        return semitone_offset, f"{note_name} {AXIS_NAMES[note_axis]}={note_pct:5.1f}%", note_pct, page_offset
 
     def _continuous_plane_percentages(self, state: HandRuntimeState) -> tuple[float, float, bool]:
         if state.plane is None:
@@ -1279,6 +1503,21 @@ class DualHandFLStudioVisualizer:
             self.current_volume_value = state.volume_value
             self._send_control_change(101, self.current_volume_value, right_channel)
             self._send_control_change(7, self.current_volume_value, right_channel)
+
+    def _update_right_stereo_control(self) -> None:
+        state = self.hands["RIGHT"]
+        if not state.tracking_active or state.plane is None:
+            return
+
+        stereo_pct, pan_value, pan_name, section_index = self._right_stereo_position_metrics(state.position, state.plane)
+        state.last_v_pct = stereo_pct
+        self.current_pan_section_index = section_index
+        self.current_pan_section_name = pan_name
+        if pan_value == self.current_pan_value:
+            return
+
+        self.current_pan_value = pan_value
+        self._send_control_change(MIDI_PAN_CONTROL, self.current_pan_value, self.midi_channels["RIGHT"])
 
     @staticmethod
     def _roll_delta_deg(current_roll: float, previous_roll: float) -> float:
@@ -1342,7 +1581,7 @@ class DualHandFLStudioVisualizer:
             self.selected_note_name = note_name
             state.active_note_index = None
             state.preview_note_index = note_offset
-            state.last_note_name = f"select={note_name} oct={octave_index:+d}"
+            state.last_note_name = f"select={note_name} page={octave_index:+d}"
             state.last_inside = note_offset is not None
             state.last_u_pct = note_pct
             self._update_midi_note("LEFT", None)
@@ -1364,8 +1603,9 @@ class DualHandFLStudioVisualizer:
             self._update_midi_note("RIGHT", None)
             return
 
-        _note_pct, other_pct, inside, octave_index = self._stacked_plane_position_metrics(state.position, state.plane)
-        play_offset = float(state.position[0] - state.plane.center[0])
+        _u_pct, _v_pct, inside, _offset = self._plane_position_metrics(state.position, state.plane)
+        stereo_pct, pan_value, pan_name, section_index = self._right_stereo_position_metrics(state.position, state.plane)
+        play_offset = float(state.position[state.plane.normal_axis] - state.plane.center[state.plane.normal_axis])
         if state.is_on_play_side:
             if play_offset <= PLAY_EXIT_THRESHOLD:
                 state.is_on_play_side = False
@@ -1382,13 +1622,16 @@ class DualHandFLStudioVisualizer:
             self.haptics.pulse("RIGHT", HAPTICS_NOTE_INTENSITY, HAPTICS_NOTE_DURATION_MS)
         state.preview_note_index = self.selected_note_offset
         state.last_note_name = (
-            f"PLAY {self.selected_note_name} instrument={self.current_instrument}"
+            f"PLAY {self.selected_note_name} pan={pan_name}"
             if can_play
-            else f"ready={self.selected_note_name} trigger_oct={octave_index:+d} instrument={self.current_instrument}"
+            else f"ready={self.selected_note_name} pan={pan_name}"
         )
         state.last_inside = inside
         state.last_offset = play_offset
-        state.last_u_pct = other_pct
+        state.last_u_pct = stereo_pct
+        state.last_v_pct = float(section_index + 1)
+        self.current_pan_section_index = section_index
+        self.current_pan_section_name = pan_name
         self._update_midi_note("RIGHT", state.active_note_index)
 
     def _update_hand_visual(self, label: str) -> None:
@@ -1422,12 +1665,19 @@ class DualHandFLStudioVisualizer:
             if state.drawing:
                 plane_text = "plane=drawing"
             elif state.plane is not None:
-                plane_text = (
-                    f"plane={AXIS_NAMES[state.plane.axis_u]}/{AXIS_NAMES[state.plane.axis_v]} "
-                    f"normal={AXIS_NAMES[state.plane.normal_axis]} "
-                    f"uv=({state.last_u_pct:5.1f}%, {state.last_v_pct:5.1f}%) "
-                    f"play_x={state.last_offset:+.3f}"
-                )
+                if label == "RIGHT":
+                    plane_text = (
+                        f"plane=stereo x={state.last_u_pct:5.1f}% "
+                        f"section={self.current_pan_section_name} pan={self.current_pan_value} "
+                        f"play_x={state.last_offset:+.3f}"
+                    )
+                else:
+                    plane_text = (
+                        f"plane={AXIS_NAMES[state.plane.axis_u]}/{AXIS_NAMES[state.plane.axis_v]} "
+                        f"normal={AXIS_NAMES[state.plane.normal_axis]} "
+                        f"uv=({state.last_u_pct:5.1f}%, {state.last_v_pct:5.1f}%) "
+                        f"play_x={state.last_offset:+.3f}"
+                    )
             lines.append(
                 f"{label} ch={self.midi_channels[label] + 1} "
                 f"pos=({state.position[0]:+.2f}, {state.position[1]:+.2f}, {state.position[2]:+.2f}) "
@@ -1463,10 +1713,10 @@ class DualHandFLStudioVisualizer:
                     f"base_note={midi_note_name(self.midi_base_note)} velocity={self.current_attack_value}"
                 ),
                 (
-                    f"MIDI OUT: LEFT rot -> CC101/CC7={self.current_volume_value} on RIGHT ch={right_channel_1_based} | "
+                    f"MIDI OUT: LEFT rot -> CC101/CC7={self.current_volume_value}, RIGHT x -> CC10 pan={self.current_pan_value} on RIGHT ch={right_channel_1_based} | "
                     f"LEFT ch setting={left_channel_1_based}"
                 ),
-                f"move_step={self.velocity_step:.2f} rotate_step={self.rotation_step:.2f} volume={self.current_volume_value} attack={self.current_attack_value} reverb={self.current_reverb_value}",
+                f"move_step={self.velocity_step:.2f} rotate_step={self.rotation_step:.2f} volume={self.current_volume_value} attack={self.current_attack_value} pan={self.current_pan_value} reverb={self.current_reverb_value}",
                 controls,
             ]
         )
@@ -1488,9 +1738,9 @@ class DualHandFLStudioVisualizer:
         )
         self.status_text.text = "\n".join(
             [
-                f"{self.scale_name} octave={self.octave_offset:+d} selected={self.selected_note_name} velocity={self.current_attack_value}",
+                f"{self.scale_name} page={self.octave_offset:+d} selected={self.selected_note_name} velocity={self.current_attack_value}",
                 f"LEFT note={left.last_note_name} button={'DOWN' if left.button_pressed else 'UP'} plane={left_plane}",
-                f"RIGHT note={right.last_note_name} button={'DOWN' if right.button_pressed else 'UP'} plane={right_plane} playing={active_note_text} ch={right_channel_1_based}",
+                f"RIGHT note={right.last_note_name} button={'DOWN' if right.button_pressed else 'UP'} plane={right_plane} pan={self.current_pan_value} {self.current_pan_section_name} playing={active_note_text} ch={right_channel_1_based}",
                 f"{midi_text} | {controls}",
             ]
         )
