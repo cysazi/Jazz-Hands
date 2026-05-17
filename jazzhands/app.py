@@ -82,10 +82,14 @@ BUTTON_HOLD_CLEAR_SECONDS = 5.0
 MIN_OCTAVE_OFFSET = -4
 MAX_OCTAVE_OFFSET = 4
 STACKED_PLANE_OCTAVES = (-1, 0, 1)
-LEFT_NOTE_PITCH_MIN_DEG = -60.0
-LEFT_NOTE_PITCH_MAX_DEG = 60.0
-LEFT_VOLUME_ROLL_MIN_DEG = -90.0
-LEFT_VOLUME_ROLL_MAX_DEG = 90.0
+LEFT_VELOCITY_AXIS_DEFAULT = "pitch"
+LEFT_VELOCITY_MIN_DEG = -60.0
+LEFT_VELOCITY_MAX_DEG = 60.0
+ROTATION_AXIS_TO_EULER_INDEX = {
+    "roll": 0,
+    "pitch": 1,
+    "yaw": 2,
+}
 
 NOTE_TO_SEMITONE = {
     "C": 0,
@@ -667,6 +671,10 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
         scale_name: str = "chromatic",
         middle_note: int = fl_debug.MIDI_BASE_NOTE,
         button_hold_clear_seconds: float = BUTTON_HOLD_CLEAR_SECONDS,
+        left_velocity_axis: str = LEFT_VELOCITY_AXIS_DEFAULT,
+        left_velocity_min_degrees: float = LEFT_VELOCITY_MIN_DEG,
+        left_velocity_max_degrees: float = LEFT_VELOCITY_MAX_DEG,
+        invert_left_velocity: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -680,6 +688,12 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
         self.button_clear_consumed: dict[str, bool] = {label: False for label in self.hand_labels}
         self.selected_note_offset: int | None = None
         self.selected_note_name = "none"
+        self.left_velocity_axis = str(left_velocity_axis).lower()
+        self.left_velocity_min_degrees = float(left_velocity_min_degrees)
+        self.left_velocity_max_degrees = float(left_velocity_max_degrees)
+        self.invert_left_velocity = bool(invert_left_velocity)
+        if self.left_velocity_axis not in ROTATION_AXIS_TO_EULER_INDEX:
+            self.left_velocity_axis = LEFT_VELOCITY_AXIS_DEFAULT
         self.stacked_plane_meshes: dict[tuple[str, int], object] = {}
         self.stacked_plane_outlines: dict[tuple[str, int], object] = {}
         self.stacked_plane_section_lines: dict[tuple[str, int], list[object]] = {}
@@ -689,9 +703,12 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
         return len(self.scale_intervals)
 
     def scale_status_text(self) -> str:
+        axis_index = ROTATION_AXIS_TO_EULER_INDEX[self.left_velocity_axis]
+        left_angle = float(self.hands["LEFT"].rotation_euler[axis_index])
         return (
             f"{self.scale_name} middle={midi_note_name(self.midi_base_note)} "
-            f"octave={self.octave_offset:+d} selected={self.selected_note_name}"
+            f"octave={self.octave_offset:+d} selected={self.selected_note_name} "
+            f"velocity={self.current_attack_value} {self.left_velocity_axis}={left_angle:+.1f}deg"
         )
 
     def set_scale(self, scale_name: str) -> None:
@@ -802,6 +819,8 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
             print(f"[{label}] plane cleared after {self.button_hold_clear_seconds:.1f}s hold")
 
         if released_edge:
+            if not self.button_clear_consumed[label]:
+                self.adjust_octave(1 if label == "LEFT" else -1)
             self.button_press_times[label] = None
             self.button_clear_consumed[label] = False
 
@@ -956,24 +975,25 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
         span = max(float(max_degrees) - float(min_degrees), 1e-6)
         return float(np.clip((float(value) - float(min_degrees)) / span, 0.0, 1.0) * 100.0)
 
-    def _note_offset_from_left_rotation(self) -> tuple[int | None, str, float, int]:
+    def _note_offset_from_left_position(self) -> tuple[int | None, str, float, int]:
         state = self.hands["LEFT"]
-        if not state.tracking_active:
+        if not state.tracking_active or state.plane is None:
             return None, "none", 0.0, 0
 
-        note_pitch = float(state.rotation_euler[1])
-        note_pct = self._rotation_pct(note_pitch, LEFT_NOTE_PITCH_MIN_DEG, LEFT_NOTE_PITCH_MAX_DEG)
-        octave_index = 0
+        note_pct, _other_pct, inside, octave_index = self._stacked_plane_position_metrics(state.position, state.plane)
+        note_axis, _note_half, _other_axis, _other_half = self._note_axis_and_half_extent(state.plane)
         section_index = min(int((note_pct / 100.0) * self.section_count), self.section_count - 1)
         semitone_offset = self.scale_intervals[section_index] + (12 * octave_index)
         midi_note = int(np.clip(self.midi_base_note + semitone_offset, 0, 127))
         note_name = midi_note_name(midi_note)
-        return semitone_offset, f"{note_name} pitch={note_pitch:+5.1f}deg {note_pct:5.1f}%", note_pct, octave_index
+        if not inside and self.require_inside_plane_to_play:
+            return None, f"outside {note_name}", note_pct, octave_index
+        return semitone_offset, f"{note_name} {fl_debug.AXIS_NAMES[note_axis]}={note_pct:5.1f}%", note_pct, octave_index
 
     def _update_note_state(self, label: str) -> None:
         if label == "LEFT":
             self._update_left_controls()
-            note_offset, note_name, note_pct, octave_index = self._note_offset_from_left_rotation()
+            note_offset, note_name, note_pct, octave_index = self._note_offset_from_left_position()
             state = self.hands["LEFT"]
             if note_offset is not None and state.preview_note_index != note_offset:
                 self.haptics.pulse("LEFT", fl_debug.HAPTICS_NOTE_INTENSITY, fl_debug.HAPTICS_NOTE_DURATION_MS)
@@ -1033,8 +1053,15 @@ class GloveScalePlayingVisualizer(fl_debug.DualHandFLStudioVisualizer):
         if not state.tracking_active:
             return
 
-        volume_roll = float(state.rotation_euler[0])
-        volume_pct = self._rotation_pct(volume_roll, LEFT_VOLUME_ROLL_MIN_DEG, LEFT_VOLUME_ROLL_MAX_DEG)
+        axis_index = ROTATION_AXIS_TO_EULER_INDEX[self.left_velocity_axis]
+        velocity_angle = float(state.rotation_euler[axis_index])
+        volume_pct = self._rotation_pct(
+            velocity_angle,
+            self.left_velocity_min_degrees,
+            self.left_velocity_max_degrees,
+        )
+        if self.invert_left_velocity:
+            volume_pct = 100.0 - volume_pct
         volume_value = int(np.clip(round((volume_pct / 100.0) * 127.0), 1, 127))
         state.volume_value = volume_value
         self.current_attack_value = volume_value
@@ -1309,6 +1336,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-scales", action="store_true", help="Print available scales and exit.")
     parser.add_argument("--midi-velocity", type=int, default=fl_debug.MIDI_VELOCITY)
     parser.add_argument(
+        "--left-velocity-axis",
+        choices=tuple(ROTATION_AXIS_TO_EULER_INDEX),
+        default=LEFT_VELOCITY_AXIS_DEFAULT,
+        help="Left-hand rotation axis used for MIDI velocity/volume.",
+    )
+    parser.add_argument(
+        "--left-velocity-min-degrees",
+        type=float,
+        default=LEFT_VELOCITY_MIN_DEG,
+        help="Left-hand angle that maps to velocity 1.",
+    )
+    parser.add_argument(
+        "--left-velocity-max-degrees",
+        type=float,
+        default=LEFT_VELOCITY_MAX_DEG,
+        help="Left-hand angle that maps to velocity 127.",
+    )
+    parser.add_argument(
+        "--invert-left-velocity",
+        action="store_true",
+        help="Invert the left-hand rotation to velocity mapping.",
+    )
+    parser.add_argument(
         "--left-midi-channel",
         type=int,
         default=fl_debug.HAND_MIDI_CHANNELS_1_BASED["LEFT"],
@@ -1413,6 +1463,10 @@ class MocapPlayingTestApp:
             show=True,
             scale_name=args.scale,
             middle_note=middle_note,
+            left_velocity_axis=args.left_velocity_axis,
+            left_velocity_min_degrees=args.left_velocity_min_degrees,
+            left_velocity_max_degrees=args.left_velocity_max_degrees,
+            invert_left_velocity=args.invert_left_velocity,
         )
         self.visualizer.canvas.events.close.connect(self.close)
 
