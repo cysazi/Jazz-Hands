@@ -1404,18 +1404,11 @@ class DualHandFLStudioVisualizer:
         position: np.ndarray,
         definition: PlaneDefinition,
     ) -> tuple[float, float, bool, int]:
-        note_axis, note_half, other_axis, other_half = self._note_axis_and_half_extent(definition)
-        axis_min = definition.center[note_axis] - note_half
-        normalized = (position[note_axis] - axis_min) / (2.0 * note_half)
-        other_min = definition.center[other_axis] - other_half
-        other_normalized = (position[other_axis] - other_min) / (2.0 * other_half)
-        inside = 0.0 <= normalized <= 1.0 and 0.0 <= other_normalized <= 1.0
-        return (
-            float(np.clip(normalized, 0.0, 1.0) * 100.0),
-            float(np.clip(other_normalized, 0.0, 1.0) * 100.0),
-            inside,
-            self.octave_offset,
+        note_pct, other_pct, inside, ghost_page_offset = self._stacked_plane_position_metrics(
+            position,
+            definition,
         )
+        return note_pct, other_pct, inside, self.octave_offset + ghost_page_offset
 
     def _right_stereo_position_metrics(self, position: np.ndarray, definition: PlaneDefinition) -> tuple[float, int, str, int]:
         stereo_axis, stereo_half, _other_axis, _other_half = self._right_stereo_axis_and_half_extent(definition)
