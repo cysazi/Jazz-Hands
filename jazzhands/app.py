@@ -32,6 +32,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from jazzhands.haptics.controller import HapticsController
+from jazzhands.music.scales import NOTE_TO_SEMITONE, SCALE_INTERVALS, SEMITONE_NAMES, normalize_scale_key
 from jazzhands.mocap import tracker as mocap
 from jazzhands.mocap import tracker_combined_vispy as combined
 from jazzhands.visualizer import fl_studio_debug_visualizer as fl_debug
@@ -90,59 +91,6 @@ ROTATION_AXIS_TO_EULER_INDEX = {
     "pitch": 1,
     "yaw": 2,
 }
-
-NOTE_TO_SEMITONE = {
-    "C": 0,
-    "B#": 0,
-    "C#": 1,
-    "DB": 1,
-    "D": 2,
-    "D#": 3,
-    "EB": 3,
-    "E": 4,
-    "FB": 4,
-    "E#": 5,
-    "F": 5,
-    "F#": 6,
-    "GB": 6,
-    "G": 7,
-    "G#": 8,
-    "AB": 8,
-    "A": 9,
-    "A#": 10,
-    "BB": 10,
-    "B": 11,
-    "CB": 11,
-}
-SEMITONE_NAMES = ("C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B")
-SCALE_INTERVALS = {
-    "chromatic": tuple(range(12)),
-    "major": (0, 2, 4, 5, 7, 9, 11),
-    "ionian": (0, 2, 4, 5, 7, 9, 11),
-    "natural-minor": (0, 2, 3, 5, 7, 8, 10),
-    "minor": (0, 2, 3, 5, 7, 8, 10),
-    "aeolian": (0, 2, 3, 5, 7, 8, 10),
-    "dorian": (0, 2, 3, 5, 7, 9, 10),
-    "phrygian": (0, 1, 3, 5, 7, 8, 10),
-    "lydian": (0, 2, 4, 6, 7, 9, 11),
-    "mixolydian": (0, 2, 4, 5, 7, 9, 10),
-    "locrian": (0, 1, 3, 5, 6, 8, 10),
-    "harmonic-minor": (0, 2, 3, 5, 7, 8, 11),
-    "melodic-minor": (0, 2, 3, 5, 7, 9, 11),
-    "harmonic-major": (0, 2, 4, 5, 7, 8, 11),
-    "double-harmonic": (0, 1, 4, 5, 7, 8, 11),
-    "hungarian-minor": (0, 2, 3, 6, 7, 8, 11),
-    "ukrainian-dorian": (0, 2, 3, 6, 7, 9, 10),
-    "neapolitan-minor": (0, 1, 3, 5, 7, 8, 11),
-    "neapolitan-major": (0, 1, 3, 5, 7, 9, 11),
-    "enigmatic": (0, 1, 4, 6, 8, 10, 11),
-    "persian": (0, 1, 4, 5, 6, 8, 11),
-    "romanian-minor": (0, 2, 3, 6, 7, 9, 10),
-    "spanish-gypsy": (0, 1, 4, 5, 7, 8, 10),
-    "altered": (0, 1, 3, 4, 6, 8, 10),
-    "whole-tone-plus": (0, 2, 4, 6, 8, 10, 11),
-}
-
 
 @dataclass
 class CameraWorkerSnapshot:
@@ -628,7 +576,7 @@ class KeyboardPoller:
 
 
 def normalize_scale_name(name: str) -> str:
-    normalized = str(name).strip().lower().replace("_", "-").replace(" ", "-")
+    normalized = normalize_scale_key(name)
     if normalized not in SCALE_INTERVALS:
         available = ", ".join(sorted(SCALE_INTERVALS))
         raise argparse.ArgumentTypeError(f"Unknown scale {name!r}. Available: {available}")

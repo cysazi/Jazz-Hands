@@ -64,6 +64,10 @@ def app_args_include_scale(app_args: list[str]) -> bool:
     return any(arg == "--scale" or arg.startswith("--scale=") for arg in app_args)
 
 
+def app_args_are_info_only(app_args: list[str]) -> bool:
+    return any(arg in {"--help", "-h", "--list-scales"} for arg in app_args)
+
+
 def choose_scale_with_dialog(default_scale: str = DEFAULT_SCALE) -> str | None:
     scales = sorted(app.SCALE_INTERVALS)
     root = Tk()
@@ -139,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if launcher_args.help:
         return app.main(["--help"])
+    if app_args_are_info_only(app_args):
+        return app.main(app_args)
 
     run_camera_setup = should_run_setup(launcher_args)
     if not app_args_include_scale(app_args):
