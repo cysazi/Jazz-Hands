@@ -6,12 +6,15 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+from tkinter import Button, Label, Listbox, Scrollbar, StringVar, Tk, messagebox
+from tkinter.constants import BOTH, END, LEFT, RIGHT, SINGLE, Y
 
 from jazzhands import app
 
 
 ROOT_DIR = Path(__file__).resolve().parent
 SETUP_SCRIPT = ROOT_DIR / "Test_Debug_Scripts" / "full_mocap_run.py"
+DEFAULT_SCALE = "chromatic"
 
 
 def build_launcher_parser() -> argparse.ArgumentParser:
@@ -57,6 +60,79 @@ def run_setup(use_ui: bool) -> int:
     return subprocess.run(command, cwd=str(ROOT_DIR)).returncode
 
 
+def app_args_include_scale(app_args: list[str]) -> bool:
+    return any(arg == "--scale" or arg.startswith("--scale=") for arg in app_args)
+
+
+def choose_scale_with_dialog(default_scale: str = DEFAULT_SCALE) -> str | None:
+    scales = sorted(app.SCALE_INTERVALS)
+    root = Tk()
+    root.title("Jazz Hands Scale")
+    root.geometry("320x420")
+    root.resizable(False, True)
+
+    selected_scale = StringVar(value=default_scale if default_scale in scales else scales[0])
+    Label(root, text="Choose the scale to play").pack(padx=12, pady=(12, 6))
+
+    scrollbar = Scrollbar(root)
+    scrollbar.pack(side=RIGHT, fill=Y)
+    listbox = Listbox(root, selectmode=SINGLE, yscrollcommand=scrollbar.set)
+    listbox.pack(side=LEFT, fill=BOTH, expand=True, padx=(12, 4), pady=(0, 12))
+    scrollbar.config(command=listbox.yview)
+
+    for scale_name in scales:
+        listbox.insert(END, scale_name)
+    selected_index = scales.index(selected_scale.get())
+    listbox.selection_set(selected_index)
+    listbox.see(selected_index)
+
+    def confirm() -> None:
+        selection = listbox.curselection()
+        if not selection:
+            messagebox.showinfo("Jazz Hands Scale", "Pick a scale first.")
+            return
+        selected_scale.set(scales[int(selection[0])])
+        root.destroy()
+
+    def cancel() -> None:
+        selected_scale.set(default_scale)
+        root.destroy()
+
+    Button(root, text="Use Scale", command=confirm).pack(pady=(0, 8))
+    root.protocol("WM_DELETE_WINDOW", cancel)
+    root.mainloop()
+    return selected_scale.get()
+
+
+def choose_scale_in_terminal(default_scale: str = DEFAULT_SCALE) -> str:
+    scales = sorted(app.SCALE_INTERVALS)
+    print("Choose the scale to play:")
+    for index, scale_name in enumerate(scales, start=1):
+        default_marker = " default" if scale_name == default_scale else ""
+        print(f"  {index:2d}. {scale_name}{default_marker}")
+    try:
+        answer = input(f"Scale [{default_scale}]: ").strip()
+    except EOFError:
+        return default_scale
+    if not answer:
+        return default_scale
+    if answer.isdigit():
+        index = int(answer)
+        if 1 <= index <= len(scales):
+            return scales[index - 1]
+    normalized = app.normalize_scale_name(answer)
+    return normalized
+
+
+def choose_scale(default_scale: str = DEFAULT_SCALE) -> str:
+    try:
+        selected = choose_scale_with_dialog(default_scale)
+    except Exception as error:
+        print(f"Could not open scale picker UI ({error}); using terminal prompt.")
+        return choose_scale_in_terminal(default_scale)
+    return selected or default_scale
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = sys.argv[1:] if argv is None else argv
     launcher_args, app_args = build_launcher_parser().parse_known_args(raw_args)
@@ -64,7 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     if launcher_args.help:
         return app.main(["--help"])
 
-    if should_run_setup(launcher_args):
+    run_camera_setup = should_run_setup(launcher_args)
+    if not app_args_include_scale(app_args):
+        selected_scale = choose_scale(DEFAULT_SCALE)
+        app_args = [*app_args, "--scale", selected_scale]
+
+    if run_camera_setup:
         setup_result = run_setup(launcher_args.setup_ui)
         if setup_result != 0:
             return setup_result

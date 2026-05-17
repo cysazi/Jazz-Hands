@@ -129,6 +129,14 @@ MIN_OCTAVE_OFFSET = -4
 MAX_OCTAVE_OFFSET = 4
 STACKED_PLANE_OCTAVES = (-1, 0, 1)
 BUTTON_HOLD_CLEAR_SECONDS = 5.0
+LEFT_VELOCITY_AXIS_DEFAULT = "pitch"
+LEFT_VELOCITY_MIN_DEG = -60.0
+LEFT_VELOCITY_MAX_DEG = 60.0
+ROTATION_AXIS_TO_EULER_INDEX = {
+    "roll": 0,
+    "pitch": 1,
+    "yaw": 2,
+}
 AXIS_NAMES = ("X", "Y", "Z")
 WORLD_UP_AXIS = 2
 PLAY_ENTER_THRESHOLD = 0.02
@@ -378,6 +386,10 @@ class DualHandFLStudioVisualizer:
         require_inside_plane_to_play: bool = False,
         scale_name: str = "chromatic",
         button_hold_clear_seconds: float = BUTTON_HOLD_CLEAR_SECONDS,
+        left_velocity_axis: str = LEFT_VELOCITY_AXIS_DEFAULT,
+        left_velocity_min_degrees: float = LEFT_VELOCITY_MIN_DEG,
+        left_velocity_max_degrees: float = LEFT_VELOCITY_MAX_DEG,
+        invert_left_velocity: bool = False,
         keyboard_buttons_enabled: bool = True,
         controlled_hand_label: str = "LEFT",
         allow_hand_switching: bool = True,
@@ -397,6 +409,12 @@ class DualHandFLStudioVisualizer:
         self.initial_midi_base_note = self.midi_base_note
         self.octave_offset = 0
         self.button_hold_clear_seconds = max(float(button_hold_clear_seconds), 0.25)
+        self.left_velocity_axis = str(left_velocity_axis).lower()
+        self.left_velocity_min_degrees = float(left_velocity_min_degrees)
+        self.left_velocity_max_degrees = float(left_velocity_max_degrees)
+        self.invert_left_velocity = bool(invert_left_velocity)
+        if self.left_velocity_axis not in ROTATION_AXIS_TO_EULER_INDEX:
+            self.left_velocity_axis = LEFT_VELOCITY_AXIS_DEFAULT
         self.max_midi_channel = int(np.clip(int(max_midi_channel), 1, 16))
         channels = midi_channels_1_based or HAND_MIDI_CHANNELS_1_BASED
         self.midi_channels = {
@@ -503,9 +521,12 @@ class DualHandFLStudioVisualizer:
         return len(self.scale_intervals)
 
     def scale_status_text(self) -> str:
+        axis_index = ROTATION_AXIS_TO_EULER_INDEX[self.left_velocity_axis]
+        left_angle = float(self.hands["LEFT"].rotation_euler[axis_index])
         return (
             f"{self.scale_name} middle={midi_note_name(self.midi_base_note)} "
-            f"octave={self.octave_offset:+d} selected={self.selected_note_name}"
+            f"octave={self.octave_offset:+d} selected={self.selected_note_name} "
+            f"velocity={self.current_attack_value} {self.left_velocity_axis}={left_angle:+.1f}deg"
         )
 
     def set_scale(self, scale_name: str) -> None:
@@ -1257,15 +1278,27 @@ class DualHandFLStudioVisualizer:
         u_pct, v_pct, inside, _offset = self._plane_position_metrics(state.position, state.plane)
         return u_pct, v_pct, inside
 
+    def _rotation_pct(self, value: float, min_degrees: float, max_degrees: float) -> float:
+        span = max(float(max_degrees) - float(min_degrees), 1e-6)
+        return float(np.clip((float(value) - float(min_degrees)) / span, 0.0, 1.0) * 100.0)
+
     def _update_left_controls(self) -> None:
         state = self.hands["LEFT"]
         if not state.tracking_active:
             return
 
-        volume_roll = float(np.clip(state.rotation_euler[0], 0.0, 180.0))
-        volume_value = int(np.clip(round((volume_roll / 180.0) * 127.0), 0, 127))
+        axis_index = ROTATION_AXIS_TO_EULER_INDEX[self.left_velocity_axis]
+        velocity_angle = float(state.rotation_euler[axis_index])
+        volume_pct = self._rotation_pct(
+            velocity_angle,
+            self.left_velocity_min_degrees,
+            self.left_velocity_max_degrees,
+        )
+        if self.invert_left_velocity:
+            volume_pct = 100.0 - volume_pct
+        volume_value = int(np.clip(round((volume_pct / 100.0) * 127.0), 1, 127))
         state.volume_value = volume_value
-        self.current_attack_value = self.midi_velocity
+        self.current_attack_value = volume_value
 
         right_channel = self.midi_channels["RIGHT"]
         if state.volume_value != self.current_volume_value:
@@ -1326,6 +1359,7 @@ class DualHandFLStudioVisualizer:
 
     def _update_note_state(self, label: str) -> None:
         if label == "LEFT":
+            self._update_left_controls()
             note_offset, note_name, note_pct, octave_index = self._note_offset_from_left_position()
             state = self.hands["LEFT"]
             if note_offset is not None and state.preview_note_index != note_offset:
@@ -1483,6 +1517,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--list-scales", action="store_true", help="Print available scales and exit.")
     parser.add_argument("--midi-velocity", type=int, default=MIDI_VELOCITY)
+    parser.add_argument(
+        "--left-velocity-axis",
+        choices=tuple(ROTATION_AXIS_TO_EULER_INDEX),
+        default=LEFT_VELOCITY_AXIS_DEFAULT,
+        help="Left-hand rotation axis used for MIDI velocity/volume.",
+    )
+    parser.add_argument(
+        "--left-velocity-min-degrees",
+        type=float,
+        default=LEFT_VELOCITY_MIN_DEG,
+        help="Left-hand angle that maps to velocity 1.",
+    )
+    parser.add_argument(
+        "--left-velocity-max-degrees",
+        type=float,
+        default=LEFT_VELOCITY_MAX_DEG,
+        help="Left-hand angle that maps to velocity 127.",
+    )
+    parser.add_argument(
+        "--invert-left-velocity",
+        action="store_true",
+        help="Invert the left-hand rotation to velocity mapping.",
+    )
     parser.add_argument("--left-midi-channel", type=int, default=HAND_MIDI_CHANNELS_1_BASED["LEFT"])
     parser.add_argument("--right-midi-channel", type=int, default=HAND_MIDI_CHANNELS_1_BASED["RIGHT"])
     parser.add_argument("--max-midi-channel", type=int, default=DEFAULT_MAX_MIDI_CHANNEL)
@@ -1509,6 +1566,10 @@ def main() -> int:
         midi_base_note=args.midi_base_note,
         scale_name=args.scale,
         midi_velocity=args.midi_velocity,
+        left_velocity_axis=args.left_velocity_axis,
+        left_velocity_min_degrees=args.left_velocity_min_degrees,
+        left_velocity_max_degrees=args.left_velocity_max_degrees,
+        invert_left_velocity=args.invert_left_velocity,
         midi_channels_1_based={"LEFT": args.left_midi_channel, "RIGHT": args.right_midi_channel},
         max_midi_channel=args.max_midi_channel,
         enable_haptics=not args.no_haptics,
