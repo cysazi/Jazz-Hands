@@ -130,6 +130,8 @@ GESTURE_ROLL_RATE_THRESHOLD_DPS = 360.0
 GESTURE_WINDOW_MS = 220
 GESTURE_COOLDOWN_MS = 300
 NOTE_GLOW_DURATION_SECONDS = 0.55
+NOTE_GLOW_HALF_SIZE = 0.15
+NOTE_GLOW_SEGMENTS = 40
 
 FRAME_MAP = np.array(
     [
@@ -490,11 +492,11 @@ class DualHandFLStudioVisualizer:
             anchor_y="bottom",
             parent=self.canvas.scene,
         )
-        self.hit_glow_mesh = scene.visuals.Mesh(
-            vertices=np.zeros((4, 3), dtype=np.float32),
-            faces=PLANE_FACES,
+        self.hit_glow_mesh = scene.visuals.Line(
+            pos=np.zeros((NOTE_GLOW_SEGMENTS + 1, 3), dtype=np.float32),
             color=(0.6, 0.95, 1.0, 0.0),
-            shading=None,
+            width=4,
+            method="gl",
             parent=self.world_scene,
         )
         self.hit_glow_mesh.visible = False
@@ -946,13 +948,13 @@ class DualHandFLStudioVisualizer:
         state = self.hands[self.controlled_hand_label]
         velocity = np.zeros(3, dtype=np.float64)
         if self.keys_down.get("W", False):
-            velocity[1] += self.velocity_step
-        if self.keys_down.get("S", False):
-            velocity[1] -= self.velocity_step
-        if self.keys_down.get("A", False):
-            velocity[0] -= self.velocity_step
-        if self.keys_down.get("D", False):
             velocity[0] += self.velocity_step
+        if self.keys_down.get("S", False):
+            velocity[0] -= self.velocity_step
+        if self.keys_down.get("A", False):
+            velocity[1] += self.velocity_step
+        if self.keys_down.get("D", False):
+            velocity[1] -= self.velocity_step
         if self.keys_down.get("Q", False):
             velocity[2] -= self.velocity_step
         if self.keys_down.get("E", False):
@@ -1184,6 +1186,15 @@ class DualHandFLStudioVisualizer:
             vertices[idx, definition.axis_u] = center[definition.axis_u] + u_sign * definition.half_u
             vertices[idx, definition.axis_v] = center[definition.axis_v] + v_sign * definition.half_v
             vertices[idx, definition.normal_axis] = center[definition.normal_axis]
+        return vertices
+
+    def _glow_circle_vertices(self, definition: PlaneDefinition) -> np.ndarray:
+        vertices = np.tile(definition.center.astype(np.float32), (NOTE_GLOW_SEGMENTS + 1, 1))
+        radius = float(definition.half_u)
+        for index, angle in enumerate(np.linspace(0.0, 2.0 * math.pi, NOTE_GLOW_SEGMENTS, endpoint=False)):
+            vertices[index, definition.axis_u] += math.cos(angle) * radius
+            vertices[index, definition.axis_v] += math.sin(angle) * radius
+        vertices[-1] = vertices[0]
         return vertices
 
     def _note_axis_and_half_extent(self, definition: PlaneDefinition) -> tuple[int, float, int, float]:
@@ -1636,7 +1647,7 @@ class DualHandFLStudioVisualizer:
             and (inside or not self.require_inside_plane_to_play)
         )
         if can_play and not self.last_right_can_play:
-            self._trigger_note_glow(state.plane)
+            self._trigger_note_glow(state.plane, state.position)
         self.last_right_can_play = can_play
         state.active_note_index = self.selected_note_offset if can_play else None
         if self.selected_note_offset is not None and state.preview_note_index != self.selected_note_offset:
@@ -1655,10 +1666,19 @@ class DualHandFLStudioVisualizer:
         self.current_pan_section_name = pan_name
         self._update_midi_note("RIGHT", state.active_note_index)
 
-    def _trigger_note_glow(self, definition: PlaneDefinition | None) -> None:
+    def _trigger_note_glow(self, definition: PlaneDefinition | None, position: np.ndarray) -> None:
         if definition is None:
             return
-        self.hit_glow_definition = definition
+        center = np.asarray(position, dtype=np.float64).copy()
+        center[definition.normal_axis] = definition.center[definition.normal_axis]
+        self.hit_glow_definition = PlaneDefinition(
+            center=center,
+            axis_u=definition.axis_u,
+            axis_v=definition.axis_v,
+            normal_axis=definition.normal_axis,
+            half_u=NOTE_GLOW_HALF_SIZE,
+            half_v=NOTE_GLOW_HALF_SIZE,
+        )
         self.hit_glow_start_time = time.time()
         self._update_hit_glow()
 
@@ -1683,13 +1703,9 @@ class DualHandFLStudioVisualizer:
             half_u=definition.half_u * (1.08 + 0.18 * progress),
             half_v=definition.half_v * (1.08 + 0.18 * progress),
         )
-        vertices = self._plane_vertices(expanded) * POSITION_SCALE
+        vertices = self._glow_circle_vertices(expanded) * POSITION_SCALE
         alpha = 0.42 * (1.0 - progress) ** 1.4
-        self.hit_glow_mesh.set_data(
-            vertices=vertices,
-            faces=PLANE_FACES,
-            color=(0.62, 0.95, 1.0, alpha),
-        )
+        self.hit_glow_mesh.set_data(pos=vertices, color=(0.62, 0.95, 1.0, alpha))
         self.hit_glow_mesh.visible = True
 
     def _update_hand_visual(self, label: str) -> None:
